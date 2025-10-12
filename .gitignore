@@ -1,0 +1,6 @@
+/build/
+/src/*/*.o
+/src/*/*_user
+*.swp
+*.log
+*.dSYM
