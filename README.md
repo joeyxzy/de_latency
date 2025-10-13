@@ -22,18 +22,16 @@ de_latency/
 
 ## eBPF
 
-GPU2机器上的编译流程
+实现了追踪装载程序所在线程组（TGID）所有线程 （TID）被调度到CPU上运行的时间
 
 ```shell
-#编译内核态程序
-clang -O2 -g -target bpf -c cpu_time.bpf.c -o cpu_time.bpf.o \
-  -I . \
-  -I /usr/src/linux-headers-6.8.0-78-generic/tools/bpf/resolve_btfids/libbpf/include
-
-#编译用户态程序
-gcc cpu_time_user.c -o cpu_time_user \
-  -I/usr/src/linux-headers-6.8.0-78-generic/tools/bpf/resolve_btfids/libbpf/include \
-  /lib/x86_64-linux-gnu/libbpf.so.1
-
+#src/CPU_demo 构建探测程序
+make
+#build/ 运行程序样例，可以更换样例
+sudo ./cpu_time_user /home/joeyxzy/de_latency/cuda-samples/Samples/0_Introduction/simpleMultiCopy/simpleMultiCopy
 
 ```
+
+TODO:
+
+ebpf骨架是什么意思，之前的rodata什么问题，attach顺序又是什么问题，为什么

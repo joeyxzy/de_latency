@@ -1,4 +1,5 @@
 /build/
+/tmp/
 /src/*/*.o
 /src/*/*_user
 *.swp
