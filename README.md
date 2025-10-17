@@ -35,3 +35,25 @@ sudo ./cpu_time_user /home/joeyxzy/de_latency/cuda-samples/Samples/0_Introductio
 TODO:
 
 ebpf骨架是什么意思，之前的rodata什么问题，attach顺序又是什么问题，为什么
+
+## CUPTI
+
+实现了对多个GPU事件的测量，采出了相对于初始时间戳的相对时间区间
+
+```shell
+#编译
+make
+#运行实例
+LD_PRELOAD=./libtracer.so /home/joeyxzy/de_latency/cuda-samples/Samples/0_Introduction/simpleMultiCopy/simpleMultiCopy
+```
+
+## FINAL
+
+```shell
+#~/de_latency 直接make生成可执行文件在build文件夹里
+#同时编译了tracer.cu和用户态控制程序
+make
+
+#运行样例
+suudo ./controller /home/joeyxzy/de_latency/cuda-samples/Samples/0_Introduction/simpleMultiGPU/simpleMultiGPU
+```
