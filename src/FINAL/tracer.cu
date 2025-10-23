@@ -110,7 +110,6 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
         if(buffer) free(buffer);
         return;
     }
-    printf("sadad\n");
     do {
         status = cuptiActivityGetNextRecord(buffer, validSize, &record);
         if (status != CUPTI_SUCCESS) break;

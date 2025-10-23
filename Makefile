@@ -35,7 +35,7 @@ BPF_SKELETON := $(BUILD_DIR)/cpu_time.skel.h
 # --- Controller (User-space App) Configuration ---
 USER_SRC := $(SRC_DIR)/cpu_time_user.c
 CFLAGS := -g -Wall
-LDFLAGS := -L$(LIB_DIR) -lbpf -lelf -lz
+LDFLAGS := -L$(LIB_DIR) -lbpf -lelf -lz -lcupti
 # Set rpath so the controller can find libbpf.so at runtime
 LDFLAGS += -Wl,-rpath,'$$ORIGIN/../lib'
 

@@ -55,5 +55,9 @@ LD_PRELOAD=./libtracer.so /home/joeyxzy/de_latency/cuda-samples/Samples/0_Introd
 make
 
 #运行样例
-suudo ./controller /home/joeyxzy/de_latency/cuda-samples/Samples/0_Introduction/simpleMultiGPU/simpleMultiGPU
+sudo ./controller /home/joeyxzy/de_latency/cuda-samples/Samples/0_Introduction/simpleMultiGPU/simpleMultiGPU
 ```
+
+## TODO
+
+- pthread和pid还是没有对齐，如果原程序有新的线程注册，则找不到线程映射，还是需要callback
