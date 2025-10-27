@@ -5,10 +5,12 @@
 #include <sys/syscall.h>
 #include <pthread.h>
 #include <map>
+#include <vector>
 #include <mutex>
 
 #include <cuda.h>
 #include <cupti.h>
+#include <cupti_callbacks.h>
 
 #include "tracer_comm.h"
 
@@ -62,31 +64,61 @@ getMemcpyKindString(CUpti_ActivityMemcpyKind kind)
 // --- GLOBAL STATE ---
 static int comm_fd = -1;
 static uint64_t startTimestamp; // For relative timestamps
-// std::map<uint32_t, pid_t> g_cupti_tid_to_os_tid_map;
+// std::map<uint32_t, pid_t> g_corr_to_os_tid_map;
 // std::mutex g_thread_map_mutex;
-static std::map<uint32_t, pid_t> *g_cupti_tid_to_os_tid_map = nullptr;
-static std::mutex *g_thread_map_mutex = nullptr;
+static std::map<uint32_t, pid_t> g_corr_to_ostid_map;
+static std::mutex g_corr_mutex;
+static CUpti_SubscriberHandle g_subscriber; // CUPTI subscriber 句柄
 
 pid_t get_os_tid() { return syscall(SYS_gettid); }
 
-void register_thread_id() {
-    pthread_t self_pthread_id = pthread_self();
-    pid_t self_os_tid = get_os_tid();
-    uint32_t cupti_thread_id = (uint32_t)self_pthread_id;
+// void register_thread_id() {
+//     pthread_t self_pthread_id = pthread_self();
+//     pid_t self_os_tid = get_os_tid();
+//     uint32_t cupti_thread_id = (uint32_t)self_pthread_id;
 
-    std::lock_guard<std::mutex> lock(*g_thread_map_mutex);
-    if (g_cupti_tid_to_os_tid_map->find(cupti_thread_id) == g_cupti_tid_to_os_tid_map->end()) {
-        (*g_cupti_tid_to_os_tid_map)[cupti_thread_id] = self_os_tid;
+//     std::lock_guard<std::mutex> lock(*g_thread_map_mutex);
+//     if (g_corr_to_os_tid_map->find(cupti_thread_id) == g_corr_to_os_tid_map->end()) {
+//         (*g_corr_to_os_tid_map)[cupti_thread_id] = self_os_tid;
 
-        if (comm_fd != -1) { // Send mapping to controller
-            UnifiedTraceRecord rec = {};
-            rec.type = RECORD_TYPE_METADATA_TID_MAP;
-            rec.pid = getpid();
-            rec.tid = self_os_tid;
-            rec.correlationId = cupti_thread_id; // Reuse field
-            write(comm_fd, &rec, sizeof(rec));
-        }
-    }
+//         if (comm_fd != -1) { // Send mapping to controller
+//             UnifiedTraceRecord rec = {};
+//             rec.type = RECORD_TYPE_METADATA_TID_MAP;
+//             rec.pid = getpid();
+//             rec.tid = self_os_tid;
+//             rec.correlationId = cupti_thread_id; // Reuse field
+//             write(comm_fd, &rec, sizeof(rec));
+//         }
+//     }
+// }
+// 这是我们的同步回调函数
+
+void CUPTIAPI api_callback(
+  void *userdata,
+  CUpti_CallbackDomain domain,
+  CUpti_CallbackId cbid,
+  const void *cbdata_void)
+{
+  const CUpti_CallbackData *cbdata = (const CUpti_CallbackData *)cbdata_void;
+
+  if (cbdata->callbackSite == CUPTI_API_ENTER) {
+      uint32_t correlationId = cbdata->correlationId;
+      pid_t os_tid = syscall(SYS_gettid);
+
+      {
+          std::lock_guard<std::mutex> lock(g_corr_mutex);
+          g_corr_to_ostid_map[correlationId] = os_tid;
+      }
+
+      // 这里你可以输出调试信息
+      //printf("[ENTER] corr=%u tid=%d api=%s\n", correlationId, os_tid, cbdata->functionName);
+  }
+  //这里需要注意这里的大小会不会爆，即map
+  // else if (cbdata->callbackSite == CUPTI_API_EXIT) {
+  //     // 可选：清理映射，防止 map 太大
+  //     std::lock_guard<std::mutex> lock(g_corr_mutex);
+  //     g_corr_to_tid.erase(cbdata->correlationId);
+  // }
 }
 
 // --- CUPTI CALLBACKS ---
@@ -105,6 +137,7 @@ void CUPTIAPI bufferRequested(uint8_t **buffer, size_t *size, size_t *maxNumReco
 
 void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer, size_t size, size_t validSize) {
     CUptiResult status;
+    std::vector<uint32_t> consumed_ids;
     CUpti_Activity *record = NULL;
     if (validSize == 0 || comm_fd == -1) {
         if(buffer) free(buffer);
@@ -168,9 +201,14 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
                 rec.pid = api->processId;
                 rec.cbid = api->cbid;
                 
-                std::lock_guard<std::mutex> lock(*g_thread_map_mutex);
-                auto it = g_cupti_tid_to_os_tid_map->find(api->threadId);
-                rec.tid = (it != g_cupti_tid_to_os_tid_map->end()) ? it->second : 0;
+                std::lock_guard<std::mutex> lock(g_corr_mutex);
+                auto it = g_corr_to_ostid_map.find(api->correlationId); // api->threadId 是 CUPTI internal TID
+                if (it != g_corr_to_ostid_map.end()) {
+                    rec.tid = it->second; // 找到了对应的 OS TID！
+                    consumed_ids.push_back(api->correlationId);
+                } else {
+                    rec.tid = 0; // 理论上不应该发生，但作为保护
+                }
                 break;
             }
             default: continue; // Skip other record types
@@ -178,19 +216,26 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
         write(comm_fd, &rec, sizeof(rec));
 
     } while (status == CUPTI_SUCCESS);
-
+    {
+      std::lock_guard<std::mutex> lock(g_corr_mutex);
+      for (uint32_t cid : consumed_ids) {
+          g_corr_to_ostid_map.erase(cid);
+      }
+    }
     free(buffer);
 }
 
 // --- CONSTRUCTOR & DESTRUCTOR ---
 __attribute__((constructor))
 void initCuptiTracer() {
-    g_thread_map_mutex = new std::mutex();
-    g_cupti_tid_to_os_tid_map = new std::map<uint32_t, pid_t>();
     const char* fd_str = getenv("CUPTI_COMM_FD");
     if (fd_str) comm_fd = atoi(fd_str);
-    fprintf(stderr, "... comm_fd=%d\n", comm_fd);
-    register_thread_id(); // Register main thread
+    //register_thread_id(); // Register main thread
+    CUPTI_CALL(cuptiSubscribe(&g_subscriber, (CUpti_CallbackFunc)api_callback, nullptr));
+    //对runtime和driver两个domain都启动
+    CUPTI_CALL(cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_RUNTIME_API));
+    CUPTI_CALL(cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_DRIVER_API));
+
     CUPTI_CALL(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted));
     CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_KERNEL));
     CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMCPY));
@@ -209,13 +254,5 @@ void deinitCuptiTracer() {
         rec.type = RECORD_TYPE_METADATA_FLUSH_COMPLETE;
         write(comm_fd, &rec, sizeof(rec));
         close(comm_fd);
-    }
-    if (g_thread_map_mutex) {
-      delete g_thread_map_mutex;
-      g_thread_map_mutex = nullptr;
-    }
-    if (g_cupti_tid_to_os_tid_map) {
-        delete g_cupti_tid_to_os_tid_map;
-        g_cupti_tid_to_os_tid_map = nullptr;
     }
 }
