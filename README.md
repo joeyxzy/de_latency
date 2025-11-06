@@ -1,6 +1,6 @@
-# CPU&GPU时间分解
+# vLLM框架追踪
 
-v0.1
+v0.2
 
 ```shell
 de_latency/
@@ -20,44 +20,12 @@ de_latency/
 
 ```
 
-## eBPF
-
-实现了追踪装载程序所在线程组（TGID）所有线程 （TID）被调度到CPU上运行的时间
+## 使用
 
 ```shell
-#src/CPU_demo 构建探测程序
-make
-#build/ 运行程序样例，可以更换样例
-sudo ./cpu_time_user /home/joeyxzy/de_latency/cuda-samples/Samples/0_Introduction/simpleMultiCopy/simpleMultiCopy
+# 启动vLLM服务，同时patch我们的追踪程序
+python start_server.py     --model Qwen/Qwen1.5-4B-Chat     --tensor-parallel-size 2     --dtype auto     --max-model-len 4096     --port 8000
 
+#向启动的服务发送请求测试
+python request_test.py
 ```
-
-TODO:
-
-ebpf骨架是什么意思，之前的rodata什么问题，attach顺序又是什么问题，为什么
-
-## CUPTI
-
-实现了对多个GPU事件的测量，采出了相对于初始时间戳的相对时间区间
-
-```shell
-#编译
-make
-#运行实例
-LD_PRELOAD=./libtracer.so /home/joeyxzy/de_latency/cuda-samples/Samples/0_Introduction/simpleMultiCopy/simpleMultiCopy
-```
-
-## FINAL
-
-```shell
-#~/de_latency 直接make生成可执行文件在build文件夹里
-#同时编译了tracer.cu和用户态控制程序
-make
-
-#运行样例
-sudo ./controller /home/joeyxzy/de_latency/cuda-samples/Samples/0_Introduction/simpleMultiGPU/simpleMultiGPU
-```
-
-## TODO
-
-- pthread和pid还是没有对齐，如果原程序有新的线程注册，则找不到线程映射，还是需要callback
