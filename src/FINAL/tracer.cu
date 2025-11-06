@@ -110,8 +110,6 @@ void CUPTIAPI api_callback(
           g_corr_to_ostid_map[correlationId] = os_tid;
       }
 
-      // 这里你可以输出调试信息
-      //printf("[ENTER] corr=%u tid=%d api=%s\n", correlationId, os_tid, cbdata->functionName);
   }
   //这里需要注意这里的大小会不会爆，即map
   // else if (cbdata->callbackSite == CUPTI_API_EXIT) {

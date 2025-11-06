@@ -4,6 +4,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <stdint.h>
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <sys/select.h>
@@ -13,12 +14,18 @@
 #include <cupti.h>
 #include<time.h>
 #include "cpu_time.skel.h"
-#include "tracer_comm.h" // You must have this shared header file
+#include "tracer_comm.h"
 
-// --- Global State ---
 static volatile sig_atomic_t exiting = 0;
 static pid_t child_pid = 0;
 uint64_t offset=0;
+__u64 cpu_walltime_start=UINT64_MAX;
+__u64 cpu_walltime_end=0;
+__u64 cpu_walltim=0;
+__u64 cpu_devicetime=0;
+
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
 
 // --- Signal Handler ---
 static void sigint_handler(int sig) {
@@ -66,6 +73,14 @@ static void print_all_thread_times(int map_fd) {
     printf("---------------------------------------\n");
 }
 
+void develop_cpu_metrics(__u64 start_ns,__u64 end_ns)
+{
+    cpu_walltime_start=min(start_ns,cpu_walltime_start);
+    cpu_walltime_end=max(end_ns,cpu_walltime_end);
+    cpu_walltim=cpu_walltime_end-cpu_walltime_end;
+    cpu_devicetime+=end_ns-start_ns;
+}
+
 // libbpf 会在 ring buffer 中有数据时自动调用这个函数
 int handle_cpu_event(void *ctx, void *data, size_t size) {
     // 从 BPF 内核代码中复制 cpu_event 结构体的定义过来
@@ -90,6 +105,7 @@ int handle_cpu_event(void *ctx, void *data, size_t size) {
         event->pid,
         event->start_ns,
         event->end_ns);
+    develop_cpu_metrics(event->start_ns,event->end_ns);
 
     return 0;
 }
@@ -389,6 +405,9 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr, "Failed to get BPF map FD for final results.\n");
     }
+
+    printf("CPU WALL TIME: %llu ms\n",(cpu_walltime_end-cpu_walltime_start)/1000000);
+    printf("CPU DEVICE TIME: %llu ms\n",cpu_devicetime/1000000);
 
 cleanup:
     // 7. Cleanup resources
