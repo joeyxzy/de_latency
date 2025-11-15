@@ -7,23 +7,49 @@
 #include <map>
 #include <vector>
 #include <mutex>
-
+#include <stdarg.h> // For va_list, va_start, etc.
+#include <fcntl.h>  // For fcntl
+#include <errno.h>  // For errno
+#include <limits.h>
+#include <sys/stat.h>
 #include <cuda.h>
 #include <cupti.h>
 #include <cupti_callbacks.h>
+#include <zmq.h>
 
 #include "tracer_comm.h"
+#include "encode.h"
+
+// --- Logger ---
+// A robust logging function that writes to a dedicated file
+void tracer_log(const char* format, ...) {
+    FILE* log_file = fopen("/tmp/libtracer.log", "a");
+    if (!log_file) return;
+
+    // Add PID prefix to each log entry
+    fprintf(log_file, "[TRACER PID %d] ", getpid());
+
+    va_list args;
+    va_start(args, format);
+    vfprintf(log_file, format, args);
+    va_end(args);
+
+    fprintf(log_file, "\n");
+    fclose(log_file);
+}
+
 
 // --- CUPTI MACROS AND HELPERS ---
+// Modified CUPTI_CALL to use our logger
 #define CUPTI_CALL(call)                                                \
   do {                                                                  \
     CUptiResult _status = call;                                         \
     if (_status != CUPTI_SUCCESS) {                                     \
       const char *errstr;                                               \
       cuptiGetResultString(_status, &errstr);                           \
-      fprintf(stderr, "%s:%d: error: function %s failed with error %s.\n", \
+      tracer_log("FATAL ERROR: %s:%d: function %s failed with error %s.", \
               __FILE__, __LINE__, #call, errstr);                       \
-      exit(-1);                                                         \
+      exit(-1); /* In a shared library, exit might be too drastic, but for debugging it's fine */ \
     }                                                                   \
   } while (0)
 
@@ -36,63 +62,135 @@ static const char *
 getMemcpyKindString(CUpti_ActivityMemcpyKind kind)
 {
   switch (kind) {
-  case CUPTI_ACTIVITY_MEMCPY_KIND_HTOD:
-    return "HtoD";
-  case CUPTI_ACTIVITY_MEMCPY_KIND_DTOH:
-    return "DtoH";
-  case CUPTI_ACTIVITY_MEMCPY_KIND_HTOA:
-    return "HtoA";
-  case CUPTI_ACTIVITY_MEMCPY_KIND_ATOH:
-    return "AtoH";
-  case CUPTI_ACTIVITY_MEMCPY_KIND_ATOA:
-    return "AtoA";
-  case CUPTI_ACTIVITY_MEMCPY_KIND_ATOD:
-    return "AtoD";
-  case CUPTI_ACTIVITY_MEMCPY_KIND_DTOA:
-    return "DtoA";
-  case CUPTI_ACTIVITY_MEMCPY_KIND_DTOD:
-    return "DtoD";
-  case CUPTI_ACTIVITY_MEMCPY_KIND_HTOH:
-    return "HtoH";
-  default:
-    break;
+  case CUPTI_ACTIVITY_MEMCPY_KIND_HTOD: return "HtoD";
+  case CUPTI_ACTIVITY_MEMCPY_KIND_DTOH: return "DtoH";
+  case CUPTI_ACTIVITY_MEMCPY_KIND_DTOD: return "DtoD";
+  // Add other kinds if needed
+  default: break;
   }
-
   return "<unknown>";
 }
 
 // --- GLOBAL STATE ---
-static int comm_fd = -1;
-static uint64_t startTimestamp; // For relative timestamps
-// std::map<uint32_t, pid_t> g_corr_to_os_tid_map;
-// std::mutex g_thread_map_mutex;
 static std::map<uint32_t, pid_t> g_corr_to_ostid_map;
 static std::mutex g_corr_mutex;
-static CUpti_SubscriberHandle g_subscriber; // CUPTI subscriber 句柄
+static CUpti_SubscriberHandle g_subscriber;
+static void *g_zmq_ctx = NULL;
+static void *g_zmq_push = NULL;
+static char g_zmq_addr[256] = {0};
 
-pid_t get_os_tid() { return syscall(SYS_gettid); }
+static void init_zmq_from_env() {
+    const char *addr = getenv("TRACER_ZMQ_ADDR");
+    if (!addr || !*addr) {
+        tracer_log("TRACER_ZMQ_ADDR not set, skip ZMQ");
+        return;
+    }
+    strncpy(g_zmq_addr, addr, sizeof(g_zmq_addr)-1);
+    g_zmq_ctx = zmq_ctx_new();
+    if (!g_zmq_ctx) {
+        tracer_log("zmq_ctx_new failed: %s", strerror(errno));
+        return;
+    }
+    g_zmq_push = zmq_socket(g_zmq_ctx, ZMQ_PUSH);
+    if (!g_zmq_push) {
+        tracer_log("zmq_socket failed: %s", strerror(errno));
+        zmq_ctx_term(g_zmq_ctx); g_zmq_ctx=NULL;
+        return;
+    }
+    if (zmq_connect(g_zmq_push, g_zmq_addr) != 0) {
+        tracer_log("zmq_connect(%s) failed: %s", g_zmq_addr, zmq_strerror(errno));
+        zmq_close(g_zmq_push); zmq_ctx_term(g_zmq_ctx);
+        g_zmq_push=NULL; g_zmq_ctx=NULL;
+        return;
+    }
+    tracer_log("ZMQ connected: %s", g_zmq_addr);
+}
 
-// void register_thread_id() {
-//     pthread_t self_pthread_id = pthread_self();
-//     pid_t self_os_tid = get_os_tid();
-//     uint32_t cupti_thread_id = (uint32_t)self_pthread_id;
+static const char *record_type_str(uint32_t t) {
+    switch (t) {
+        case RECORD_TYPE_KERNEL: return "kernel";
+        case RECORD_TYPE_MEMCPY: return "memcpy";
+        case RECORD_TYPE_MEMSET: return "memset";
+        case RECORD_TYPE_DRIVER: return "driver";
+        case RECORD_TYPE_RUNTIME: return "runtime";
+        default: return "unknown";
+    }
+}
 
-//     std::lock_guard<std::mutex> lock(*g_thread_map_mutex);
-//     if (g_corr_to_os_tid_map->find(cupti_thread_id) == g_corr_to_os_tid_map->end()) {
-//         (*g_corr_to_os_tid_map)[cupti_thread_id] = self_os_tid;
+static void send_record_payload(const UnifiedTraceRecord *rec) {
+    if (!g_zmq_push) {tracer_log("!g_zmq_push\n"); return;}
+  
+    struct json_object *payload = json_object_new_object();
+  
+    // 公共字段
+    json_object_object_add(payload, "pid", json_object_new_int((int)rec->pid));
+    if (rec->tid) {
+        json_object_object_add(payload, "tid", json_object_new_int((int)rec->tid));
+    }
+    json_object_object_add(payload, "type", json_object_new_string(record_type_str(rec->type)));
+    json_object_object_add(payload, "start_ns", json_object_new_int64((long long)rec->start_ns));
+    json_object_object_add(payload, "end_ns", json_object_new_int64((long long)rec->end_ns));
+    json_object_object_add(payload, "correlationId", json_object_new_int((int)rec->correlationId));
+  
+    // 根据类型添加字段
+    switch (rec->type) {
+        case RECORD_TYPE_KERNEL: {
+            json_object_object_add(payload, "deviceId", json_object_new_int((int)rec->deviceId));
+            json_object_object_add(payload, "contextId", json_object_new_int((int)rec->contextId));
+            json_object_object_add(payload, "streamId", json_object_new_int((int)rec->streamId));
+            if (rec->name[0])
+                json_object_object_add(payload, "name", json_object_new_string(rec->name));
+            json_object_object_add(payload, "gridX", json_object_new_int((int)rec->gridX));
+            json_object_object_add(payload, "gridY", json_object_new_int((int)rec->gridY));
+            json_object_object_add(payload, "gridZ", json_object_new_int((int)rec->gridZ));
+            json_object_object_add(payload, "blockX", json_object_new_int((int)rec->blockX));
+            json_object_object_add(payload, "blockY", json_object_new_int((int)rec->blockY));
+            json_object_object_add(payload, "blockZ", json_object_new_int((int)rec->blockZ));
+            json_object_object_add(payload, "staticSharedMemory", json_object_new_int((int)rec->staticSharedMemory));
+            json_object_object_add(payload, "dynamicSharedMemory", json_object_new_int((int)rec->dynamicSharedMemory));
+            break;
+        }
+        case RECORD_TYPE_MEMCPY: {
+            json_object_object_add(payload, "deviceId", json_object_new_int((int)rec->deviceId));
+            json_object_object_add(payload, "contextId", json_object_new_int((int)rec->contextId));
+            json_object_object_add(payload, "streamId", json_object_new_int((int)rec->streamId));
+            if (rec->name[0])
+                json_object_object_add(payload, "copyKind", json_object_new_string(rec->name));
+            json_object_object_add(payload, "runtimeCorrelationId",
+                json_object_new_int((int)rec->memcpy_runtimeCorrelationId));
+            break;
+        }
+        case RECORD_TYPE_MEMSET: {
+            json_object_object_add(payload, "deviceId", json_object_new_int((int)rec->deviceId));
+            json_object_object_add(payload, "contextId", json_object_new_int((int)rec->contextId));
+            json_object_object_add(payload, "streamId", json_object_new_int((int)rec->streamId));
+            json_object_object_add(payload, "value", json_object_new_int((int)rec->memset_value));
+            break;
+        }
+        case RECORD_TYPE_DRIVER:
+        case RECORD_TYPE_RUNTIME: {
+            json_object_object_add(payload, "cbid", json_object_new_int((int)rec->cbid));
+            if (rec->tid)
+                json_object_object_add(payload, "tid", json_object_new_int((int)rec->tid));
+            break;
+        }
+        default:
+            // unknown: 只发送公共字段
+            break;
+    }
+    struct json_object *meta = make_metadata("CUPTI", record_type_str(rec->type), NULL, -1);
+    json_object_object_add(meta, "payload", payload);
+    const char *js = metadata_to_bytes(meta);
+    int rc = zmq_send(g_zmq_push, js, strlen(js), ZMQ_DONTWAIT);
+    if (rc < 0) {
+        tracer_log("zmq_send failed: %s", zmq_strerror(errno));
+    }
+    json_object_put(meta);
+  }
 
-//         if (comm_fd != -1) { // Send mapping to controller
-//             UnifiedTraceRecord rec = {};
-//             rec.type = RECORD_TYPE_METADATA_TID_MAP;
-//             rec.pid = getpid();
-//             rec.tid = self_os_tid;
-//             rec.correlationId = cupti_thread_id; // Reuse field
-//             write(comm_fd, &rec, sizeof(rec));
-//         }
-//     }
-// }
-// 这是我们的同步回调函数
+// --- CUPTI CALLBACKS ---
 
+// This callback is triggered when a CUDA API is entered or exited.
 void CUPTIAPI api_callback(
   void *userdata,
   CUpti_CallbackDomain domain,
@@ -104,27 +202,23 @@ void CUPTIAPI api_callback(
   if (cbdata->callbackSite == CUPTI_API_ENTER) {
       uint32_t correlationId = cbdata->correlationId;
       pid_t os_tid = syscall(SYS_gettid);
-
+      
+      // Log that we are capturing a correlation
+      // tracer_log("API_ENTER: cbid=%u, corrId=%u, tid=%d", cbid, correlationId, os_tid);
+      
       {
           std::lock_guard<std::mutex> lock(g_corr_mutex);
           g_corr_to_ostid_map[correlationId] = os_tid;
       }
-
   }
-  //这里需要注意这里的大小会不会爆，即map
-  // else if (cbdata->callbackSite == CUPTI_API_EXIT) {
-  //     // 可选：清理映射，防止 map 太大
-  //     std::lock_guard<std::mutex> lock(g_corr_mutex);
-  //     g_corr_to_tid.erase(cbdata->correlationId);
-  // }
 }
 
-// --- CUPTI CALLBACKS ---
+// This callback is triggered when CUPTI needs a buffer to store activity records.
 void CUPTIAPI bufferRequested(uint8_t **buffer, size_t *size, size_t *maxNumRecords)
 {
   uint8_t *bfr = (uint8_t *) malloc(BUF_SIZE + ALIGN_SIZE);
   if (bfr == NULL) {
-    fprintf(stderr, "Tracer Error: out of memory\n");
+    tracer_log("FATAL ERROR: out of memory in bufferRequested");
     exit(-1);
   }
 
@@ -133,23 +227,39 @@ void CUPTIAPI bufferRequested(uint8_t **buffer, size_t *size, size_t *maxNumReco
   *maxNumRecords = 0;
 }
 
+// This callback is triggered when a buffer of activity records is ready to be processed.
 void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer, size_t size, size_t validSize) {
-    CUptiResult status;
-    std::vector<uint32_t> consumed_ids;
-    CUpti_Activity *record = NULL;
-    if (validSize == 0 || comm_fd == -1) {
-        if(buffer) free(buffer);
+    tracer_log("bufferCompleted called. validSize = %zu", validSize);
+    if (!g_zmq_push) {
+        tracer_log("Warning: Dropping buffer of size %zu because ZMQ socket is not initialized.", validSize);
+        if (buffer) free(buffer);
         return;
     }
+    if (validSize == 0) {
+        if (buffer) free(buffer);
+        return;
+    }
+
+    CUptiResult status;
+    CUpti_Activity *record = NULL;
+
     do {
         status = cuptiActivityGetNextRecord(buffer, validSize, &record);
-        if (status != CUPTI_SUCCESS) break;
+        if (status != CUPTI_SUCCESS) {
+            if (status != CUPTI_ERROR_MAX_LIMIT_REACHED) { // This error is expected at the end
+                 const char *errstr;
+                 cuptiGetResultString(status, &errstr);
+                 tracer_log("ERROR: cuptiActivityGetNextRecord failed with %s", errstr);
+            }
+            break;
+        }
 
         UnifiedTraceRecord rec = {}; // Zero-initialize
         rec.pid = getpid();
+        bool record_valid = true;
         switch (record->kind) {
             case CUPTI_ACTIVITY_KIND_KERNEL: {
-                CUpti_ActivityKernel4 *k = (CUpti_ActivityKernel4 *)record;
+                auto *k = (CUpti_ActivityKernel4 *)record;
                 rec.type = RECORD_TYPE_KERNEL;
                 rec.start_ns = k->start;
                 rec.end_ns = k->end;
@@ -165,7 +275,7 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
                 break;
             }
             case CUPTI_ACTIVITY_KIND_MEMCPY: {
-                CUpti_ActivityMemcpy *m = (CUpti_ActivityMemcpy *)record;
+                auto *m = (CUpti_ActivityMemcpy *)record;
                 rec.type = RECORD_TYPE_MEMCPY;
                 rec.start_ns = m->start;
                 rec.end_ns = m->end;
@@ -178,7 +288,7 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
                 break;
             }
             case CUPTI_ACTIVITY_KIND_MEMSET: {
-                CUpti_ActivityMemset *m = (CUpti_ActivityMemset *)record;
+                auto *m = (CUpti_ActivityMemset *)record;
                 rec.type = RECORD_TYPE_MEMSET;
                 rec.start_ns = m->start;
                 rec.end_ns = m->end;
@@ -191,7 +301,7 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
             }
             case CUPTI_ACTIVITY_KIND_DRIVER:
             case CUPTI_ACTIVITY_KIND_RUNTIME: {
-                CUpti_ActivityAPI *api = (CUpti_ActivityAPI *)record;
+                auto *api = (CUpti_ActivityAPI *)record;
                 rec.type = (record->kind == CUPTI_ACTIVITY_KIND_DRIVER) ? RECORD_TYPE_DRIVER : RECORD_TYPE_RUNTIME;
                 rec.start_ns = api->start;
                 rec.end_ns = api->end;
@@ -200,57 +310,73 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
                 rec.cbid = api->cbid;
                 
                 std::lock_guard<std::mutex> lock(g_corr_mutex);
-                auto it = g_corr_to_ostid_map.find(api->correlationId); // api->threadId 是 CUPTI internal TID
+                auto it = g_corr_to_ostid_map.find(api->correlationId);
                 if (it != g_corr_to_ostid_map.end()) {
-                    rec.tid = it->second; // 找到了对应的 OS TID！
-                    consumed_ids.push_back(api->correlationId);
+                    rec.tid = it->second;
                 } else {
-                    rec.tid = 0; // 理论上不应该发生，但作为保护
+                    rec.tid = 0; // TID not found
+                    // tracer_log("Warning: OS TID for corrId %u not found in map.", api->correlationId);
                 }
                 break;
             }
-            default: continue; // Skip other record types
+            default: 
+                record_valid = false;
+                tracer_log("Skipping activity kind=%u", record->kind);
+                break;
         }
-        write(comm_fd, &rec, sizeof(rec));
+
+        if (record_valid) {
+            send_record_payload(&rec);
+        }
 
     } while (status == CUPTI_SUCCESS);
-    {
-      std::lock_guard<std::mutex> lock(g_corr_mutex);
-      for (uint32_t cid : consumed_ids) {
-          g_corr_to_ostid_map.erase(cid);
-      }
-    }
+
     free(buffer);
 }
 
 // --- CONSTRUCTOR & DESTRUCTOR ---
 __attribute__((constructor))
 void initCuptiTracer() {
-    const char* fd_str = getenv("CUPTI_COMM_FD");
-    if (fd_str) comm_fd = atoi(fd_str);
-    //register_thread_id(); // Register main thread
-    CUPTI_CALL(cuptiSubscribe(&g_subscriber, (CUpti_CallbackFunc)api_callback, nullptr));
-    //对runtime和driver两个domain都启动
-    CUPTI_CALL(cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_RUNTIME_API));
-    CUPTI_CALL(cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_DRIVER_API));
+    tracer_log("--- libtracer.so loaded in PID %d ---", getpid());
+    init_zmq_from_env();
 
+    tracer_log("Initializing CUPTI...");
+    CUPTI_CALL(cuptiSubscribe(&g_subscriber, (CUpti_CallbackFunc)api_callback, nullptr));
+    tracer_log("cuptiSubscribe OK.");
+
+    CUPTI_CALL(cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_RUNTIME_API));
+    tracer_log("Enabled RUNTIME_API domain.");
+    CUPTI_CALL(cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_DRIVER_API));
+    tracer_log("Enabled DRIVER_API domain.");
+    
+    tracer_log("Registering Activity callbacks...");
     CUPTI_CALL(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted));
+    tracer_log("Activity callbacks registered.");
+    
+    tracer_log("Enabling Activity kinds...");
     CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_KERNEL));
     CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMCPY));
     CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMSET));
     CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DRIVER));
     CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME));
+    tracer_log("Activity kinds enabled.");
 
-    CUPTI_CALL(cuptiGetTimestamp(&startTimestamp));
+    tracer_log("--- CUPTI Initialization complete ---");
 }
 
 __attribute__((destructor))
 void deinitCuptiTracer() {
+    tracer_log("--- libtracer.so unloading from PID %d ---", getpid());
     CUPTI_CALL(cuptiActivityFlushAll(0));
-    if (comm_fd != -1) {
-        UnifiedTraceRecord rec = {};
-        rec.type = RECORD_TYPE_METADATA_FLUSH_COMPLETE;
-        write(comm_fd, &rec, sizeof(rec));
-        close(comm_fd);
+    tracer_log("Flushed all remaining CUPTI activity.");
+    if (g_zmq_push) {
+        zmq_close(g_zmq_push);
+        g_zmq_push=NULL;
     }
+    if (g_zmq_ctx) {
+        zmq_ctx_term(g_zmq_ctx);
+        g_zmq_ctx=NULL;
+    }
+    CUPTI_CALL(cuptiUnsubscribe(g_subscriber));
+    tracer_log("Unsubscribed from CUPTI.");
 }

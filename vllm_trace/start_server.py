@@ -1,8 +1,9 @@
 # start_server.py (v2 - Correct version using runpy)
-
+import os
 # ======================================================================
 # 1. 导入补丁模块 (这一步保持不变，且至关重要)
 # ======================================================================
+print(f"✅ [PATCH_LOADER] LD_PRELOAD = {os.getenv('LD_PRELOAD')}")
 print("✅ [PATCH_LOADER] Loading custom vLLM patch...")
 #import vllm_patch
 import trace_patch
@@ -14,6 +15,37 @@ print("✅ [PATCH_LOADER] Patch loaded successfully.")
 # ======================================================================
 import runpy
 import sys
+
+# python
+# def preserve_tracer_fd():
+#     fd_str = os.getenv("VLLM_TRACER_INHERIT_FD")
+#     print(f"🕵️  [PATCH_LOADER] Checking for VLLM_TRACER_INHERIT_FD...")
+#     print(f"    Value from os.getenv: {fd_str!r}")
+#     if not fd_str:
+#         print("❌ [PATCH_LOADER] VLLM_TRACER_INHERIT_FD is missing.")
+#         return
+
+#     try:
+#         fd = int(fd_str)
+#     except ValueError:
+#         print(f"❌ [PATCH_LOADER] Invalid FD string: {fd_str!r}")
+#         return
+
+#     try:
+#         os.set_inheritable(fd, True)
+#         print(f"✅ [PATCH_LOADER] Marked FD {fd} inheritable for child processes.")
+#     except Exception as e:
+#         print(f"❌ [PATCH_LOADER] os.set_inheritable failed: {e}")
+
+#     # 避免 spawn 丢 FD：Linux 下尽量用 fork
+#     try:
+#         import multiprocessing as mp
+#         mp.set_start_method("fork", force=True)
+#         print("✅ [PATCH_LOADER] multiprocessing start method set to 'fork'.")
+#     except Exception as e:
+#         print(f"⚠️  [PATCH_LOADER] Cannot set start method to 'fork': {e}")
+
+# preserve_tracer_fd()
 
 def start_patched_server():
     print("🚀 [PATCH_LOADER] Starting patched vLLM server via runpy...")

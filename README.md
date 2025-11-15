@@ -26,6 +26,29 @@ de_latency/
 # 启动vLLM服务，同时patch我们的追踪程序
 python start_server.py     --model Qwen/Qwen1.5-4B-Chat     --tensor-parallel-size 2     --dtype auto     --max-model-len 4096     --port 8000
 
+
 #向启动的服务发送请求测试
 python request_test.py
+
+#使用v0.1的trace追踪并启动vllm
+sudo -E ./controller /home/joeyxzy/miniconda3/envs/vllm/bin/python /home/joeyxzy/de_latency/de_latency/vllm_trace/start_server.py     --model Qwen/Qwen1.5-4B-Chat     --tensor-parallel-size 2     --dtype auto     --max-model-len 4096     --port 8000
+
+# 在sudo下抹去用户环境变量时
+sudo LD_LIBRARY_PATH=/home/joeyxzy/zeromq_install/lib:/home/joeyxzy/jsonc_install/lib ./controller /home/joeyxzy/de_latency/cuda-samples/Samples/0_Introduction/simpleMultiGPU/simpleMultiGPU
+
+sudo -E LD_LIBRARY_PATH=/home/joeyxzy/zeromq_install/lib:/home/joeyxzy/jsonc_install/lib ./controller /home/joeyxzy/miniconda3/envs/vllm/bin/python /home/joeyxzy/de_latency/de_latency/vllm_trace/start_server.py     --model Qwen/Qwen1.5-4B-Chat     --tensor-parallel-size 2     --dtype auto     --max-model-len 4096     --port 8000
+```
+
+## 新增环境
+
+- ZeroMQ
+
+```shell
+#c环境依赖
+sudo apt-get install -y libzmq3-dev
+
+#python的环境依赖
+pip install pyzmq
+
+
 ```

@@ -35,10 +35,11 @@ BPF_SKELETON := $(BUILD_DIR)/cpu_time.skel.h
 # --- Controller (User-space App) Configuration ---
 USER_SRC := $(SRC_DIR)/cpu_time_user.c
 CFLAGS := -g -Wall
-LDFLAGS := -L$(LIB_DIR) -lbpf -lelf -lz -lcupti
+LDFLAGS := -L$(LIB_DIR) -lbpf -lelf -lz -lcupti -lzmq -ljson-c
 # Set rpath so the controller can find libbpf.so at runtime
 LDFLAGS += -Wl,-rpath,'$$ORIGIN/../lib'
-
+ENCODE_SRC := $(SRC_DIR)/encode.c
+ENCODE_OBJ := $(BUILD_DIR)/encode.o
 
 # ==============================================================================
 # Part 2: CUDA CUPTI Tracer Configuration
@@ -51,7 +52,7 @@ NVCC_CPPFLAGS := -I"$(CUDA_INSTALL_PATH)/include" -I"$(CUPTI_INSTALL_PATH)/inclu
 
 # NVCC compiler and linker flags
 NVCC_CFLAGS := -g -shared -Xcompiler -fPIC
-NVCC_LDFLAGS := -L"$(CUPTI_INSTALL_PATH)/lib64" -L"$(CUDA_INSTALL_PATH)/lib64" -lcupti -lcuda
+NVCC_LDFLAGS := -L"$(CUPTI_INSTALL_PATH)/lib64" -L"$(CUDA_INSTALL_PATH)/lib64" -lcupti -lcuda -lzmq -ljson-c
 
 
 # ==============================================================================
@@ -66,15 +67,20 @@ $(BUILD_DIR):
 	@echo "  MKDIR    $@"
 	@mkdir -p $(BUILD_DIR)
 
+# --- Rule to compile the Encode Module ---
+$(ENCODE_OBJ): $(ENCODE_SRC) | $(BUILD_DIR)
+	@echo "  CC       $@"
+	$(CC) $(CPPFLAGS) -fPIC -c $< -o $@
+
 # --- Rule to build the CUPTI Tracer Library ---
 $(TARGET_TRACER): $(TRACER_SRC) $(INCLUDE_DIR)/tracer_comm.h | $(BUILD_DIR)
 	@echo "  NVCC     $@"
-	$(NVCC) $(CPPFLAGS) $(NVCC_CPPFLAGS) $(NVCC_CFLAGS) -o $@ $< $(NVCC_LDFLAGS)
+	$(NVCC) $(CPPFLAGS) $(NVCC_CPPFLAGS) $(NVCC_CFLAGS) -o $@ $< $(ENCODE_OBJ) $(NVCC_LDFLAGS)
 
 # --- Rule to build the Controller Application ---
-$(TARGET_CONTROLLER): $(USER_SRC) $(BPF_SKELETON) | $(BUILD_DIR)
+$(TARGET_CONTROLLER): $(USER_SRC) $(ENCODE_OBJ) $(BPF_SKELETON) | $(BUILD_DIR)
 	@echo "  CC       $@"
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $(USER_SRC) $(ENCODE_OBJ) $(LDFLAGS)
 
 # --- Rule to generate the BPF Skeleton Header ---
 # This rule is triggered by the controller's dependency on it

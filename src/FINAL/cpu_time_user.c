@@ -9,15 +9,20 @@
 #include <sys/types.h>
 #include <sys/select.h>
 #include <sys/epoll.h>
+#include <sys/stat.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <cupti.h>
-#include<time.h>
+#include <time.h>
+#include <fcntl.h>
+#include <zmq.h>
 #include "cpu_time.skel.h"
 #include "tracer_comm.h"
+#include "encode.h"
 
 static volatile sig_atomic_t exiting = 0;
 static pid_t child_pid = 0;
+static pid_t collector_pid = 0;
 uint64_t offset=0;
 __u64 cpu_walltime_start=UINT64_MAX;
 __u64 cpu_walltime_end=0;
@@ -26,6 +31,83 @@ __u64 cpu_devicetime=0;
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((a) > (b) ? (a) : (b))
+
+#define COLLECTOR_PY "/home/joeyxzy/miniconda3/envs/vllm/bin/python"
+#define COLLECTOR_SCRIPT "../src/FINAL/collector.py"
+#define ZMQ_ADDR "ipc:///tmp/tracer.sock"
+
+static int wait_for_path(const char *path, int timeout_ms) {
+    int waited = 0;
+    const int step_ms = 50;
+    struct stat st;
+    while (waited < timeout_ms) {
+        if (stat(path, &st) == 0) return 0;
+        usleep(step_ms * 1000);
+        waited += step_ms;
+    }
+    return -1;
+}
+
+static int start_collector_process(void) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork collector");
+        return 0;
+    }
+    if (pid == 0) {
+        //子进程：exec collector.py
+        setenv("TRACER_ZMQ_ADDR", ZMQ_ADDR, 1);
+        execl(COLLECTOR_PY, COLLECTOR_PY, COLLECTOR_SCRIPT, "--bind", "ipc:///tmp/tracer.sock", (char *)NULL);
+        //失败
+        perror("execl collector");
+        _exit(127);
+    }
+    //父进程：等待 collector 启动并将 socket 准备好
+    if (wait_for_path("/tmp/tracer.sock", 2000) != 0) {
+        fprintf(stderr, "warning: collector socket not ready after timeout\n");
+        //杀死子进程
+        kill(pid, SIGTERM);
+        return 0;
+    }
+    return pid;
+}
+
+//用于zmq通信的全局变量
+void *g_zmq_ctx = NULL;
+void *g_zmq_push = NULL;
+
+//初始化zmq传输器socket，在collector成功启动后调用
+int init_zmq_sender(const char *addr) {
+    g_zmq_ctx = zmq_ctx_new();
+    if (!g_zmq_ctx) { perror("zmq_ctx_new"); return -1; }
+    g_zmq_push = zmq_socket(g_zmq_ctx, ZMQ_PUSH);
+    if (!g_zmq_push) { perror("zmq_socket"); return -1; }
+    int linger = 0;
+    zmq_setsockopt(g_zmq_push, ZMQ_LINGER, &linger, sizeof(linger));
+    int rc = zmq_connect(g_zmq_push, addr);
+    if (rc != 0) {
+        fprintf(stderr, "zmq_connect failed: %s\n", zmq_strerror(zmq_errno()));
+        // 可以 retry 或继续
+    }
+    return 0;
+}
+
+void shutdown_zmq_sender() {
+    if (g_zmq_push) zmq_close(g_zmq_push);
+    if (g_zmq_ctx) zmq_ctx_term(g_zmq_ctx);
+}
+
+// send_metadata_payload takes ownership of payload (will free it)
+static void send_metadata_payload(const char *event_type, struct json_object *payload) {
+    if (!g_zmq_push || !payload) return;
+    struct json_object *meta = make_metadata("eBPF", event_type, NULL, -1);
+    json_object_get(payload);  // increase ref
+    json_object_object_add(meta, "payload", payload);
+    const char *js = metadata_to_bytes(meta);
+    zmq_send(g_zmq_push, js, strlen(js), ZMQ_DONTWAIT);
+    json_object_put(meta);
+}
+
 
 // --- Signal Handler ---
 static void sigint_handler(int sig) {
@@ -77,7 +159,7 @@ void develop_cpu_metrics(__u64 start_ns,__u64 end_ns)
 {
     cpu_walltime_start=min(start_ns,cpu_walltime_start);
     cpu_walltime_end=max(end_ns,cpu_walltime_end);
-    cpu_walltim=cpu_walltime_end-cpu_walltime_end;
+    cpu_walltim=cpu_walltime_end-cpu_walltime_start;
     cpu_devicetime+=end_ns-start_ns;
 }
 
@@ -101,12 +183,18 @@ int handle_cpu_event(void *ctx, void *data, size_t size) {
     
     // 打印实时收到的 CPU 时间区间
     // 为了和CUPTI的输出区分开，我们加个前缀
-    printf("eBPF-CPU [TID %-5u] ns range: [%llu, %llu]\n",
-        event->pid,
-        event->start_ns,
-        event->end_ns);
+    // printf("eBPF-CPU [TID %-5u] ns range: [%llu, %llu]\n",
+    //     event->pid,
+    //     event->start_ns,
+    //     event->end_ns);
     develop_cpu_metrics(event->start_ns,event->end_ns);
-
+    struct json_object *payload = json_object_new_object();
+    json_object_object_add(payload, "tgid", json_object_new_int((int)event->tgid));
+    json_object_object_add(payload, "tid", json_object_new_int((int)event->pid));
+    json_object_object_add(payload, "start_ns", json_object_new_int64((long long)event->start_ns));
+    json_object_object_add(payload, "end_ns", json_object_new_int64((long long)event->end_ns));
+    json_object_object_add(payload, "offset", json_object_new_int64((long long)offset));
+    send_metadata_payload("cpu_interval", payload); // payload 在 meta 内释放
     return 0;
 }
 
@@ -141,7 +229,7 @@ void process_cupti_record(UnifiedTraceRecord *rec) {
             break;
         case RECORD_TYPE_METADATA_TID_MAP:
             // This is metadata. We can print it for debugging or ignore it for cleaner output.
-            // printf("[INFO] Tracer attached to PID %u, TID %u\n", rec->pid, rec->tid);
+            printf("[INFO] Tracer attached to PID %u, TID %u\n", rec->pid, rec->tid);
             break;
         default: 
             break;
@@ -153,7 +241,10 @@ int main(int argc, char **argv) {
     struct cpu_time_bpf *skel = NULL;
     struct ring_buffer *rb = NULL;
     int ringbuf_fd = -1;
-    int comm_pipe[2] = {-1, -1};
+    //int comm_pipe[2] = {-1, -1};//？
+    //创建匿名管道
+    //const char* fifo_path="/tmp/cupti_trace.fifo";
+    int fifo_rfd=-1;int fifo_wfd=-1;
     //增加一个同步管道，用于保证子进程启动目标程序在父进程attach ebpf程序以后
     int sync_pipe[2]={-1,-1};
 
@@ -179,10 +270,29 @@ int main(int argc, char **argv) {
     }
 
     // 2.创建管道
-    if (pipe(comm_pipe) == -1) {
-        perror("pipe");
-        goto cleanup;
-    }
+    // if (pipe(comm_pipe) == -1) {
+    //     perror("pipe");
+    //     goto cleanup;
+    // }//？
+
+    //unlink(fifo_path); // 保证是新的
+    // if (mkfifo(fifo_path, 0666) == -1 && errno != EEXIST) {
+    //     perror("mkfifo");
+    //     goto cleanup;
+    // }
+    // 打开读端为非阻塞
+    // fifo_rfd = open(fifo_path, O_RDONLY | O_NONBLOCK);
+    // if (fifo_rfd == -1) {
+    //     perror("open fifo read");
+    //     goto cleanup;
+    // }
+    // 防止没有写端时 read 立即返回 EOF，保持一个写端占位
+    // fifo_wfd = open(fifo_path, O_WRONLY | O_NONBLOCK);
+    // if (fifo_wfd == -1) {
+    //     perror("open fifo keep write");
+    //     // 不致命
+    // }
+
     if(pipe(sync_pipe)==-1)
     {
         perror("sync_pipe");
@@ -197,32 +307,47 @@ int main(int argc, char **argv) {
     }
 
     if (child_pid == 0) {
+        printf("Child process started\n");
         //子进程
-        close(comm_pipe[0]); // Child only writes, so close read end
         close(sync_pipe[1]);
-        //此处是将pipe管道的描述符字符串化写到pipe_fd_str里
-        char pipe_fd_str[16];
-        snprintf(pipe_fd_str, sizeof(pipe_fd_str), "%d", comm_pipe[1]);
-        setenv("CUPTI_COMM_FD", pipe_fd_str, 1);
         //进程独立的环境变量
         setenv("LD_PRELOAD", "./libtracer.so", 1); // Ensure libtracer.so is in the current directory
-
+        setenv("TRACER_ZMQ_ADDR", ZMQ_ADDR, 1);
+        //此处是阻塞等待父进程的通知，确保父进程已经attach好了ebpf程序
         char sync_temp;
-        read(sync_pipe[0],&sync_temp,sizeof(sync_temp));
+        printf("before sync read...\n");
+        ssize_t n = read(sync_pipe[0],&sync_temp,sizeof(sync_temp));
         close(sync_pipe[0]);
-
+        if (n == 1) {
+            printf("sync received, launching target\n");
+        } else if (n == 0) {
+            printf("sync pipe EOF (父进程未写字节直接关闭)\n");
+        } else {
+            perror("read sync_pipe");
+        }
+        printf("yes!!\n");
         //此处子进程启动测试程序，启动的时候动态链接器会发现LD_PRELOAD设置的环境变量，所以就会装载我们的CUPTI程序
         execvp(argv[1], &argv[1]);
 
         //exec不会退出，退出就证明fail了
         perror("execvp");
-        close(comm_pipe[1]);
         _exit(127);
     }
 
-    // Parent process (Controller)
-    close(comm_pipe[1]); // Parent only reads, so close write end
     close(sync_pipe[0]);
+
+    // 4.初始化zmq传输器socket
+    collector_pid = start_collector_process();
+    if (collector_pid == 0) {
+        fprintf(stderr, "Failed to start collector process\n");
+        goto cleanup;
+    }
+    int init_zmq_=init_zmq_sender(ZMQ_ADDR);
+    if (init_zmq_ != 0) {
+        fprintf(stderr, "Failed to initialize ZMQ sender\n");
+        //不致命
+    }
+
     printf("Tracking process group with TGID: %d\n", child_pid);
 
     //父进程上传子进程PID，即线程组号，用于ebpf后续找到自己要采的线程
@@ -248,153 +373,38 @@ int main(int argc, char **argv) {
     cuptiGetTimestamp(&gpu_ref); // GPU reference
     offset = (int64_t)cpu_ref - (int64_t)gpu_ref;
 
-    close(sync_pipe[1]);//父进程关闭写端就会通知子进程的读端，读端的阻塞就会结束
-
+    //使用更稳健的方式，因为主进程在fork的时候可能会复制管道，所以期待所有写端关闭不稳健，直接通过写的方式确定
+    char notify = 1;
+    if (write(sync_pipe[1], &notify, 1) != 1) {
+        perror("write sync_pipe");
+    }
+    close(sync_pipe[1]);
+    
     //为时间区间的ringbuffer注册回调打印函数
     rb = ring_buffer__new(bpf_map__fd(skel->maps.events), handle_cpu_event, NULL, NULL);
-    if (!rb) {
-        fprintf(stderr, "Failed to create ring buffer\n");
-        goto cleanup;
-    }
+    if (!rb) { fprintf(stderr, "Failed to create ring buffer\n");goto cleanup; }
     // 获取 ring buffer 的文件描述符，用于 select/epoll
     ringbuf_fd = ring_buffer__epoll_fd(rb);
-    if (ringbuf_fd < 0) {
-        fprintf(stderr, "Failed to get ring buffer epoll fd\n");
-        goto cleanup;
-    }
+    if (ringbuf_fd < 0) {fprintf(stderr, "Failed to get ring buffer epoll fd\n");goto cleanup; }
 
-    int cupti_fd=comm_pipe[0];
-    //创建epoll实例
-    int epoll_fd=epoll_create1(0);
-    if(epoll_fd<0)
-    {
-        perror("epoll_create1");
-        goto cleanup;
-    }
+    printf("Tracking TGID: %d\n", child_pid);
+    printf("--- eBPF CPU intervals collecting (JSON 已通过 ZMQ 发送) ---\n");
 
-    // --- 1. 为 cupti_fd 准备并添加事件 ---
-    struct epoll_event cupti_event;
-    cupti_event.events = EPOLLIN;
-    cupti_event.data.fd = cupti_fd;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, cupti_fd, &cupti_event) < 0) {
-        perror("epoll_ctl add cupti_fd");
-        close(epoll_fd);
-        goto cleanup;
-    }
-    
-    // --- 2. 为 ringbuf_fd 准备并添加事件 ---
-    struct epoll_event ringbuf_event;
-    ringbuf_event.events = EPOLLIN;
-    ringbuf_event.data.fd = ringbuf_fd;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ringbuf_fd, &ringbuf_event) < 0) {
-        perror("epoll_ctl add ringbuf_fd");
-        close(epoll_fd);
-        goto cleanup;
-    }
-    
-    // 4. Main event loop: read from the pipe
-    printf("--- Real-time CUPTI Trace (timestamps are relative to tracer start) ---\n");
-
-    // 4. =========== 主事件循环 (重写逻辑) ===========
-    // 替换主循环：更稳健地处理 epoll + ringbuf + 子进程退出
-    int pipe_closed = 0;
     int child_exited = 0;
-    struct epoll_event active_events[4];
-
-    while (1) {
-        if (exiting) {
-            // 收到 SIGINT/SIGTERM，优雅退出前继续处理剩余 ringbuf 事件
-            fprintf(stderr, "[main] exiting flag set\n");
-        }
-
-        int n_events = epoll_wait(epoll_fd, active_events, 4, 1000); // 1s 超时
-        if (n_events < 0) {
-            if (errno == EINTR) {
-                // 被信号打断，重试或检查退出条件
-                continue;
-            }
-            perror("epoll_wait");
-            break;
-        }
-
-        // 如果 epoll 没有事件，也要尝试 poll ring buffer（防止漏掉）
-        if (n_events == 0) {
-            // 轮询 ringbuf，处理可能缓存在内核的事件
-            int processed = ring_buffer__poll(rb, 0);
-            // 可选 debug:
-            // printf("[main] epoll timeout, ring_buffer__poll returned %d\n", processed);
-        }
-
-        for (int i = 0; i < n_events; i++) {
-            int fd = active_events[i].data.fd;
-            uint32_t ev = active_events[i].events;
-            // debug 打印（删除或定为 --debug 模式）
-            // printf("[main] epoll event fd=%d ev=0x%x\n", fd, ev);
-
-            if (fd == cupti_fd) {
-                // 处理 CUPTI 管道（非阻塞 fd）
-                UnifiedTraceRecord rec;
-                while (1) {
-                    ssize_t bytes_read = read(cupti_fd, &rec, sizeof(rec));
-                    if (bytes_read == sizeof(rec)) {
-                        process_cupti_record(&rec);
-                    } else if (bytes_read == 0) {
-                        // 管道写端关闭（子进程或 tracer lib 已关闭）
-                        pipe_closed = 1;
-                        // printf("[main] cupti pipe EOF\n");
-                        break;
-                    } else {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            // 非阻塞，暂时无数据
-                            break;
-                        }
-                        // 其他错误：记录并视为管道关闭/出问题
-                        perror("read from cupti pipe");
-                        pipe_closed = 1;
-                        break;
-                    }
-                }
-            } else if (fd == ringbuf_fd) {
-                // ring buffer 的 eventfd 触发，去 poll 并处理事件
-                // 注意：ring_buffer__poll 会调用你的 handle_cpu_event 回调
-                // 我们把返回值打印出来以便 debug
-                int processed = ring_buffer__poll(rb, 0);
-                // printf("[main] ring_buffer__poll returned %d\n", processed);
-            } else {
-                // 未知的 fd：根据实际情况处理或忽略
-                // printf("[main] unknown fd %d\n", fd);
-            }
-        }
-
-        // 每个循环都尝试非阻塞地处理残余 ringbuf 事件，确保不漏样本
-        ring_buffer__poll(rb, 0);
-
-        // 检查子进程是否退出（非阻塞）
+    while (!exiting) {
+        // 轮询 ring buffer
+        ring_buffer__poll(rb, 200); // 200ms
         if (!child_exited) {
             int status;
             pid_t r = waitpid(child_pid, &status, WNOHANG);
-            if (r == child_pid) {
-                child_exited = 1;
-                // printf("[main] child exited, status=%d\n", status);
-            }
+            if (r == child_pid) child_exited = 1;
         }
-
-        // 退出条件：外部退出或子进程已退出并且管道已见 EOF
-        // 这里我们要求：子进程已退出 或 (pipe 已关闭)
-        // 但为了保险起见，还要确保 ring buffer 中没有立即可处理的事件
-        if (exiting) {
-            break;
-        }
-        if (child_exited && pipe_closed) {
-            // 做一次最终的 ringbuf 处理，确保不漏最后数据
-            int more;
-            do {
-                more = ring_buffer__poll(rb, 100); // 等待最多 100ms 来吸尽残留事件
-            } while (more > 0);
+        if (child_exited) {
+            // 再多 poll 几次吸尽剩余事件
+            for (int i=0;i<5;i++) ring_buffer__poll(rb, 100);
             break;
         }
     }
-
 
     printf("\n--- Child process finished, all data processed. ---\n");
 
@@ -411,14 +421,17 @@ int main(int argc, char **argv) {
 
 cleanup:
     // 7. Cleanup resources
+    shutdown_zmq_sender();
     if(rb) ring_buffer__free(rb);
-    if (comm_pipe[0] != -1) close(comm_pipe[0]);
-    if (comm_pipe[1] != -1) close(comm_pipe[1]); // Should already be closed
     if (skel) cpu_time_bpf__destroy(skel);
     
     // Ensure the child process is cleaned up properly
     if (child_pid > 0) {
         waitpid(child_pid, NULL, 0);
+    }
+    if (collector_pid > 0) {
+        kill(collector_pid, SIGTERM);
+        waitpid(collector_pid, NULL, 0);
     }
     printf("Controller exiting.\n");
     return 0;
