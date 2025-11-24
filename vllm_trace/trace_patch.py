@@ -59,11 +59,11 @@ def patch_vllm():
 
     @wraps(original_generate)
     async def patched_generate(self, *args, **kwargs):
-
-        engine_request = None
-        if args:
-            engine_request = args[0]
-        request_id = getattr(engine_request, "request_id", None)
+        request_id = None
+        if len(args) >= 3:
+            request_id = args[2]
+        elif "request_id" in kwargs:
+            request_id = kwargs["request_id"]
         process_id = os.getpid()
         thread_id = threading.get_ident()
 
