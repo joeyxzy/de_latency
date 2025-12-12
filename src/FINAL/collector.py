@@ -1,7 +1,26 @@
 import zmq
 import json
+from pathlib import Path
+from datetime import datetime
 
 SOCK_ADDR = "ipc:///tmp/tracer.sock"
+
+LOG_DIR = Path.cwd()
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+CUPTI_LOG = LOG_DIR / "de_latency.log"
+
+def _log_cupti(meta, payload):
+    # 将 CUPTI 记录为一行 JSON；二进制 payload 只记录长度，避免文件巨大
+    rec = {
+        "src": "cupti",
+        "meta": meta,
+        "payload": (
+            {"_bytes_len": len(payload)}
+            if isinstance(payload, (bytes, bytearray)) else payload
+        )
+    }
+    with open(CUPTI_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 def _get_src(meta):
     src = meta.get("source")
@@ -31,8 +50,11 @@ def handle_frames(frames):
         print(f"[ERROR] Unexpected multipart size: {len(frames)}", flush=True)
         return
     src = _get_src(meta)
-    if src == "ebpf" or src == "cupti":
+    if src == "ebpf":
         return  # 暂时忽略 eBPF 消息，太多了
+    if src == "cupti" or src == "monkey_patch":
+        _log_cupti(meta, payload)
+        return
     if payload is not None:
         print(src, meta, payload, flush=True)
     else:
@@ -71,4 +93,5 @@ def collector():
         # process(meta, payload)
 
 if __name__ == "__main__":
+    CUPTI_LOG.write_text("", encoding="utf-8")
     collector()

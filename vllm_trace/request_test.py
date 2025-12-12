@@ -2,121 +2,69 @@
 # -*- coding: utf-8 -*-
 
 from openai import OpenAI
-import requests
-import json
 import time
+import concurrent.futures
+import random
 
 # ================================
 # 全局参数
 # ================================
-BASE_URL = "http://localhost:8000/v1"   # 如果服务在其他机器，请修改
-API_KEY = "EMPTY"                       # vLLM 不检查，但必须填写
+BASE_URL = "http://localhost:8000/v1"
+API_KEY = "EMPTY"
 MODEL = "Qwen/Qwen1.5-4B-Chat"
 
+# 准备一组提示词，长度不一，模拟真实场景
+PROMPTS = [
+    "你好，请用一句话介绍自己。",
+    "请背诵一首李白的《静夜思》。",
+    "写一个 Python 的 Hello World 程序。",
+    "将以下句子翻译成英文：今天天气真好，我想出去散步。",
+    "解释一下什么是量子纠缠，用小学生能听懂的话。",
+    "1+1等于几？",
+    "给我讲一个冷笑话。",
+    "列出太阳系的八大行星。",
+]
 
-# ================================
-# 1) ChatCompletion 普通请求
-# ================================
-def test_basic_chat():
-    print("\n✅ 测试：普通 ChatCompletion 对话")
+def send_request(idx, prompt):
+    """发送单个请求的函数"""
+    print(f"🚀 [Req {idx}] 发送请求: {prompt[:10]}...")
+    client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+    
+    start_time = time.time()
     try:
-        client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
-
+        # 为了增加 Batching 的概率，我们让输出稍微长一点
         resp = client.chat.completions.create(
             model=MODEL,
-            messages=[{"role": "user", "content": "你好，介绍一下你自己"}],
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=50,  # 限制输出长度，让大家跑得差不多快
+            temperature=0.7
         )
-
-        print("✅ 响应内容：")
-        print(">>>", resp.choices[0].message.content)
+        content = resp.choices[0].message.content
+        duration = time.time() - start_time
+        print(f"✅ [Req {idx}] 完成 ({duration:.2f}s): {content[:10].replace('\n', ' ')}...")
+        return idx, True
     except Exception as e:
-        print("❌ 普通对话测试失败：", e)
+        print(f"❌ [Req {idx}] 失败: {e}")
+        return idx, False
 
+def test_concurrent_batching():
+    print("====================================")
+    print(f"🚀 开始并发测试 (总请求数: {len(PROMPTS)})")
+    print("====================================")
 
-# ================================
-# 2) ChatCompletion 流式输出
-# ================================
-def test_streaming_chat():
-    print("\n✅ 测试：流式输出 ChatCompletion")
-    try:
-        client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+    # 使用线程池并发发送
+    # max_workers=10 意味着同时有 10 个线程在发 HTTP 请求
+    # 这远超 vLLM 的处理速度，会迫使请求在 vLLM 队列中堆积，从而触发 Batching
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = []
+        for i, prompt in enumerate(PROMPTS):
+            # 稍微加一点点随机延迟，模拟真实到达（可选，设为0就是瞬时爆发）
+            # time.sleep(random.uniform(0, 0.05)) 
+            futures.append(executor.submit(send_request, i, prompt))
+        
+        # 等待所有请求完成
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
 
-        stream = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": "请写一首五言绝句"}],
-            stream=True
-        )
-
-        print("✅ 流式输出：")
-        for chunk in stream:
-            delta = chunk.choices[0].delta
-            if delta and delta.content:
-                print(delta.content, end="", flush=True)
-
-        print("\n✅ 流式输出结束\n")
-
-    except Exception as e:
-        print("❌ 流式输出测试失败：", e)
-
-
-# ================================
-# 3) 使用 requests 测试
-# ================================
-def test_raw_request():
-    print("\n✅ 测试：使用 requests 原始请求")
-    try:
-        url = f"{BASE_URL}/chat/completions"
-        payload = {
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "你认识有人叫徐卓一么？"}]
-        }
-
-        r = requests.post(url, json=payload)
-        j = r.json()
-        print("✅ 响应内容：")
-        print(">>>", j["choices"][0]["message"]["content"])
-
-    except Exception as e:
-        print("❌ requests 测试失败：", e)
-
-
-# ================================
-# 4) 错误处理测试
-# ================================
-def test_error_case():
-    print("\n✅ 测试：错误情况（模型名错误）")
-    try:
-        client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
-
-        _ = client.chat.completions.create(
-            model="WrongModelName",
-            messages=[{"role": "user", "content": "测试错误"}],
-        )
-    except Exception as e:
-        print("✅ 预期错误出现：", e)
-
-
-# ================================
-# 主函数
-# ================================
 if __name__ == "__main__":
-    print("====================================")
-    print("🚀 vLLM OpenAI API 自动化测试程序开始")
-    print("====================================")
-
-    time.sleep(1)
-
-    test_basic_chat()
-    time.sleep(0.5)
-
-    test_streaming_chat()
-    time.sleep(0.5)
-
-    test_raw_request()
-    time.sleep(0.5)
-
-    test_error_case()
-
-    print("\n====================================")
-    print("✅ 全部测试完成")
-    print("====================================")
+    test_concurrent_batching()

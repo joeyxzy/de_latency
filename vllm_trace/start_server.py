@@ -1,72 +1,45 @@
-# start_server.py (v2 - Correct version using runpy)
 import os
-# ======================================================================
-# 1. 导入补丁模块 (这一步保持不变，且至关重要)
-# ======================================================================
+import sys
+import runpy
+
 print(f"✅ [PATCH_LOADER] LD_PRELOAD = {os.getenv('LD_PRELOAD')}")
 print("✅ [PATCH_LOADER] Loading custom vLLM patch...")
-#import vllm_patch
 import trace_patch
 print("✅ [PATCH_LOADER] Patch loaded successfully.")
 
 
-# ======================================================================
-# 2. 导入 runpy 和 sys，准备执行 vLLM 的主模块
-# ======================================================================
-import runpy
-import sys
-
-# python
-# def preserve_tracer_fd():
-#     fd_str = os.getenv("VLLM_TRACER_INHERIT_FD")
-#     print(f"🕵️  [PATCH_LOADER] Checking for VLLM_TRACER_INHERIT_FD...")
-#     print(f"    Value from os.getenv: {fd_str!r}")
-#     if not fd_str:
-#         print("❌ [PATCH_LOADER] VLLM_TRACER_INHERIT_FD is missing.")
-#         return
-
-#     try:
-#         fd = int(fd_str)
-#     except ValueError:
-#         print(f"❌ [PATCH_LOADER] Invalid FD string: {fd_str!r}")
-#         return
-
-#     try:
-#         os.set_inheritable(fd, True)
-#         print(f"✅ [PATCH_LOADER] Marked FD {fd} inheritable for child processes.")
-#     except Exception as e:
-#         print(f"❌ [PATCH_LOADER] os.set_inheritable failed: {e}")
-
-#     # 避免 spawn 丢 FD：Linux 下尽量用 fork
-#     try:
-#         import multiprocessing as mp
-#         mp.set_start_method("fork", force=True)
-#         print("✅ [PATCH_LOADER] multiprocessing start method set to 'fork'.")
-#     except Exception as e:
-#         print(f"⚠️  [PATCH_LOADER] Cannot set start method to 'fork': {e}")
-
-# preserve_tracer_fd()
-
-def start_patched_server():
-    print("🚀 [PATCH_LOADER] Starting patched vLLM server via runpy...")
-
-    # 3. 设置命令行参数
-    #    runpy.run_module 会像命令行一样读取 sys.argv
-    #    我们需要确保 sys.argv 包含了我们想传递的所有参数
-    #    第一个参数应该是被执行的模块的路径，后面跟着所有的命令行标志
+def start_server():
+    # 保持原来的 API server 启动逻辑
     original_argv = sys.argv
-    sys.argv = [
-        # runpy 会用这个作为脚本名
-        "vllm.entrypoints.openai.api_server",
-        # 从原始命令行中继承所有参数 (除了我们自己的脚本名 'start_server.py')
-        *original_argv[1:]
-    ]
-
-    # 4. 使用 runpy.run_module 来执行 vLLM 的入口点
-    #    这和在命令行运行 `python -m vllm.entrypoints.openai.api_server` 的效果几乎完全一样
-    #    但它是在我们的补丁已经被加载之后才执行的
+    sys.argv = ["vllm.entrypoints.openai.api_server", *original_argv[1:]]
     runpy.run_module("vllm.entrypoints.openai.api_server", run_name="__main__")
 
+def start_bench():
+    # 获取外部传入的参数 (如 --model ...)
+    # sys.argv[0] 是脚本本身路径，sys.argv[1:] 是参数
+    args = sys.argv[1:]
+    
+    # 2. 构造伪造的命令行参数
+    # 我们要模拟执行: vllm bench latency [args...]
+    # 所以 argv[0] 是 'vllm' (或者是入口模块名), 后面紧跟 'bench', 'latency', 然后是原来的参数
+    sys.argv = ["vllm", "bench", "latency"] + args
+    
+    print(f"✅ [BENCH_RUNNER] Invoking vLLM CLI with args: {sys.argv}")
+    
+    # 3. 调用 vLLM 的 CLI 主入口
+    # 'vllm' 命令实际上对应的就是 vllm.entrypoints.cli.main
+    try:
+        runpy.run_module("vllm.entrypoints.cli.main", run_name="__main__")
+    except ImportError:
+        # 兼容旧版本 vLLM，如果上面的路径不对，可能是 vllm.scripts.vllm
+        print("⚠️ [WARN] vllm.entrypoints.cli.main not found, trying vllm.scripts.vllm")
+        runpy.run_module("vllm.scripts.vllm", run_name="__main__")
 
+# ============================================================
+# 4. 根据模式选择启动
+# ============================================================
 if __name__ == "__main__":
-    start_patched_server()
+    #正常启动vllm服务
+    start_server()
+    #运行latency的benchmark(取消注释开启)
+    #start_bench()

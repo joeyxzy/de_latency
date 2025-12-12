@@ -172,6 +172,14 @@ static void send_record_payload(const UnifiedTraceRecord *rec) {
             json_object_object_add(payload, "cbid", json_object_new_int((int)rec->cbid));
             if (rec->tid)
                 json_object_object_add(payload, "tid", json_object_new_int((int)rec->tid));
+            if (rec->name[0] != '\0') {
+                json_object_object_add(payload, "name", json_object_new_string(rec->name));
+            } else {
+                // 如果为空，说明采集时解析失败，给个默认值
+                json_object_object_add(payload, "name", json_object_new_string(
+                    rec->type == RECORD_TYPE_RUNTIME ? "runtime_unknown" : "driver_unknown"
+                ));
+            }
             break;
         }
         default:
@@ -308,7 +316,21 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
                 rec.correlationId = api->correlationId;
                 rec.pid = api->processId;
                 rec.cbid = api->cbid;
+                const char* funcName = NULL;
+                CUpti_CallbackDomain domain = (record->kind == CUPTI_ACTIVITY_KIND_RUNTIME) 
+                                              ? CUPTI_CB_DOMAIN_RUNTIME_API 
+                                              : CUPTI_CB_DOMAIN_DRIVER_API;
+                                              
+                // 调用 CUPTI API 解析 cbid
+                CUptiResult res = cuptiGetCallbackName(domain, api->cbid, &funcName);
                 
+                if (res == CUPTI_SUCCESS && funcName) {
+                    // 安全复制到 rec.name (假设 name 是 char[256])
+                    strncpy(rec.name, funcName, sizeof(rec.name) - 1);
+                    rec.name[sizeof(rec.name) - 1] = '\0'; // 确保以 null 结尾
+                } else {
+                    rec.name[0] = '\0'; // 获取失败则置空
+                }
                 std::lock_guard<std::mutex> lock(g_corr_mutex);
                 auto it = g_corr_to_ostid_map.find(api->correlationId);
                 if (it != g_corr_to_ostid_map.end()) {

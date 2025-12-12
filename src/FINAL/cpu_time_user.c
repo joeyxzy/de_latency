@@ -355,8 +355,8 @@ int main(int argc, char **argv) {
     if (tgid_map_fd < 0) {
         fprintf(stderr, "Failed to get target_tgid_map FD\n");
     } else {
-        __u32 key = 0;
-        __u32 val = (uint32_t) child_pid;
+        __u32 key = (__u32)child_pid;
+        __u32 val = 1;
         if (bpf_map_update_elem(tgid_map_fd, &key, &val, BPF_ANY) != 0) {
             perror("bpf_map_update_elem(target_tgid_map)");
         }

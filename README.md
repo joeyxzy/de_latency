@@ -37,6 +37,30 @@ sudo -E ./controller /home/joeyxzy/miniconda3/envs/vllm/bin/python /home/joeyxzy
 sudo LD_LIBRARY_PATH=/home/joeyxzy/zeromq_install/lib:/home/joeyxzy/jsonc_install/lib ./controller /home/joeyxzy/de_latency/cuda-samples/Samples/0_Introduction/simpleMultiGPU/simpleMultiGPU
 
 sudo -E LD_LIBRARY_PATH=/home/joeyxzy/zeromq_install/lib:/home/joeyxzy/jsonc_install/lib ./controller /home/joeyxzy/miniconda3/envs/vllm/bin/python /home/joeyxzy/de_latency/de_latency/vllm_trace/start_server.py     --model Qwen/Qwen1.5-4B-Chat     --tensor-parallel-size 2     --dtype auto     --max-model-len 4096     --port 8000
+
+# 启动sitecustomize
+sudo -E   PYTHONPATH=/home/joeyxzy/de_latency/de_latency/vllm_trace  LD_LIBRARY_PATH=/home/joeyxzy/zeromq_install/lib:/home/joeyxzy/jsonc_install/lib   ./controller   /home/joeyxzy/miniconda3/envs/vllm/bin/python   /home/joeyxzy/de_latency/de_latency/vllm_trace/start_server.py   --model Qwen/Qwen1.5-4B-Chat   --tensor-parallel-size 2   --dtype auto   --max-model-len 4096   --port 8000
+
+#将直接输出的日志转换为trace.json，供perffeto查看
+python log_to_trace.py /home/joeyxzy/de_latency/de_latency/build/de_latency.log trace.json
+
+#启动bench的指令
+vllm bench latency     --model Qwen/Qwen1.5-4B-Chat     --input-len 32     --output-len 1     --max-model-len 32300     --enforce-eager     --load-format dummy
+
+#启动bench同时trace的指令
+sudo -E \
+PYTHONPATH=/home/joeyxzy/de_latency/de_latency/vllm_trace \
+LD_LIBRARY_PATH=/home/joeyxzy/zeromq_install/lib:/home/joeyxzy/jsonc_install/lib \
+./controller \
+/home/joeyxzy/miniconda3/envs/vllm/bin/python \
+/home/joeyxzy/de_latency/de_latency/vllm_trace/start_server.py \
+--model Qwen/Qwen1.5-4B-Chat \
+--input-len 32 \
+--output-len 1 \
+--max-model-len 32300 \
+--enforce-eager \
+--load-format dummy \
+--tensor-parallel-size 2
 ```
 
 ## 新增环境
