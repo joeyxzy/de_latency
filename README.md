@@ -48,6 +48,7 @@ python log_to_trace.py /home/joeyxzy/de_latency/de_latency/build/de_latency.log 
 vllm bench latency     --model Qwen/Qwen1.5-4B-Chat     --input-len 32     --output-len 1     --max-model-len 32300     --enforce-eager     --load-format dummy
 
 #启动bench同时trace的指令
+#应该是需要打开注释的
 sudo -E \
 PYTHONPATH=/home/joeyxzy/de_latency/de_latency/vllm_trace \
 LD_LIBRARY_PATH=/home/joeyxzy/zeromq_install/lib:/home/joeyxzy/jsonc_install/lib \

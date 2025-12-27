@@ -2,16 +2,18 @@ import os
 import sys
 import runpy
 
-print(f"✅ [PATCH_LOADER] LD_PRELOAD = {os.getenv('LD_PRELOAD')}")
-print("✅ [PATCH_LOADER] Loading custom vLLM patch...")
+print("✅ [PATCH_LOADER START...]")
+#引入monkeypatch模块，这个模块会被执行，执行完vllm的相关函数就被修改了
 import trace_patch
-print("✅ [PATCH_LOADER] Patch loaded successfully.")
+print("✅ [PATCH_LOADER SUCCESS!]")
 
 
 def start_server():
     # 保持原来的 API server 启动逻辑
     original_argv = sys.argv
     sys.argv = ["vllm.entrypoints.openai.api_server", *original_argv[1:]]
+    #patch只对当前这个进程有效，所以在这里直接运行模块启动vllm，这个修改才可见
+    #但是可以预知的，vLLM的后续启动的进程是无法感知到这个patch的
     runpy.run_module("vllm.entrypoints.openai.api_server", run_name="__main__")
 
 def start_bench():
@@ -32,7 +34,7 @@ def start_bench():
         runpy.run_module("vllm.entrypoints.cli.main", run_name="__main__")
     except ImportError:
         # 兼容旧版本 vLLM，如果上面的路径不对，可能是 vllm.scripts.vllm
-        print("⚠️ [WARN] vllm.entrypoints.cli.main not found, trying vllm.scripts.vllm")
+        print("[WARN] vllm.entrypoints.cli.main not found, trying vllm.scripts.vllm")
         runpy.run_module("vllm.scripts.vllm", run_name="__main__")
 
 # ============================================================

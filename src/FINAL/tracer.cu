@@ -356,7 +356,7 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
     free(buffer);
 }
 
-// --- CONSTRUCTOR & DESTRUCTOR ---
+//__attribute__((constructor))保证这个共享库在被加载到任何一个进程时，initCuptiTracer函数会被自动调用
 __attribute__((constructor))
 void initCuptiTracer() {
     tracer_log("--- libtracer.so loaded in PID %d ---", getpid());
@@ -386,19 +386,72 @@ void initCuptiTracer() {
     tracer_log("--- CUPTI Initialization complete ---");
 }
 
+// 假设这些是你在全局作用域或类成员中定义的
+// static CUpti_SubscriberHandle g_subscriber;
+// static void *g_zmq_ctx = NULL;
+// static void *g_zmq_push = NULL;
+
+//这个是在卸载共享库时自动调用的清理函数
 __attribute__((destructor))
 void deinitCuptiTracer() {
-    tracer_log("--- libtracer.so unloading from PID %d ---", getpid());
-    CUPTI_CALL(cuptiActivityFlushAll(0));
-    tracer_log("Flushed all remaining CUPTI activity.");
+    tracer_log("--- [DEINIT] libtracer.so unloading from PID %d ---", getpid());
+
+    // --------------------------------------------------------------------
+    // 步骤 1: 禁用所有 Activity Kinds
+    // 这是最先要做的事情之一，告诉CUPTI不要再产生新的活动记录。
+    // 这与初始化的启用顺序相反。
+    // --------------------------------------------------------------------
+    tracer_log("[DEINIT] Disabling Activity kinds...");
+    CUPTI_CALL(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_RUNTIME));
+    CUPTI_CALL(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_DRIVER));
+    CUPTI_CALL(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_MEMSET));
+    CUPTI_CALL(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_MEMCPY));
+    CUPTI_CALL(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_KERNEL));
+    tracer_log("[DEINIT] Activity kinds disabled.");
+
+
+    // --------------------------------------------------------------------
+    // 步骤 2: Flush 所有剩余的 Activity 记录
+    // 确保在关闭追踪之前，处理完所有已经产生但在缓冲区中的数据。
+    // --------------------------------------------------------------------
+    tracer_log("[DEINIT] Flushing all remaining CUPTI activity...");
+    CUPTI_CALL(cuptiActivityFlushAll(0)); // 0 表示同步刷新，等待所有buffer被处理完
+    tracer_log("[DEINIT] Flushed all activity.");
+
+
+    // --------------------------------------------------------------------
+    // 步骤 3: 取消订阅 Callback API
+    // 告诉CUPTI，我们不再对任何同步回调感兴趣。
+    // 这是非常关键的一步，防止卸载后出现悬空指针调用。
+    // --------------------------------------------------------------------
+    // 检查 g_subscriber 是否有效，防止在初始化失败的情况下调用
+    if (g_subscriber != NULL) {
+        tracer_log("[DEINIT] Unsubscribing from CUPTI callbacks...");
+        CUPTI_CALL(cuptiUnsubscribe(g_subscriber));
+        g_subscriber = NULL; // 置空，好习惯
+        tracer_log("[DEINIT] Unsubscribed from CUPTI.");
+    }
+
+
+    // --------------------------------------------------------------------
+    // 步骤 4: 清理外部资源，例如 ZMQ
+    // 此时所有CUPTI活动都已停止，可以安全地关闭网络连接。
+    // --------------------------------------------------------------------
     if (g_zmq_push) {
+        tracer_log("[DEINIT] Closing ZMQ socket...");
+        // linger设置为0，确保立即关闭，不等待未发送的消息
+        int linger = 0;
+        zmq_setsockopt(g_zmq_push, ZMQ_LINGER, &linger, sizeof(linger));
         zmq_close(g_zmq_push);
-        g_zmq_push=NULL;
+        g_zmq_push = NULL;
+        tracer_log("[DEINIT] ZMQ socket closed.");
     }
     if (g_zmq_ctx) {
+        tracer_log("[DEINIT] Terminating ZMQ context...");
         zmq_ctx_term(g_zmq_ctx);
-        g_zmq_ctx=NULL;
+        g_zmq_ctx = NULL;
+        tracer_log("[DEINIT] ZMQ context terminated.");
     }
-    CUPTI_CALL(cuptiUnsubscribe(g_subscriber));
-    tracer_log("Unsubscribed from CUPTI.");
+    
+    tracer_log("--- [DEINIT] libtracer.so cleanup complete for PID %d ---", getpid());
 }
