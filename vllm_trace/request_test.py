@@ -9,7 +9,7 @@ import random
 # ================================
 # 全局参数
 # ================================
-BASE_URL = "http://localhost:8000/v1"
+BASE_URL = "http://localhost:8001/v1"
 API_KEY = "EMPTY"
 MODEL = "Qwen/Qwen1.5-4B-Chat"
 

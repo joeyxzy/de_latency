@@ -44,6 +44,12 @@ def process_logs(input_file, output_file):
     # 仅存储有真实时间戳的 Kernel，用于画图
     eager_kernels = []
 
+    req_enqueue_scheduler = []
+    req_scheduler_out_rpc = []
+    req_step_ready = []
+
+    worker_preprocess_events = [] 
+
     coroutine_starts = {}
 
     # --- Pass 1: 数据分类 ---
@@ -82,6 +88,14 @@ def process_logs(input_file, output_file):
                     "name": "thread_name", "ph": "M", "pid": real_pid, "tid": virtual_tid,
                     "args": {"name": f"Req-{req_id[:6]}"}
                 })
+            elif etype == 'req_scheduler_out_rpc':
+                req_scheduler_out_rpc.append(payload)
+            elif etype == 'req_enqueue_scheduler':
+                req_enqueue_scheduler.append(payload)
+            elif etype == "req_step_ready":
+                req_step_ready.append(payload)
+            elif etype == "worker_preprocess_start":
+                worker_preprocess_events.append(payload)
 
         elif src == 'CUPTI':
             corr_id = payload.get('correlationId')
@@ -106,8 +120,149 @@ def process_logs(input_file, output_file):
     gpu_forward_events.sort(key=lambda x: x['start_ns'])
     runtime_events.sort(key=lambda x: x['start_ns'])
 
-    print("🔗 Linking events...")
+    print("Processing Scheduler Events...")
+    print(f"📊 Stats: Enqueues={len(req_enqueue_scheduler)}, out_rpc={len(req_scheduler_out_rpc)}, step_ready={len(req_step_ready)}")
+    req_enqueue_map = {} 
 
+    # 3.1 处理入队事件 (画在专门的 Queue 轨道上)
+    QUEUE_PID = 1000  # 给调度队列分配一个固定的虚拟 PID
+    QUEUE_TID = 0     # 主队列
+    
+    trace_events.append({
+        "name": "process_name", "ph": "M", "pid": QUEUE_PID, 
+        "args": {"name": "Scheduler Queue"}
+    })
+
+    #1.为请求入队创建队列
+    for item in req_enqueue_scheduler:
+        req_id = item.get('req_id')
+        ts = item.get('timestamp_ns')
+        if not req_id or not ts: continue
+        
+        # 记录下来，供后续连线使用
+        req_enqueue_map[req_id] = {"ts": ts, "pid": QUEUE_PID, "tid": QUEUE_TID}
+        print(f"Enqueue recorded: {req_id} at {ts}")
+        # 在轨道上是Instant Event
+        trace_events.append(create_perfetto_event(
+            name=f"Enqueue: {req_id[:8]}", # 简写一下 ID 避免太长
+            cat="scheduler", ph="i", ts=ts, dur=0, # Instant
+            pid=QUEUE_PID, tid=QUEUE_TID,
+            args={"full_req_id": req_id}
+        ))
+        
+        # [关键] 开启 Flow (Flow Start 's')
+        # 我们用 req_id 字符串本身作为 flow id (我们 hash 一下变成数字)
+        flow_id = hash(req_id) & 0x7FFFFFFF
+        
+        trace_events.append(create_flow_event(
+            ph="s", ts=ts, pid=QUEUE_PID, tid=QUEUE_TID, corr_id=flow_id
+        ))
+
+    for item in req_scheduler_out_rpc:
+        req_ids = item.get('req_ids', [])
+        ts = item.get('timestamp_ns')
+        
+        # 如果日志里没带 pid/tid，就得去 gpu_forward 里找对应时间段的。
+        # 简单起见，假设 req_scheduler_out_rpc 的 payload 里也加上 pid/tid。
+        
+        for req_id in req_ids:
+            if req_id in req_enqueue_map:
+                flow_id = hash(req_id) & 0x7FFFFFFF
+                
+                # 画一个 Flow Step ('t') 指向这里
+                # 注意：'t' 表示 flow 经过这里但还在继续（因为一个请求可能被调度多次）
+                # 如果是最后一次，应该用 'f'。但我们不知道是不是最后一次，用 't' 安全。
+                
+                # 为了让箭头能显示出来，我们需要在这个时间点有一个 slice。
+                # 幸好，execute_model 就在这个时间点附近。
+                # 我们可以创建一个极短的 Slice 或者 Instant Event 来接收箭头
+                trace_events.append(create_perfetto_event(
+                    name=f"Execute: {req_id[:8]}",
+                    cat="scheduler", ph="i", ts=ts, dur=0,
+                    pid=QUEUE_PID, tid=QUEUE_TID,
+                    args={"full_req_id": req_id}
+                ))
+                trace_events.append(create_flow_event(
+                    ph="t", ts=ts, pid=QUEUE_PID, tid=QUEUE_TID, corr_id=flow_id
+                ))
+    
+    for item in req_step_ready:
+        req_ids = item.get('req_ids', [])
+        ts = item.get('timestamp_ns')
+        if not req_ids or not ts: continue
+        
+        for req_id in req_ids:
+            if req_id in req_enqueue_map:
+                flow_id = hash(req_id) & 0x7FFFFFFF
+                
+                trace_events.append(create_perfetto_event(
+                    name=f"Step Ready: {req_id[:8]}",
+                    cat="scheduler", ph="i", ts=ts, dur=0,
+                    pid=QUEUE_PID, tid=QUEUE_TID,
+                    args={"full_req_id": req_id}
+                ))
+                trace_events.append(create_flow_event(
+                    ph="t", ts=ts, pid=QUEUE_PID, tid=QUEUE_TID, corr_id=flow_id
+                ))
+
+    print("Processing Worker Preprocess Events...")
+    print(f"📊 Stats: Worker Preprocess Events={len(worker_preprocess_events)},len of gpu_forward_events={len(gpu_forward_events)}")
+    from collections import deque
+    preprocess_queues = {}
+    
+    # 必须排序，保证 FIFO
+    worker_preprocess_events.sort(key=lambda x: x.get('timestamp_ns', 0))
+    
+    for wp in worker_preprocess_events:
+        pid = wp.get('pid')
+        tid = wp.get('tid')
+        key = (pid, tid)
+        if key not in preprocess_queues:
+            preprocess_queues[key] = deque()
+        preprocess_queues[key].append(wp)
+    print("all keys in preprocess_queues:",list(preprocess_queues.keys()))
+    for py_ev in gpu_forward_events:
+        py_start = py_ev['start_ns']
+        py_end = py_ev['end_ns']
+        py_tid = py_ev['tid']
+        py_pid = py_ev['pid'] # 确保取到了 PID
+        req_ids = py_ev.get('req_ids', [])
+        #print("py_pid=",py_pid," py_tid=",py_tid," req_ids=",req_ids)
+
+        # ========================================================
+        # [NEW] 匹配并生成 Worker Preprocess 切片
+        # ========================================================
+        key = (py_pid, py_tid)
+        if key in preprocess_queues and preprocess_queues[key]:
+            # 取出队列头部的预处理事件
+            # 逻辑：预处理一定发生在 Forward 之前
+            wp = preprocess_queues[key][0]
+            wp_ts = wp.get('timestamp_ns', 0)
+            
+            # 只有当预处理时间 早于 Forward 开始时间，才是有效匹配
+            if wp_ts < py_start:
+                # 消耗掉这个事件
+                preprocess_queues[key].popleft()
+                
+                # 计算时长
+                #视觉上1us的误差，因为对于perffeto两个slcie的首尾时间完全一样的时候会出现渲染bug
+                prep_dur = (py_start - wp_ts) - 1000 
+                
+                #print(f"Matched Worker Preprocess for PID={py_pid}, TID={py_tid}, ReqIDs={req_ids}, Start={wp_ts}, Duration={prep_dur}")
+                # 生成切片 (黄色)
+                trace_events.append(create_perfetto_event(
+                    name="Worker Preprocess",
+                    cat="worker", ph="X", 
+                    ts=wp_ts, dur=prep_dur,
+                    pid=py_pid, tid=py_tid,
+                    args={
+                        "related_reqs": "\n".join(req_ids),
+                        "duration_ms": prep_dur / 1e6
+                    }
+                ))
+
+    print("🔗 Linking events...")
+    print(f"📊 Stats: GPU Forwards={len(gpu_forward_events)}, Runtimes={len(runtime_events)}")
     for py_ev in gpu_forward_events:
         py_start = py_ev['start_ns']
         py_end = py_ev['end_ns']
@@ -187,7 +342,9 @@ def process_logs(input_file, output_file):
             trace_events.append(create_flow_event(
                 ph="f", ts=start, pid=0, tid=stream_id, corr_id=corr_id
             ))
-
+            
+    print("✨ Sorting all events by timestamp...")
+    trace_events.sort(key=lambda x: x.get('ts', 0))
     # 输出
     output_json = {"traceEvents": trace_events}
     with open(output_file, 'w', encoding='utf-8') as f:
