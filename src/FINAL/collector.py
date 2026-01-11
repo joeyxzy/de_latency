@@ -7,7 +7,7 @@ SOCK_ADDR = "ipc:///tmp/tracer.sock"
 
 LOG_DIR = Path.cwd()
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-CUPTI_LOG = LOG_DIR / "/home/joeyxzy/de_latency/de_latency/perffeto/de_latency.log"
+CUPTI_LOG = Path("/home/joeyxzy/de_latency/de_latency/perfetto/de_latency.log")
 
 def _log_cupti(meta, payload):
     # 将 CUPTI 记录为一行 JSON；二进制 payload 只记录长度，避免文件巨大
