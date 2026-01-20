@@ -171,7 +171,7 @@ def patch_gpu_model_runner(module):
             self._model = model
 
         def __call__(self, *args, **kwargs):
-            # GPU model 调用前插桩
+            # [Timeline Point] Forward 开始
             start_ns = time.time_ns()
             TraceSender.emit(
                 event_type="gpu_forward_start",
@@ -182,7 +182,23 @@ def patch_gpu_model_runner(module):
                     "timestamp_ns": start_ns,
                 }
             )
-            return self._model(*args, **kwargs)
+            
+            try:
+                # 执行真正的模型 Forward
+                return self._model(*args, **kwargs)
+            finally:
+                # [Timeline Point] Forward 结束 (这也是 Postprocess 的开始)
+                end_ns = time.time_ns()
+                TraceSender.emit(
+                    event_type="gpu_forward_end",
+                    payload={
+                        "pid": os.getpid(),
+                        "tid": getattr(threading, "get_native_id", threading.get_ident)(),
+                        "timestamp_ns": end_ns,
+                        # 可选：如果你想直接看 forward 耗时，可以把 start_ns 也带上
+                        # "duration_ns": end_ns - start_ns 
+                    }
+                )
 
         def __getattr__(self, name):
             return getattr(self._model, name)
@@ -263,7 +279,7 @@ def patch_gpu_model_runner(module):
 
                 # 发送数据
                 TraceSender.emit(
-                    event_type="gpu_forward",
+                    event_type="gpu_execute_model",
                     payload={
                         "pid": pid,
                         "tid": tid,
@@ -283,55 +299,50 @@ def patch_gpu_model_runner(module):
             
             return res
         return wrapper
-
-    # def model_forward_wrapper(original_func):
-    #     def wrapper(self, *args, **kwargs):
-    #         print(f">>> [WORKER DEBUG] gpu_forward_start HIT!")
-    #         # [关键点] Preprocess 结束，开始 Forward+Postprocess
-    #         TraceSender.emit(
-    #             event_type="gpu_forward_start", # 这个事件标记切分线
-    #             payload={
-    #                 "pid": os.getpid(),
-    #                 "tid": threading.get_native_id(),
-    #                 "timestamp_ns": time.time_ns()
-    #             }
-    #         )
-    #         # 执行原函数 (CPU 发射计算图)
-    #         return original_func(self, *args, **kwargs)
-    #     return wrapper
-
-
-    # 真正注册上去
-    apply_method_patch(cls, "execute_model", excute_model_wrapper)
-    # apply_method_patch(cls, "_model_forward", model_forward_wrapper)
-    logger.info(f">>> [OKOKOKOKOKOKOKOKOKOK??????]")
-    if hasattr(cls, "model") and cls.model is not None:
-        logger.info(f">>> [YESYESYESYESYEYSE!!!!!]")
-        original_model = cls.model
-
-        class ModelProxy:
-            def __init__(self, model):
-                self._model = model
-
-            def __call__(self, *args, **kwargs):
-                # 插桩点: GPU 调用前
-                start_ns = time.time_ns()
+    
+    def sample_wrapper(original_func):
+        def wrapper(self, *args, **kwargs):
+            start_ns = time.time_ns()
+            # 执行原有的 _sample
+            try:
+                return original_func(self, *args, **kwargs)
+            finally:
+                # 即使报错也要记录结束时间
+                end_ns = time.time_ns()
                 TraceSender.emit(
-                    event_type="gpu_forward_start",
+                    event_type="gpu_sample",
                     payload={
                         "pid": os.getpid(),
                         "tid": getattr(threading, "get_native_id", threading.get_ident)(),
-                        "hooked_method": "model.__call__",
-                        "timestamp_ns": start_ns,
+                        "start_ns": start_ns,
+                        "end_ns": end_ns
                     }
                 )
-                return self._model(*args, **kwargs)
-
-            def __getattr__(self, name):
-                return getattr(self._model, name)
-
-        cls.model = ModelProxy(cls.model)
-        logger.info(f">>> [HOOK SUCCESS] GPUModelRunner.model wrapped with ModelProxy")
+        return wrapper
+    
+    def bookkeeping_wrapper(original_func):
+        def wrapper(self, *args, **kwargs):
+            start_ns = time.time_ns()
+            # 执行原有的 _bookkeeping_sync
+            # 这里的耗时 = GPU计算剩余时间 + 数据拷贝时间
+            try:
+                return original_func(self, *args, **kwargs)
+            finally:
+                end_ns = time.time_ns()
+                TraceSender.emit(
+                    event_type="gpu_bookkeeping",
+                    payload={
+                        "pid": os.getpid(),
+                        "tid": getattr(threading, "get_native_id", threading.get_ident)(),
+                        "start_ns": start_ns,
+                        "end_ns": end_ns
+                    }
+                )
+        return wrapper
+    
+    apply_method_patch(cls, "execute_model", excute_model_wrapper)
+    apply_method_patch(cls, "_sample", sample_wrapper)
+    apply_method_patch(cls, "_bookkeeping_sync", bookkeeping_wrapper)
 
 @register_hook("vllm.v1.core.sched.scheduler") 
 def patch_v1_scheduler(module):

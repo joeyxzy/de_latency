@@ -74,11 +74,13 @@ def process_logs(input_file, output_file):
         # 修正：你的代码中 gpu_forward 的 payload 包含 start_ns/end_ns，但 event_type 叫 'gpu_forward'
         # 我们统一整理到 worker_events
         if src == 'monkey_patch':
-            if etype in ['worker_preprocess_start', 'gpu_forward_start', 'gpu_forward']:
+            # 新增事件类型支持
+            if etype in ['worker_preprocess_start', 'gpu_forward_start', 'gpu_forward_end', 
+                         'gpu_sample', 'gpu_bookkeeping', 'gpu_execute_model']:
                 worker_events.append({
                     "type": etype,
                     "payload": payload,
-                    "ts": payload['timestamp_ns'] # 这是事件发生的时间
+                    "ts": payload.get('timestamp_ns', payload.get('start_ns', ts))
                 })
             elif etype in ['req_enqueue_scheduler', 'req_scheduler_out_rpc', 'req_step_ready']:
                 scheduler_events.append({"type": etype, "payload": payload})
@@ -94,18 +96,20 @@ def process_logs(input_file, output_file):
                 if payload.get('start_ns', 0) > 0:
                     eager_kernels.append(payload)
 
-    # --- 2. Worker 状态机 (核心修改逻辑) ---
+    # --- 2. Worker 状态机 (支持细粒度阶段) ---
     print(f"Processing Worker Events ({len(worker_events)})...")
     
-    # 必须按时间排序，这是状态机工作的前提
     worker_events.sort(key=lambda x: x['ts'])
 
-    # 状态存储: Key=(pid, tid), Value={ 't1': start_ts, 'req_ids': [] }
+    # 状态存储: Key=(pid, tid), Value={
+    #   't_pre_start': ..., 
+    #   't_fwd_start': ..., 
+    #   't_fwd_end': ..., 
+    #   'req_ids': [...],
+    #   'batch_size': ..., 'input_type': ...
+    # }
     worker_states = {}
-    
-    # 存储生成的 Dispatch 切片，用于后续关联 CUPTI
-    # Item: {'pid':, 'tid':, 'start':, 'end':, 'req_ids':}
-    generated_dispatch_slices = []
+    generated_dispatch_slices = []  # 仍可用于 CUPTI 关联（用整个 execute_model 区间）
 
     for ev in worker_events:
         etype = ev['type']
@@ -116,90 +120,111 @@ def process_logs(input_file, output_file):
         key = (pid, tid)
 
         # ----------------------------------------------------------------
-        # [Step 1] Worker Preprocess Start
-        # 对应插桩: Worker.execute_model 入口
+        # [Step 0] 整体 execute_model 区间（容器）
+        # ----------------------------------------------------------------
+        if etype == 'gpu_execute_model':
+            t_start = payload.get('start_ns')
+            t_end = payload.get('end_ns')
+            if t_start is not None and t_end is not None:
+                req_ids = payload.get('req_ids', [])
+                batch_size = payload.get('batch_size', 0)
+                input_type = payload.get('input_type', 'unknown')
+                
+                # 记录完整区间（用于 CUPTI 关联）
+                generated_dispatch_slices.append({
+                    'pid': pid, 'tid': tid,
+                    'start': t_start, 'end': t_end,
+                    'req_ids': req_ids
+                })
+                
+                # 画一个透明容器（浅灰色背景）
+                trace_events.append(create_perfetto_event(
+                    name="Step Execution", cat="worker", ph="X",
+                    ts=t_start, dur=t_end - t_start,
+                    pid=pid, tid=tid,
+                    args={"req_ids": "\n".join(req_ids), "batch_size": batch_size},
+                    cname="background"
+                ))
+            continue  # 不进入状态机流转
+
+        # ----------------------------------------------------------------
+        # [Step 1] Preprocess Start
         # ----------------------------------------------------------------
         if etype == 'worker_preprocess_start':
             worker_states[key] = {
-                't1': ts,
-                'req_ids': payload.get('req_ids', [])
+                't_pre_start': ts,
+                'req_ids': payload.get('req_ids', []),
+                'batch_size': payload.get('batch_size'),
+                'input_type': payload.get('input_type', 'unknown')
             }
 
         # ----------------------------------------------------------------
-        # [Step 2] Forward Start (切分点)
-        # 对应插桩: GPUModelRunner._model_forward 入口
-        # 动作: 结算 Preprocess 切片 (T1 -> T2)，更新状态为 T2
+        # [Step 2] Forward Start
         # ----------------------------------------------------------------
         elif etype == 'gpu_forward_start':
             state = worker_states.get(key)
-            if state and 't1' in state:
-                t1 = state['t1']
-                # 结算 Preprocess (Duration = Now - T1)
-                # 减 1000ns 是为了视觉上稍微留白，防止 Perfetto 渲染层叠
-                dur = (ts - t1) - 1000 
-                if dur < 0: dur = 0
-
+            if state and 't_pre_start' in state:
+                t1 = state['t_pre_start']
+                dur = max(0, ts - t1 - 1000)  # 留白
                 trace_events.append(create_perfetto_event(
                     name="Worker Preprocess",
                     cat="python", ph="X", ts=t1, dur=dur,
                     pid=pid, tid=tid,
-                    args={
-                        "req_ids": "\n".join(state['req_ids']),
-                        "desc": "Prepare Inputs & Metadata"
-                    },
-                    cname="good" # 黄色/绿色系
+                    args={"req_ids": "\n".join(state['req_ids']), "desc": "Prepare Inputs"},
+                    cname="good"  # 黄绿色
                 ))
-                
-                # 状态流转：记录 T2，进入 Dispatch 阶段
-                state['t2'] = ts
-            else:
-                # 只有中间没有开始，可能是日志丢失或Worker启动前的残留，忽略
-                pass
+                state['t_fwd_start'] = ts
 
         # ----------------------------------------------------------------
-        # [Step 3] Forward End (整体结束)
-        # 对应插桩: GPUModelRunner.execute_model 结束
-        # 动作: 结算 Dispatch 切片 (T2 -> T3)
-        # 注意: 这里使用 payload['end_ns'] 作为 T3，因为它比事件ts更精准
+        # [Step 3] Forward End
         # ----------------------------------------------------------------
-        elif etype == 'gpu_forward':
+        elif etype == 'gpu_forward_end':
             state = worker_states.get(key)
-            if state and 't2' in state:
-                t2 = state['t2']
-                # 优先使用 payload 里的 end_ns，如果没有则用事件时间
-                t3 = payload.get('end_ns', ts)
-                
-                dur = t3 - t2
-                if dur < 0: dur = 0 # 异常保护
-
-                # 元数据提取
-                batch_size = payload.get('batch_size', 0)
-                input_type = payload.get('input_type', 'unknown')
-                req_ids = payload.get('req_ids') or state.get('req_ids', [])
-
-                # 生成 Dispatch 切片 (Fwd + Post)
+            if state and 't_fwd_start' in state:
+                t2 = state['t_fwd_start']
+                dur = max(0, ts - t2)
                 trace_events.append(create_perfetto_event(
-                    name="Model Dispatch (Fwd+Post)",
+                    name="Model Forward",
                     cat="python", ph="X", ts=t2, dur=dur,
                     pid=pid, tid=tid,
-                    args={
-                        "batch_size": batch_size,
-                        "input_type": input_type,
-                        "req_ids": "\n".join(req_ids)
-                    },
-                    cname="terrible" # 红色/紫色系，醒目
+                    args={"req_ids": "\n".join(state['req_ids']), "batch_size": state.get('batch_size', 0)},
+                    cname="olive"  # 橄榄绿
+                ))
+                state['t_fwd_end'] = ts
+
+        # ----------------------------------------------------------------
+        # [Step 4] Sample (区间事件)
+        # ----------------------------------------------------------------
+        elif etype == 'gpu_sample':
+            t_start = payload.get('start_ns')
+            t_end = payload.get('end_ns')
+            if t_start is not None and t_end is not None:
+                state = worker_states.get(key)
+                req_ids = state['req_ids'] if state else payload.get('req_ids', [])
+                trace_events.append(create_perfetto_event(
+                    name="Sampling",
+                    cat="python", ph="X", ts=t_start, dur=t_end - t_start,
+                    pid=pid, tid=tid,
+                    args={"req_ids": "\n".join(req_ids)},
+                    cname="mauve"  # 紫红色
                 ))
 
-                # 记录下来给 CUPTI 匹配用
-                generated_dispatch_slices.append({
-                    'pid': pid, 'tid': tid,
-                    'start': t2, 'end': t3,
-                    'req_ids': req_ids
-                })
-            
-            # 一个 Step 完成，清空状态
-            if key in worker_states:
-                del worker_states[key]
+        # ----------------------------------------------------------------
+        # [Step 5] Bookkeeping / Sync (区间事件)
+        # ----------------------------------------------------------------
+        elif etype == 'gpu_bookkeeping':
+            t_start = payload.get('start_ns')
+            t_end = payload.get('end_ns')
+            if t_start is not None and t_end is not None:
+                state = worker_states.get(key)
+                req_ids = state['req_ids'] if state else payload.get('req_ids', [])
+                trace_events.append(create_perfetto_event(
+                    name="Bookkeeping/Sync",
+                    cat="python", ph="X", ts=t_start, dur=t_end - t_start,
+                    pid=pid, tid=tid,
+                    args={"req_ids": "\n".join(req_ids)},
+                    cname="cyan"  # 青色
+                ))
 
     # --- 3. Scheduler 处理 (保持原逻辑) ---
     print("Processing Scheduler Events...")

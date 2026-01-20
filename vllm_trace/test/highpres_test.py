@@ -88,35 +88,75 @@ class StressTester:
     def __init__(self):
         self.client = AsyncOpenAI(base_url=BASE_URL, api_key=API_KEY)
         self.latencies = []
+        self.ttfts = []
+        self.tpots = []
+        self.request_id_map = {}
+        self.per_request_stats = []  # ← 新增：存储每条请求的完整统计
         self.errors = 0
         self.completed = 0
         self.start_time = 0
 
     async def send_request(self, req_id):
-        # 随机选择 Prompt 类型：20% 概率是长 Prompt (重 Prefill)，80% 是短 Prompt
         is_long = random.random() < 0.2
         prompt = LONG_PROMPT_TEMPLATE if is_long else random.choice(SHORT_PROMPTS)
         max_tokens = random.randint(*MAX_TOKENS_RANGE)
         
         req_start = time.time()
-        # print(f"🚀 [Req {req_id}] Sent (Long={is_long})")
+        first_token_time = None
+        token_count = 0
+        vllm_request_id = None
 
         try:
-            response = await self.client.chat.completions.create(
+            stream = await self.client.chat.completions.create(
                 model=MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=max_tokens,
                 temperature=0.7,
+                stream=True,
             )
-            duration = time.time() - req_start
-            self.latencies.append(duration)
+
+            async for chunk in stream:
+                if vllm_request_id is None:
+                    vllm_request_id = chunk.id
+
+                delta_content = chunk.choices[0].delta.content
+                if delta_content is not None:
+                    if first_token_time is None:
+                        first_token_time = time.time()
+                    token_count += 1
+
+            total_time = time.time() - req_start
+
+            # 计算 TTFT / TPOT
+            if token_count == 0:
+                ttft = total_time
+                tpot = 0.0
+            else:
+                ttft = (first_token_time - req_start) if first_token_time else total_time
+                decode_time = total_time - ttft
+                tpot = decode_time / (token_count - 1) if token_count > 1 else 0.0
+
+            # 保存全局统计
+            self.latencies.append(total_time)
+            self.ttfts.append(ttft)
+            self.tpots.append(tpot)
+            self.request_id_map[req_id] = vllm_request_id
+
+            # ✅ 保存 per-request 详细信息
+            self.per_request_stats.append({
+                "req_id": req_id,
+                "vllm_id": vllm_request_id,
+                "ttft": ttft,
+                "tpot": tpot,
+                "total_output_tokens": token_count,
+                "e2e_latency": total_time,
+            })
+
             self.completed += 1
-            
-            # 每完成 10 个打印一次进度
             if self.completed % 10 == 0:
                 avg_lat = np.mean(self.latencies[-10:])
                 print(f"✅ Progress: {self.completed}/{TOTAL_REQUESTS} | Last 10 Avg Latency: {avg_lat:.2f}s")
-                
+
         except Exception as e:
             print(f"❌ [Req {req_id}] Failed: {e}")
             self.errors += 1
@@ -164,11 +204,30 @@ class StressTester:
         print(f"Success Rate    : {100 * self.completed / TOTAL_REQUESTS:.1f}%")
         print("----------------------------------------")
         if self.latencies:
-            print(f"Latency (Avg)   : {np.mean(self.latencies):.2f} s")
-            print(f"Latency (P50)   : {np.percentile(self.latencies, 50):.2f} s")
-            print(f"Latency (P95)   : {np.percentile(self.latencies, 95):.2f} s")
-            print(f"Latency (P99)   : {np.percentile(self.latencies, 99):.2f} s")
+            print(f"Latency E2E (Avg): {np.mean(self.latencies):.2f} s")
+            print(f"Latency E2E (P95): {np.percentile(self.latencies, 95):.2f} s")
+        if self.ttfts:
+            print(f"TTFT (Avg)       : {np.mean(self.ttfts):.3f} s")
+            print(f"TTFT (P95)       : {np.percentile(self.ttfts, 95):.3f} s")
+        if self.tpots:
+            valid_tpots = [t for t in self.tpots if t > 0]
+            if valid_tpots:
+                print(f"TPOT (Avg)       : {np.mean(valid_tpots):.3f} s/token")
+                print(f"TPOT (P95)       : {np.percentile(valid_tpots, 95):.3f} s/token")
         print("========================================")
+
+        # ✅ 新增：逐条打印每个请求的详细指标
+        print("\n📋 Per-Request Detailed Metrics (Success Only):")
+        print(f"{'ReqID':<6} {'vLLM ID':<36} {'TTFT(s)':<8} {'TPOT(s/tok)':<12} {'Tokens':<8}")
+        print("-" * 80)
+        for stat in sorted(self.per_request_stats, key=lambda x: x["req_id"]):
+            print(
+                f"{stat['req_id']:<6} "
+                f"{stat['vllm_id']:<36} "
+                f"{stat['ttft']:<8.3f} "
+                f"{stat['tpot']:<12.4f} "
+                f"{stat['total_output_tokens']:<8}"
+            )
 
 if __name__ == "__main__":
     tester = StressTester()
