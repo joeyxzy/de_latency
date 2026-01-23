@@ -50,9 +50,7 @@ def handle_frames(frames):
         print(f"[ERROR] Unexpected multipart size: {len(frames)}", flush=True)
         return
     src = _get_src(meta)
-    if src == "ebpf":
-        return  # 暂时忽略 eBPF 消息，太多了
-    if src == "cupti" or src == "monkey_patch":
+    if src == "ebpf" or src == "cupti" or src == "monkey_patch":
         _log_cupti(meta, payload)
         return
     if payload is not None:

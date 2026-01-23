@@ -1,5 +1,6 @@
 import json
 import sys
+from collections import defaultdict
 import os
 
 def load_log_lines(filepath):
@@ -45,6 +46,9 @@ def process_logs(input_file, output_file):
     worker_events = []
     scheduler_events = []
     cupti_events = []
+    req_metric_events = []
+    execute_model_span = []
+    ebpf_sched_latency_events = []
     
     # 辅助字典：存储 Kernel 信息
     all_kernels_map = {}
@@ -84,6 +88,10 @@ def process_logs(input_file, output_file):
                 })
             elif etype in ['req_enqueue_scheduler', 'req_scheduler_out_rpc', 'req_step_ready']:
                 scheduler_events.append({"type": etype, "payload": payload})
+            elif etype=="req_metrics_events":
+                req_metric_events.append(payload)
+            elif etype=="worker_model_execute_span":
+                execute_model_span.append(payload)
 
         elif src == 'CUPTI':
             corr_id = payload.get('correlationId')
@@ -95,6 +103,10 @@ def process_logs(input_file, output_file):
                 all_kernels_map[corr_id].append(payload)
                 if payload.get('start_ns', 0) > 0:
                     eager_kernels.append(payload)
+
+        elif src == 'ebpf':
+            if etype == 'sched_latency':
+                ebpf_sched_latency_events.append(payload)
 
     # --- 2. Worker 状态机 (支持细粒度阶段) ---
     print(f"Processing Worker Events ({len(worker_events)})...")
@@ -343,6 +355,154 @@ def process_logs(input_file, output_file):
         # Flow 终点
         if corr_id:
             trace_events.append(create_flow_event("f", start, gpu_pid, stream, corr_id))
+
+    print(f"Processing Request Metric Events ({len(req_metric_events)})...")
+    req_lifecycle={} # Key: req_id, Value: list of events
+    for req_events in req_metric_events:
+        for update in req_events.get('req_events', []):
+            rid = update.get('req_id')
+            if not rid:
+                continue
+            if rid not in req_lifecycle:
+                req_lifecycle[rid] = []
+            raw_events_once=update.get('events', [])
+            for ev in raw_events_once:
+                ev_type = ev.get('type')
+                ev_ts = ev.get('ts')
+                if ev_type and ev_ts:
+                    req_lifecycle[rid].append((ev_type, ev_ts))
+    #为每个请求排序
+    for rid, events in req_lifecycle.items():
+        events.sort(key=lambda x: x[1])
+    #DEBUG:打印每个请求的所有事件
+    for rid in req_lifecycle:
+        events = req_lifecycle[rid]
+        print(f"Request {rid} lifecycle events:")
+        for ev_type, ev_ts in events:
+            print(f"  - {ev_type} at {ev_ts}")
+    #统计每个req的排队时间：ev_type=1表示入队，ev_type=2表示调度出队，ev_type=3表示抢占；统计方法为最近的evtype=2减去最近的evtype=1以及evtype=2减去最近的evtype=3
+    print("Calculating request queue times...")
+    for rid, events in req_lifecycle.items():
+        enqueue_ts = None
+        dequeue_ts = None
+        preempt_ts = None
+        sum_queue_time = 0
+        for ev_type, ev_ts in events:
+            #换ns
+            ev_ts=int(ev_ts*1e9)
+            if ev_type == "1":  # 入队
+                enqueue_ts = ev_ts
+            elif ev_type == "2":  # 调度出队
+                dequeue_ts = ev_ts
+                if enqueue_ts:
+                    queue_time = dequeue_ts - enqueue_ts
+                    sum_queue_time += queue_time
+                    # trace_events.append(create_perfetto_event(
+                    #     name=f"Req {rid[:8]} Queue Time", cat="request_metrics", ph="i",
+                    #     ts=enqueue_ts, dur=0,
+                    #     pid=QUEUE_PID, tid=QUEUE_TID,
+                    #     args={"queue_time_ns": queue_time}
+                    # ))
+                    enqueue_ts = None  # 重置，防止重复计算
+                elif preempt_ts:
+                    queue_time = dequeue_ts - preempt_ts
+                    sum_queue_time += queue_time
+                    # trace_events.append(create_perfetto_event(
+                    #     name=f"Req {rid[:8]} Queue Time (Preempted)", cat="request_metrics", ph="i",
+                    #     ts=preempt_ts, dur=0,
+                    #     pid=QUEUE_PID, tid=QUEUE_TID,
+                    #     args={"queue_time_ns": queue_time}
+                    # ))
+                    preempt_ts = None
+            elif ev_type == "3":  # 抢占
+                preempt_ts = ev_ts
+        if sum_queue_time > 0:
+            #输出每个请求的总排队时间
+            print(f"  - Request {rid} total queue time: {sum_queue_time / 1e6:.2f} ms")
+
+
+    print("\n=== 正在计算 OS 调度/抢占延迟 (eBPF) ===")
+    # 1. 预处理 eBPF 数据：按 TID 分组并按时间排序，方便快速查找
+    # ebpf_map: { tid: [ {start, end, dur}, ... sorted by start ] }
+    ebpf_map = defaultdict(list)
+    for ev in ebpf_sched_latency_events:
+        # 提取 payload 里的字段，兼容性处理
+        payload = ev.get('payload', ev) 
+        tid = payload.get('tid')
+        start = payload.get('start_ns')
+        end = payload.get('end_ns')
+        
+        if tid and start and end:
+            ebpf_map[tid].append({
+                'start': start,
+                'end': end,
+                'dur': end - start
+            })
+
+    # 对每个 TID 的事件按开始时间排序
+    for tid in ebpf_map:
+        ebpf_map[tid].sort(key=lambda x: x['start'])
+
+    # 2. 结果容器：Key=req_id, Value=total_os_delay_ns
+    req_latency_map = defaultdict(int)
+
+    # 3. 遍历 Worker Span 计算交集
+    for span in execute_model_span:
+        payload = span.get('payload', span)
+        
+        tid = payload.get('tid')
+        span_start = payload.get('start_ns')
+        span_end = payload.get('end_ns')
+        req_ids = payload.get('req_ids', [])
+
+        if not (tid and span_start and span_end and req_ids):
+            continue
+
+        # 如果这个 TID 根本没有 eBPF 记录，直接跳过
+        if tid not in ebpf_map:
+            continue
+
+        # 计算当前 Span 内的总 OS 延迟
+        current_span_os_delay = 0
+        
+        # 遍历该线程的所有 eBPF 事件 (已排序)
+        for os_ev in ebpf_map[tid]:
+            # 优化：如果 OS 事件开始时间 已经晚于 Span 结束时间，后面的都不用看了
+            if os_ev['start'] >= span_end:
+                break
+            
+            # 优化：如果 OS 事件结束时间 早于 Span 开始时间，说明还没到，继续
+            if os_ev['end'] <= span_start:
+                continue
+
+            # --- 核心：计算区间重叠 ---
+            # 重叠起点 = max(Span起点, OS事件起点)
+            overlap_start = max(span_start, os_ev['start'])
+            # 重叠终点 = min(Span终点, OS事件终点)
+            overlap_end = min(span_end, os_ev['end'])
+
+            if overlap_end > overlap_start:
+                overlap_ns = overlap_end - overlap_start
+                current_span_os_delay += overlap_ns
+
+        # 4. 归因：将计算出的延迟累加到该 Batch 的所有 Req 上
+        # 逻辑：如果是 Batch 推理，这段 OS 卡顿影响了 Batch 里的每一个人
+        if current_span_os_delay > 0:
+            for rid in req_ids:
+                req_latency_map[rid] += current_span_os_delay
+
+    # 5. 打印结果
+    print(f"共统计到 {len(req_latency_map)} 个请求受到 OS 调度影响：")
+    
+    # 按延迟从高到低排序
+    sorted_reqs = sorted(req_latency_map.items(), key=lambda x: x[1], reverse=True)
+    
+    for rid, lat_ns in sorted_reqs:
+        lat_ms = lat_ns / 1e6
+        print(f"  - Request {rid}: {lat_ms:.3f} ms (OS Scheduling/Preemption Delay)")
+            
+    if not sorted_reqs:
+        print("  未统计到调度延迟")
 
     # --- 输出 ---
     print("✨ Sorting all trace events...")

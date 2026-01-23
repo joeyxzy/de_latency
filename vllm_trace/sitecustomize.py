@@ -7,6 +7,7 @@ import inspect
 import time
 import zmq
 import json
+from typing import Dict, List, Any
 from importlib.abc import MetaPathFinder, Loader
 from importlib.util import spec_from_loader
 
@@ -164,8 +165,6 @@ def patch_gpu_model_runner(module):
 
     cls = module.GPUModelRunner
     method_names = [m for m in dir(cls) ]
-    logger.info(f"    Available forward methods: {method_names}")
-    logger.info(f">>> [HOOK SUCCESS] Patching gpu_model_runner Entry: {cls.__name__}")
     class ModelProxy:
         def __init__(self, model):
             self._model = model
@@ -370,7 +369,60 @@ def patch_v1_scheduler(module):
             )
             return original_func(self, request)
         return wrapper
-    
+    #这个函数帮助我们将update_from_output函数返回的dict[int, EngineCoreOutputs]中的每个req的时间戳事件提取出来
+    def extract_events_from_results(results_dict: Dict[int, Any]) -> List[Dict]:
+        """
+        针对确定的 vLLM V1 结构提取事件
+        Input: dict[int, EngineCoreOutputs]
+        Output: List of event payloads
+        """
+        extracted_updates = []
+        # 1. 遍历字典 (key 是 engine_index)
+        for engine_id, core_outputs_batch in results_dict.items():
+            # core_outputs_batch 就是 EngineCoreOutputs 对象
+            # 2. 获取该 batch 下的所有请求输出列表
+            # 根据定义: outputs: list[EngineCoreOutput] = []
+            if not hasattr(core_outputs_batch, "outputs"):
+                continue
+            #request_outputs_list=outputs: outputs: list[EngineCoreOutput] = []
+            request_outputs_list = core_outputs_batch.outputs
+            # 3. 遍历每个请求的输出
+            for req_output in request_outputs_list:
+                # req_output 就是 EngineCoreOutput 对象
+                
+                # A. 必须要有 events 才有发送价值
+                # 定义: events: Optional[list[EngineCoreEvent]] = None
+                if not hasattr(req_output, "events") or not req_output.events:
+                    continue
+                # B. 解析事件列表
+                parsed_events = []
+                for evt in req_output.events:
+                    # EngineCoreEvent 通常有 type 和 timestamp 属性
+                    # 有些版本可能是 tuple，做个防御性读取
+                    e_type = getattr(evt, "type", None)
+                    e_ts = getattr(evt, "timestamp", None)
+                    
+                    # 如果是 Enum，转字符串
+                    if e_type is not None:
+                        e_type = str(e_type)
+
+                    if e_type and e_ts:
+                        parsed_events.append({
+                            "type": e_type,
+                            "ts": e_ts
+                        })
+                
+                # C. 如果提取到了事件，加入列表
+                if parsed_events:
+                    extracted_updates.append({
+                        "req_id": getattr(req_output, "request_id", "unknown"),
+                        "events": parsed_events,
+                        # 还可以带上 engine_id 方便调试
+                        "engine_id": engine_id 
+                    })
+
+        return extracted_updates
+
     def update_from_output_wrapper(original_func):
         def wrapper(self, scheduler_output, model_output):
             # 1. 先执行原逻辑 (确保状态更新完毕)
@@ -402,7 +454,20 @@ def patch_v1_scheduler(module):
                         "timestamp_ns": time.time_ns(),
                     }
                 )
-            
+            try:
+                req_events = extract_events_from_results(res)
+                if req_events:
+                    #这里发送的是在这一轮update_from_output中多个req的多个时间戳时间
+                    #需要在后续进行解析，将每个req的时间平铺
+                    TraceSender.emit(
+                        event_type="req_metrics_events",
+                        payload={
+                            "req_events": req_events,
+                        }
+                    )
+            except Exception as e:
+                print(f"[Probe Error] Extraction failed: {e}")
+
             return res
         return wrapper
     
@@ -518,8 +583,23 @@ def patch_worker_base(module):
                     }
                 )
             # ---------------------------------------
-
-            return original_func(self, scheduler_output, *args, **kwargs)
+            start_mono = int(time.clock_gettime_ns(time.CLOCK_MONOTONIC)*1e9)
+            try:
+                return original_func(self, scheduler_output, *args, **kwargs)
+            finally:
+                end_mono = int(time.clock_gettime_ns(time.CLOCK_MONOTONIC)*1e9)
+                if req_ids:
+                    TraceSender.emit(
+                        event_type="worker_model_execute_span",
+                        payload={
+                            "req_ids": req_ids,
+                            "pid": os.getpid(),
+                            "tid": tid,
+                            "start_ns": start_mono,
+                            "end_ns": end_mono,
+                            "duration_us": (end_mono - start_mono) // 1000
+                        }
+                    )
         return wrapper
 
     # 尝试 Hook execute_model
