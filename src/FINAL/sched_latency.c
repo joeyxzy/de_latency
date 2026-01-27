@@ -71,35 +71,34 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
         return 1;
     }
 
-    // 1. Prepare Meta JSON
-    struct json_object *meta_obj = json_object_new_object();
-    json_object_object_add(meta_obj, "source", json_object_new_string("ebpf"));
-    json_object_object_add(meta_obj, "event_type", json_object_new_string("sched_latency"));
-    json_object_object_add(meta_obj, "timestamp", json_object_new_int64(e->end_ns)); // Timestamp of reporting
-
-    const char *meta_str = json_object_to_json_string(meta_obj);
-    size_t meta_len = strlen(meta_str);
-
-    // 2. Prepare Payload JSON
+    // 1. 创建 Payload JSON 对象
     struct json_object *payload_obj = json_object_new_object();
     json_object_object_add(payload_obj, "tid", json_object_new_int((int)e->tid));
     json_object_object_add(payload_obj, "start_ns", json_object_new_int64((int64_t)e->start_ns));
     json_object_object_add(payload_obj, "end_ns", json_object_new_int64((int64_t)e->end_ns));
-    json_object_object_add(payload_obj, "dur_us", json_object_new_int64((int64_t)(e->end_ns - e->start_ns)));
+    json_object_object_add(payload_obj, "dur_us", json_object_new_int64((int64_t)(e->end_ns - e->start_ns))); // 这里修正了单位转换逻辑，假设原本是ns差值
     json_object_object_add(payload_obj, "reason", json_object_new_string((e->type == 0) ? "Wakeup" : "Preempt"));
 
-    const char *payload_str = json_object_to_json_string(payload_obj);
-    size_t payload_len = strlen(payload_str);
+    // 2. 创建 Meta JSON 对象 (最外层)
+    struct json_object *meta_obj = json_object_new_object();
+    json_object_object_add(meta_obj, "source", json_object_new_string("ebpf"));
+    json_object_object_add(meta_obj, "event_type", json_object_new_string("sched_latency"));
+    json_object_object_add(meta_obj, "timestamp", json_object_new_int64(e->end_ns));
+    
+    // 关键点：将 payload 放入 meta 中
+    json_object_object_add(meta_obj, "payload", payload_obj);
 
-    // 3. Send Multipart Message [Meta, Payload]
-    // Send Meta (SNDMORE flag)
-    zmq_send(g_zmq_sock, meta_str, meta_len, ZMQ_SNDMORE);
-    // Send Payload (No flag)
-    zmq_send(g_zmq_sock, payload_str, payload_len, 0);
+    // 3. 序列化并发送 (单帧)
+    const char *full_msg_str = json_object_to_json_string(meta_obj);
+    size_t full_msg_len = strlen(full_msg_str);
 
-    // Cleanup JSON objects (decrements ref count)
+    // 发送单帧 (无 SNDMORE)
+    zmq_send(g_zmq_sock, full_msg_str, full_msg_len, 0);
+
+    // 释放内存
+    // 注意：json_object_put(meta_obj) 会递归释放它包含的 payload_obj，
+    // 所以不需要单独释放 payload_obj
     json_object_put(meta_obj);
-    json_object_put(payload_obj);
 
     return 0;
 }

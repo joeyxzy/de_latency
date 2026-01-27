@@ -36,6 +36,78 @@ def create_flow_event(ph, ts, pid, tid, corr_id):
         "pid": pid, "tid": tid, "id": corr_id
     }
 
+#DEBUG: 调试OS调度层的时间对齐问题（将ebpf和execute_model_span的区间在perfetto上画出来）
+def export_alignment_debug_trace(worker_spans, ebpf_events, output_filename="debug_align.json"):
+    """
+    生成一个只包含 Worker 执行区间(Green) 和 eBPF 调度事件(Red) 的 Trace。
+    用于肉眼 Debug 时间对齐问题。
+    """
+    print(f"\n🔍 Generating Debug Trace: {output_filename} ...")
+    
+    trace_events = []
+    
+    # 1. 添加 Worker Spans (绿色条)
+    for item in worker_spans:
+        # 兼容处理：有些 payload 在 item 里，有些 item 本身就是 payload
+        p = item.get('payload', item)
+        
+        pid = p.get('pid', 0)
+        tid = p.get('tid', 0)
+        start = p.get('start_ns')
+        end = p.get('end_ns')
+        
+        if start and end and tid:
+            trace_events.append({
+                "name": "Worker Span (Python)",
+                "cat": "debug_worker",
+                "ph": "X",
+                "ts": start / 1000.0,       # ns -> us
+                "dur": (end - start) / 1000.0,
+                "pid": pid,
+                "tid": tid,
+                "cname": "good",            # 绿色
+                "args": {"req_ids": p.get("req_ids")}
+            })
+
+    # 2. 添加 eBPF Events (红色条)
+    # 为了防止 eBPF 事件太短看不清，或者为了方便对比，
+    # 我们将 eBPF 事件放在同一个 PID/TID 轨道上，或者放在一个专门的 Debug 轨道
+    for item in ebpf_events:
+        p = item.get('payload', item)
+        
+        tid = p.get('tid', 0)
+        start = p.get('start_ns')
+        end = p.get('end_ns')
+        dur = p.get('dur_us', 0)
+        
+        # eBPF 数据通常没有 PID，为了让它能在 Perfetto 里跟 Worker 显示在一起，
+        # 我们尝试"借用" Worker 的 PID。这里我们做一个特殊的处理：
+        # 如果我们不知道 PID，就设为 TID (Perfetto 会把它们分到不同组，但至少能看见)
+        # 或者设为 0。为了对比，最好让它们在同一轨道。
+        
+        if start and end and tid:
+            trace_events.append({
+                "name": "OS Latency (eBPF)",
+                "cat": "debug_ebpf",
+                "ph": "X",
+                "ts": start / 1000.0,       # ns -> us
+                "dur": (end - start) / 1000.0,
+                "pid": 0,                   # 故意设为0 或者一个特定值，方便在最顶层看到
+                # "pid": p.get('pid', tid), # 如果你想让它和 Worker 挤在一起，解开这行
+                "tid": tid,                 # 关键：TID 必须一致
+                "cname": "terrible",        # 红色
+                "args": {"reason": p.get("reason")}
+            })
+
+    # 3. 输出
+    # 按时间排序
+    trace_events.sort(key=lambda x: x['ts'])
+    
+    with open(output_filename, 'w', encoding='utf-8') as f:
+        json.dump({"traceEvents": trace_events}, f)
+    
+    print(f"✅ Debug Trace Saved: {output_filename}")
+
 def process_logs(input_file, output_file):
     print(f"🔄 Loading logs from {input_file}...")
     raw_events = load_log_lines(input_file)
@@ -424,6 +496,7 @@ def process_logs(input_file, output_file):
     print("\n=== 正在计算 OS 调度/抢占延迟 (eBPF) ===")
     # 1. 预处理 eBPF 数据：按 TID 分组并按时间排序，方便快速查找
     # ebpf_map: { tid: [ {start, end, dur}, ... sorted by start ] }
+    export_alignment_debug_trace(execute_model_span, ebpf_sched_latency_events, output_filename="debug_os_latency_align.json")
     ebpf_map = defaultdict(list)
     for ev in ebpf_sched_latency_events:
         # 提取 payload 里的字段，兼容性处理

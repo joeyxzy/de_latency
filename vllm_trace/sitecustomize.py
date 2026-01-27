@@ -583,11 +583,11 @@ def patch_worker_base(module):
                     }
                 )
             # ---------------------------------------
-            start_mono = int(time.clock_gettime_ns(time.CLOCK_MONOTONIC)*1e9)
+            start_mono = int(time.clock_gettime_ns(time.CLOCK_MONOTONIC))
             try:
                 return original_func(self, scheduler_output, *args, **kwargs)
             finally:
-                end_mono = int(time.clock_gettime_ns(time.CLOCK_MONOTONIC)*1e9)
+                end_mono = int(time.clock_gettime_ns(time.CLOCK_MONOTONIC))
                 if req_ids:
                     TraceSender.emit(
                         event_type="worker_model_execute_span",
