@@ -36,6 +36,48 @@ def create_flow_event(ph, ts, pid, tid, corr_id):
         "pid": pid, "tid": tid, "id": corr_id
     }
 
+def to_ns(raw_ts):
+    """
+    统一时间戳到 ns。
+    - 若原值是大整数（>1e14），认为已是 ns。
+    - 否则按秒（float）转 ns（兼容 EngineCoreEvent.timestamp）。
+    """
+    if raw_ts is None:
+        return None
+    try:
+        val = float(raw_ts)
+    except (TypeError, ValueError):
+        return None
+    if val <= 0:
+        return None
+    if val > 1e14:
+        return int(val)
+    return int(val * 1e9)
+
+def normalize_req_event_type(raw_type):
+    if raw_type is None:
+        return None
+    s = str(raw_type).strip()
+    up = s.upper()
+
+    if s == "2" or "DEQUEUE" in up or "SCHEDULED" in up or "DISPATCH" in up:
+        return "dequeue"
+    if s == "3" or "PREEMPT" in up:
+        return "preempt"
+    if s == "1" or "QUEUE" in up or "ENQUEUE" in up:
+        return "enqueue"
+    return None
+
+def median_int(values):
+    if not values:
+        return None
+    vals = sorted(values)
+    n = len(vals)
+    mid = n // 2
+    if n % 2 == 1:
+        return vals[mid]
+    return (vals[mid - 1] + vals[mid]) // 2
+
 #DEBUG: 调试OS调度层的时间对齐问题（将ebpf和execute_model_span的区间在perfetto上画出来）
 def export_alignment_debug_trace(worker_spans, ebpf_events, output_filename="debug_align.json"):
     """
@@ -119,6 +161,7 @@ def process_logs(input_file, output_file):
     scheduler_events = []
     cupti_events = []
     req_metric_events = []
+    coroutine_events = []
     execute_model_span = []
     ebpf_sched_latency_events = []
     
@@ -161,7 +204,16 @@ def process_logs(input_file, output_file):
             elif etype in ['req_enqueue_scheduler', 'req_scheduler_out_rpc', 'req_step_ready']:
                 scheduler_events.append({"type": etype, "payload": payload})
             elif etype=="req_metrics_events":
-                req_metric_events.append(payload)
+                req_metric_events.append({
+                    "payload": payload,
+                    "batch_ts_ns": ts
+                })
+            elif etype in ['coroutine_start', 'coroutine_end']:
+                coroutine_events.append({
+                    "type": etype,
+                    "payload": payload,
+                    "ts": payload.get('timestamp_ns', ts)
+                })
             elif etype=="worker_model_execute_span":
                 execute_model_span.append(payload)
 
@@ -310,7 +362,55 @@ def process_logs(input_file, output_file):
                     cname="cyan"  # 青色
                 ))
 
-    # --- 3. Scheduler 处理 (保持原逻辑) ---
+    # --- 3. 请求生命周期 (AsyncLLM.generate 包装) ---
+    print(f"Processing Coroutine Lifecycle Events ({len(coroutine_events)})...")
+    coroutine_events.sort(key=lambda x: x.get('ts') or 0)
+
+    active_coroutines = {}
+    request_spans = {}
+
+    for ev in coroutine_events:
+        etype = ev['type']
+        payload = ev.get('payload', {})
+        rid = payload.get('request_id')
+        cid = payload.get('coroutine_id')
+        ts_ns = payload.get('timestamp_ns', ev.get('ts'))
+
+        if etype == 'coroutine_start' and rid and cid and ts_ns:
+            active_coroutines[cid] = {
+                "request_id": rid,
+                "start_ns": ts_ns,
+                "pid": payload.get('pid', 0),
+                "tid": payload.get('tid', 0),
+            }
+            continue
+
+        if etype == 'coroutine_end' and rid and ts_ns:
+            start_info = active_coroutines.pop(cid, None) if cid else None
+            if start_info:
+                start_ns = start_info['start_ns']
+                pid = start_info['pid']
+                tid = start_info['tid']
+            else:
+                duration_ms = payload.get('duration_ms')
+                duration_ns = int(duration_ms * 1e6) if duration_ms else 0
+                start_ns = ts_ns - duration_ns if duration_ns > 0 else ts_ns
+                pid = payload.get('pid', 0)
+                tid = payload.get('tid', 0)
+
+            if ts_ns > start_ns:
+                if rid not in request_spans:
+                    request_spans[rid] = {
+                        "start_ns": start_ns,
+                        "end_ns": ts_ns,
+                        "pid": pid,
+                        "tid": tid,
+                    }
+                else:
+                    request_spans[rid]["start_ns"] = min(request_spans[rid]["start_ns"], start_ns)
+                    request_spans[rid]["end_ns"] = max(request_spans[rid]["end_ns"], ts_ns)
+
+    # --- 4. Scheduler 处理 (保持原逻辑) ---
     print("Processing Scheduler Events...")
     QUEUE_PID = 1000
     QUEUE_TID = 0
@@ -429,68 +529,97 @@ def process_logs(input_file, output_file):
             trace_events.append(create_flow_event("f", start, gpu_pid, stream, corr_id))
 
     print(f"Processing Request Metric Events ({len(req_metric_events)})...")
-    req_lifecycle={} # Key: req_id, Value: list of events
-    for req_events in req_metric_events:
-        for update in req_events.get('req_events', []):
+    req_lifecycle = defaultdict(list)  # Key=req_id, Value=list[dict]
+    queue_intervals_map = defaultdict(list)  # 可视化用（墙上时间）
+    req_vllm_queue_ns = defaultdict(int)  # 聚合统计
+    mono_to_wall_offsets = []
+
+    for item in req_metric_events:
+        payload = item.get('payload', item)
+        batch_ts_ns = to_ns(item.get('batch_ts_ns'))
+        updates = payload.get('req_events', [])
+
+        # 用同一批 req_events 估计 mono->wall 偏移量
+        batch_mono_ns = []
+        for update in updates:
+            for ev in update.get('events', []):
+                ev_ns = to_ns(ev.get('ts'))
+                if ev_ns:
+                    batch_mono_ns.append(ev_ns)
+
+        batch_offset = None
+        if batch_ts_ns and batch_mono_ns:
+            batch_offset = batch_ts_ns - max(batch_mono_ns)
+            mono_to_wall_offsets.append(batch_offset)
+
+        for update in updates:
             rid = update.get('req_id')
             if not rid:
                 continue
-            if rid not in req_lifecycle:
-                req_lifecycle[rid] = []
-            raw_events_once=update.get('events', [])
-            for ev in raw_events_once:
-                ev_type = ev.get('type')
-                ev_ts = ev.get('ts')
-                if ev_type and ev_ts:
-                    req_lifecycle[rid].append((ev_type, ev_ts))
-    #为每个请求排序
-    for rid, events in req_lifecycle.items():
-        events.sort(key=lambda x: x[1])
-    #DEBUG:打印每个请求的所有事件
+            for ev in update.get('events', []):
+                etype = normalize_req_event_type(ev.get('type'))
+                mono_ns = to_ns(ev.get('ts'))
+                if not etype or not mono_ns:
+                    continue
+                wall_ns = mono_ns + batch_offset if batch_offset is not None else None
+                req_lifecycle[rid].append({
+                    "type": etype,
+                    "mono_ns": mono_ns,
+                    "wall_ns": wall_ns,
+                })
+
     for rid in req_lifecycle:
-        events = req_lifecycle[rid]
-        print(f"Request {rid} lifecycle events:")
-        for ev_type, ev_ts in events:
-            print(f"  - {ev_type} at {ev_ts}")
-    #统计每个req的排队时间：ev_type=1表示入队，ev_type=2表示调度出队，ev_type=3表示抢占；统计方法为最近的evtype=2减去最近的evtype=1以及evtype=2减去最近的evtype=3
+        req_lifecycle[rid].sort(
+            key=lambda x: (
+                x.get("mono_ns") if x.get("mono_ns") is not None else float("inf"),
+                x.get("wall_ns") if x.get("wall_ns") is not None else float("inf")
+            )
+        )
+
     print("Calculating request queue times...")
     for rid, events in req_lifecycle.items():
-        enqueue_ts = None
-        dequeue_ts = None
-        preempt_ts = None
-        sum_queue_time = 0
-        for ev_type, ev_ts in events:
-            #换ns
-            ev_ts=int(ev_ts*1e9)
-            if ev_type == "1":  # 入队
-                enqueue_ts = ev_ts
-            elif ev_type == "2":  # 调度出队
-                dequeue_ts = ev_ts
-                if enqueue_ts:
-                    queue_time = dequeue_ts - enqueue_ts
-                    sum_queue_time += queue_time
-                    # trace_events.append(create_perfetto_event(
-                    #     name=f"Req {rid[:8]} Queue Time", cat="request_metrics", ph="i",
-                    #     ts=enqueue_ts, dur=0,
-                    #     pid=QUEUE_PID, tid=QUEUE_TID,
-                    #     args={"queue_time_ns": queue_time}
-                    # ))
-                    enqueue_ts = None  # 重置，防止重复计算
-                elif preempt_ts:
-                    queue_time = dequeue_ts - preempt_ts
-                    sum_queue_time += queue_time
-                    # trace_events.append(create_perfetto_event(
-                    #     name=f"Req {rid[:8]} Queue Time (Preempted)", cat="request_metrics", ph="i",
-                    #     ts=preempt_ts, dur=0,
-                    #     pid=QUEUE_PID, tid=QUEUE_TID,
-                    #     args={"queue_time_ns": queue_time}
-                    # ))
-                    preempt_ts = None
-            elif ev_type == "3":  # 抢占
-                preempt_ts = ev_ts
-        if sum_queue_time > 0:
-            #输出每个请求的总排队时间
-            print(f"  - Request {rid} total queue time: {sum_queue_time / 1e6:.2f} ms")
+        enqueue_ev = None
+        preempt_ev = None
+        for ev in events:
+            etype = ev['type']
+            if etype == "enqueue":
+                enqueue_ev = ev
+            elif etype == "preempt":
+                preempt_ev = ev
+            elif etype == "dequeue":
+                start_ev = enqueue_ev if enqueue_ev else preempt_ev
+                if not start_ev:
+                    continue
+
+                queue_ns = None
+                if start_ev.get("mono_ns") and ev.get("mono_ns"):
+                    queue_ns = ev["mono_ns"] - start_ev["mono_ns"]
+                elif start_ev.get("wall_ns") and ev.get("wall_ns"):
+                    queue_ns = ev["wall_ns"] - start_ev["wall_ns"]
+
+                if queue_ns and queue_ns > 0:
+                    req_vllm_queue_ns[rid] += queue_ns
+
+                if start_ev.get("wall_ns") and ev.get("wall_ns") and ev["wall_ns"] > start_ev["wall_ns"]:
+                    queue_intervals_map[rid].append({
+                        "start_ns": start_ev["wall_ns"],
+                        "end_ns": ev["wall_ns"],
+                        "reason": "enqueue_wait" if enqueue_ev else "preempt_wait",
+                    })
+
+                enqueue_ev = None
+                preempt_ev = None
+
+    if req_vllm_queue_ns:
+        print(f"共统计到 {len(req_vllm_queue_ns)} 个请求的 vLLM 内部排队时间：")
+        for rid, lat_ns in sorted(req_vllm_queue_ns.items(), key=lambda x: x[1], reverse=True):
+            print(f"  - Request {rid}: {lat_ns / 1e6:.3f} ms (vLLM Internal Queue)")
+    else:
+        print("  未统计到 vLLM 内部排队时间")
+
+    global_mono_to_wall_offset = median_int(mono_to_wall_offsets)
+    if global_mono_to_wall_offset is not None:
+        print(f"Estimated mono->wall offset: {global_mono_to_wall_offset} ns")
 
 
     print("\n=== 正在计算 OS 调度/抢占延迟 (eBPF) ===")
@@ -518,6 +647,7 @@ def process_logs(input_file, output_file):
 
     # 2. 结果容器：Key=req_id, Value=total_os_delay_ns
     req_latency_map = defaultdict(int)
+    req_os_overlap_intervals = defaultdict(list)  # mono 时间轴，后续可转 wall 画图
 
     # 3. 遍历 Worker Span 计算交集
     for span in execute_model_span:
@@ -557,6 +687,12 @@ def process_logs(input_file, output_file):
             if overlap_end > overlap_start:
                 overlap_ns = overlap_end - overlap_start
                 current_span_os_delay += overlap_ns
+                for rid in req_ids:
+                    req_os_overlap_intervals[rid].append({
+                        "start_mono_ns": overlap_start,
+                        "end_mono_ns": overlap_end,
+                        "worker_tid": tid,
+                    })
 
         # 4. 归因：将计算出的延迟累加到该 Batch 的所有 Req 上
         # 逻辑：如果是 Batch 推理，这段 OS 卡顿影响了 Batch 里的每一个人
@@ -576,6 +712,109 @@ def process_logs(input_file, output_file):
             
     if not sorted_reqs:
         print("  未统计到调度延迟")
+
+    # --- 6. 按请求聚合可视化：生命周期 + vLLM排队 + OS调度 ---
+    print("\n=== Building Request Lifecycle/Queue/OS Timeline ===")
+    REQUEST_PID = 11000
+    trace_events.append({"name": "process_name", "ph": "M", "pid": REQUEST_PID, "args": {"name": "Request Interference"}})
+
+    all_req_ids = set(request_spans.keys()) | set(req_vllm_queue_ns.keys()) | set(req_latency_map.keys())
+    req_os_intervals_wall = defaultdict(list)
+    if global_mono_to_wall_offset is not None:
+        for rid, intervals in req_os_overlap_intervals.items():
+            for it in intervals:
+                s_wall = it["start_mono_ns"] + global_mono_to_wall_offset
+                e_wall = it["end_mono_ns"] + global_mono_to_wall_offset
+                if e_wall > s_wall:
+                    req_os_intervals_wall[rid].append({
+                        "start_ns": s_wall,
+                        "end_ns": e_wall,
+                        "worker_tid": it["worker_tid"],
+                    })
+    elif req_os_overlap_intervals:
+        print("  [warn] 无法估计 mono->wall 偏移，OS overlap 仅做统计，不绘制到请求生命周期轨道")
+
+    def req_sort_key(rid):
+        span = request_spans.get(rid)
+        if span and span.get("start_ns"):
+            return span["start_ns"]
+        q = queue_intervals_map.get(rid)
+        if q:
+            return q[0]["start_ns"]
+        o = req_os_intervals_wall.get(rid)
+        if o:
+            return o[0]["start_ns"]
+        return float("inf")
+
+    for req_tid, rid in enumerate(sorted(all_req_ids, key=req_sort_key), start=1):
+        trace_events.append({
+            "name": "thread_name",
+            "ph": "M",
+            "pid": REQUEST_PID,
+            "tid": req_tid,
+            "args": {"name": rid[:12]},
+        })
+
+        vllm_queue_ms = req_vllm_queue_ns.get(rid, 0) / 1e6
+        os_delay_ms = req_latency_map.get(rid, 0) / 1e6
+
+        span = request_spans.get(rid)
+        if span and span.get("end_ns", 0) > span.get("start_ns", 0):
+            trace_events.append(create_perfetto_event(
+                name=f"Req {rid[:8]} Lifecycle",
+                cat="request_lifecycle",
+                ph="X",
+                ts=span["start_ns"],
+                dur=span["end_ns"] - span["start_ns"],
+                pid=REQUEST_PID,
+                tid=req_tid,
+                args={
+                    "request_id": rid,
+                    "vllm_queue_ms": round(vllm_queue_ms, 3),
+                    "os_sched_delay_ms": round(os_delay_ms, 3),
+                },
+                cname="good",
+            ))
+
+        for q in queue_intervals_map.get(rid, []):
+            if q["end_ns"] > q["start_ns"]:
+                trace_events.append(create_perfetto_event(
+                    name="vLLM Queue Wait",
+                    cat="request_queue",
+                    ph="X",
+                    ts=q["start_ns"],
+                    dur=q["end_ns"] - q["start_ns"],
+                    pid=REQUEST_PID,
+                    tid=req_tid,
+                    args={"request_id": rid, "reason": q["reason"]},
+                    cname="yellow",
+                ))
+
+        for o in req_os_intervals_wall.get(rid, []):
+            if o["end_ns"] > o["start_ns"]:
+                trace_events.append(create_perfetto_event(
+                    name="OS Sched Delay (Attributed)",
+                    cat="request_os",
+                    ph="X",
+                    ts=o["start_ns"],
+                    dur=o["end_ns"] - o["start_ns"],
+                    pid=REQUEST_PID,
+                    tid=req_tid,
+                    args={"request_id": rid, "worker_tid": o["worker_tid"]},
+                    cname="terrible",
+                ))
+
+    print("=== Request Interference Summary ===")
+    for rid in sorted(all_req_ids, key=lambda x: (req_vllm_queue_ns.get(x, 0) + req_latency_map.get(x, 0)), reverse=True):
+        lifecycle_ms = None
+        if rid in request_spans:
+            lifecycle_ms = (request_spans[rid]["end_ns"] - request_spans[rid]["start_ns"]) / 1e6
+        print(
+            f"  - {rid}: "
+            f"lifecycle={f'{lifecycle_ms:.3f} ms' if lifecycle_ms is not None else 'N/A'}, "
+            f"vllm_queue={req_vllm_queue_ns.get(rid, 0) / 1e6:.3f} ms, "
+            f"os_delay={req_latency_map.get(rid, 0) / 1e6:.3f} ms"
+        )
 
     # --- 输出 ---
     print("✨ Sorting all trace events...")
