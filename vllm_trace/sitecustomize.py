@@ -75,6 +75,45 @@ class TraceSender:
 HOOK_REGISTRY = {}
 _WORKER_READY_PIDS = set()
 _WORKER_READY_LOCK = threading.Lock()
+_CORE_PREPROCESS_DONE_NS = {}
+_CORE_PREPROCESS_LOCK = threading.Lock()
+
+
+def _remember_core_preprocess_done(req_id: str, ts_ns: int):
+    if not req_id:
+        return
+    with _CORE_PREPROCESS_LOCK:
+        _CORE_PREPROCESS_DONE_NS[req_id] = ts_ns
+
+
+def _pop_core_preprocess_done(req_id: str):
+    if not req_id:
+        return None
+    with _CORE_PREPROCESS_LOCK:
+        return _CORE_PREPROCESS_DONE_NS.pop(req_id, None)
+
+
+def emit_req_stage(stage: str, start_ns: int, end_ns: int, request_id=None, request_name=None, extra=None):
+    if start_ns is None or end_ns is None:
+        return
+    if end_ns < start_ns:
+        return
+    rid = request_id
+    rname = request_name or rid
+    payload = {
+        "request_id": rid,
+        "request_name": rname,
+        "stage": stage,
+        "start_ns": int(start_ns),
+        "end_ns": int(end_ns),
+        "duration_ns": int(end_ns) - int(start_ns),
+        "pid": os.getpid(),
+        "tid": getattr(threading, "get_native_id", threading.get_ident)(),
+        "timestamp_ns": int(end_ns),
+    }
+    if isinstance(extra, dict):
+        payload.update(extra)
+    TraceSender.emit(event_type="req_generate_stage", payload=payload)
 
 
 def emit_worker_process_ready(stage):
@@ -99,6 +138,7 @@ def emit_worker_process_ready(stage):
         },
     )
 
+
 def register_hook(module_name):
     """装饰器：将函数注册为指定模块的 Patch 逻辑"""
     def decorator(func):
@@ -121,6 +161,135 @@ def apply_method_patch(cls, method_name, wrapper_factory):
     setattr(cls, method_name, patched_func)
     logger.info(f"Successfully patched: {cls.__name__}.{method_name}")
     return True
+
+
+@register_hook("vllm.v1.engine.core")
+def patch_v1_engine_core(module):
+    engine_core_cls = getattr(module, "EngineCore", None)
+    engine_core_proc_cls = getattr(module, "EngineCoreProc", None)
+    request_type_enum = getattr(module, "EngineCoreRequestType", None)
+    if engine_core_cls is None:
+        logger.warning(f"EngineCore class not found in {module.__name__}")
+        return
+
+    def preprocess_add_request_wrapper(original_func):
+        def wrapper(self, request):
+            start_ns = time.time_ns()
+            request_id = getattr(request, "request_id", None)
+            try:
+                return original_func(self, request)
+            finally:
+                end_ns = time.time_ns()
+                emit_req_stage(
+                    stage="engine_core.preprocess_add_request",
+                    start_ns=start_ns,
+                    end_ns=end_ns,
+                    request_id=request_id,
+                )
+                if request_id:
+                    _remember_core_preprocess_done(request_id, end_ns)
+        return wrapper
+
+    def add_request_wrapper(original_func):
+        def wrapper(self, request, request_wave=0):
+            request_id = getattr(request, "request_id", None)
+            start_ns = time.time_ns()
+            try:
+                return original_func(self, request, request_wave)
+            finally:
+                emit_req_stage(
+                    stage="engine_core.add_request",
+                    start_ns=start_ns,
+                    end_ns=time.time_ns(),
+                    request_id=request_id,
+                )
+        return wrapper
+
+    apply_method_patch(engine_core_cls, "preprocess_add_request", preprocess_add_request_wrapper)
+    apply_method_patch(engine_core_cls, "add_request", add_request_wrapper)
+
+    if engine_core_proc_cls is None or request_type_enum is None:
+        return
+
+    def handle_client_request_wrapper(original_func):
+        def wrapper(self, request_type, request):
+            is_add = request_type == request_type_enum.ADD
+            request_id = None
+            handle_start_ns = None
+            if is_add:
+                handle_start_ns = time.time_ns()
+                try:
+                    req, _ = request
+                    request_id = getattr(req, "request_id", None)
+                except Exception:
+                    request_id = None
+                if request_id:
+                    preprocess_done_ns = _pop_core_preprocess_done(request_id)
+                    if preprocess_done_ns is not None and handle_start_ns >= preprocess_done_ns:
+                        emit_req_stage(
+                            stage="engine_core.input_queue_wait_after_preprocess",
+                            start_ns=preprocess_done_ns,
+                            end_ns=handle_start_ns,
+                            request_id=request_id,
+                        )
+            try:
+                return original_func(self, request_type, request)
+            finally:
+                if is_add and handle_start_ns is not None:
+                    emit_req_stage(
+                        stage="engine_core.handle_client_add",
+                        start_ns=handle_start_ns,
+                        end_ns=time.time_ns(),
+                        request_id=request_id,
+                    )
+        return wrapper
+
+    apply_method_patch(engine_core_proc_cls, "_handle_client_request", handle_client_request_wrapper)
+
+    def process_input_queue_wrapper(original_func):
+        def wrapper(self, *args, **kwargs):
+            start_ns = time.time_ns()
+            try:
+                return original_func(self, *args, **kwargs)
+            finally:
+                end_ns = time.time_ns()
+                TraceSender.emit(
+                    event_type="enginecore_mainloop_span",
+                    payload={
+                        "phase": "_process_input_queue",
+                        "start_ns": start_ns,
+                        "end_ns": end_ns,
+                        "duration_ns": end_ns - start_ns,
+                        "pid": os.getpid(),
+                        "tid": getattr(threading, "get_native_id", threading.get_ident)(),
+                        "timestamp_ns": end_ns,
+                    },
+                )
+        return wrapper
+
+    def process_engine_step_wrapper(original_func):
+        def wrapper(self, *args, **kwargs):
+            start_ns = time.time_ns()
+            try:
+                return original_func(self, *args, **kwargs)
+            finally:
+                end_ns = time.time_ns()
+                TraceSender.emit(
+                    event_type="enginecore_mainloop_span",
+                    payload={
+                        "phase": "_process_engine_step",
+                        "start_ns": start_ns,
+                        "end_ns": end_ns,
+                        "duration_ns": end_ns - start_ns,
+                        "pid": os.getpid(),
+                        "tid": getattr(threading, "get_native_id", threading.get_ident)(),
+                        "timestamp_ns": end_ns,
+                    },
+                )
+        return wrapper
+
+    apply_method_patch(engine_core_proc_cls, "_process_input_queue", process_input_queue_wrapper)
+    apply_method_patch(engine_core_proc_cls, "_process_engine_step", process_engine_step_wrapper)
 
 # =============================================================================
 # [升级版] 鲁棒的通用拦截器 (Proxy Pattern)

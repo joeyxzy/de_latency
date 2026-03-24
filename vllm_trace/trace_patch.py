@@ -24,6 +24,7 @@ coroutine_timers = {}
 task_request_ctx = {}
 ctx_lock = threading.Lock()
 DEBUG_SCHED_PATCH = os.getenv("TRACE_PATCH_DEBUG", "0") == "1"
+ENABLE_REQ_STAGE_TIMING = os.getenv("TRACE_REQ_STAGE_TIMING", "1") == "1"
 debug_counters = {
     "call_soon_hits": 0,
     "call_soon_threadsafe_hits": 0,
@@ -38,15 +39,22 @@ sock.connect(SOCK_ADDR)
 
 def send_event(source, event_type, payload=None, extra=None):
     meta = make_metadata(source, event_type, extra=extra)
-    # 如果 payload 是结构化数据且小，直接将其合并到 meta（单帧）
-    if payload is not None and isinstance(payload, dict) and len(json.dumps(payload)) < 1500:
-        meta['payload'] = payload
-        sock.send_json(meta, flags=zmq.DONTWAIT)
-    else:
-        # multipart: meta + binary payload (payload is bytes)
-        meta_b = metadata_to_bytes(meta)
-        payload_b = payload if payload else b""
-        sock.send_multipart([meta_b, payload_b], flags=zmq.DONTWAIT)
+    try:
+        # 如果 payload 是结构化数据且小，直接将其合并到 meta（单帧）
+        if payload is not None and isinstance(payload, dict) and len(json.dumps(payload)) < 1500:
+            meta['payload'] = payload
+            sock.send_json(meta, flags=zmq.DONTWAIT)
+        else:
+            # multipart: meta + binary payload (payload is bytes)
+            meta_b = metadata_to_bytes(meta)
+            payload_b = payload if payload else b""
+            sock.send_multipart([meta_b, payload_b], flags=zmq.DONTWAIT)
+    except zmq.error.Again:
+        # 发送队列满时直接丢弃，绝不影响业务主流程
+        pass
+    except Exception:
+        # 防御性兜底：trace 不得打断推理
+        pass
 
 def get_arg_value(func, arg_name, args, kwargs):
     """从 args/kwargs 自动解析参数"""
@@ -59,6 +67,40 @@ def get_arg_value(func, arg_name, args, kwargs):
         return bound.arguments.get(arg_name, None)
     except:
         return None
+
+
+def emit_stage_duration(stage, start_ns, end_ns, request_id=None, request_name=None, extra=None):
+    """Emit a per-request stage duration event for generate->enqueue breakdown."""
+    if not ENABLE_REQ_STAGE_TIMING:
+        return
+    rid = request_id
+    rname = request_name
+    if rid is None or rname is None:
+        ctx_rid, ctx_rname = get_request_ctx_from_context(None)
+        rid = rid or ctx_rid
+        rname = rname or ctx_rname
+    rname = remember_request_name(rid, rname)
+    dur_ns = None
+    if start_ns is not None and end_ns is not None:
+        dur_ns = max(0, int(end_ns) - int(start_ns))
+    payload = {
+        "request_id": rid,
+        "request_name": rname,
+        "stage": stage,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "duration_ns": dur_ns,
+        "pid": os.getpid(),
+        "tid": threading.get_ident(),
+        "timestamp_ns": end_ns if end_ns is not None else time.time_ns(),
+    }
+    if extra and isinstance(extra, dict):
+        payload.update(extra)
+    send_event(
+        source="monkey_patch",
+        event_type="req_generate_stage",
+        payload=payload,
+    )
 
 
 def _debug_log(msg):
@@ -271,16 +313,181 @@ def patch_asyncio_scheduler():
 def patch_vllm():
     try:
         from vllm.v1.engine.async_llm import AsyncLLM
+        from vllm.v1.engine.processor import Processor
+        from vllm.v1.engine.output_processor import OutputProcessor
+        from vllm.v1.engine import core_client as core_client_module
         patch_logger.info("[VLLM_PATCH] Successfully imported AsyncLLM.")
     except ImportError:
         patch_logger.error("[VLLM_PATCH] Could not import AsyncLLM", exc_info=True)
         return
 
+    if getattr(AsyncLLM, "_de_latency_req_stage_patch_installed", False):
+        patch_logger.info("[VLLM_PATCH] Request stage patch already installed.")
+        return
+
+    def _mark_patched(func):
+        setattr(func, "_de_latency_req_stage_wrapped", True)
+        return func
+
+    def _is_patched(func):
+        return getattr(func, "_de_latency_req_stage_wrapped", False)
+
+    # 1) Patch AsyncLLM._run_output_handler: generate() 早期初始化阶段
+    if hasattr(AsyncLLM, "_run_output_handler"):
+        original_run_output_handler = AsyncLLM._run_output_handler
+        if not _is_patched(original_run_output_handler):
+            @wraps(original_run_output_handler)
+            def patched_run_output_handler(self, *args, **kwargs):
+                rid, rname = get_request_ctx_from_context(None)
+                start_ns = time.time_ns()
+                try:
+                    return original_run_output_handler(self, *args, **kwargs)
+                finally:
+                    emit_stage_duration(
+                        stage="async_llm._run_output_handler",
+                        start_ns=start_ns,
+                        end_ns=time.time_ns(),
+                        request_id=rid,
+                        request_name=rname,
+                    )
+
+            AsyncLLM._run_output_handler = _mark_patched(patched_run_output_handler)
+            patch_logger.info("[VLLM_PATCH] Patched AsyncLLM._run_output_handler.")
+
+    # 2) Patch Processor.process_inputs: 输入处理/分词阶段
+    if hasattr(Processor, "process_inputs"):
+        original_process_inputs = Processor.process_inputs
+        if not _is_patched(original_process_inputs):
+            @wraps(original_process_inputs)
+            def patched_process_inputs(self, *args, **kwargs):
+                request_id = get_arg_value(original_process_inputs, "request_id", args, kwargs)
+                request_name = remember_request_name(request_id, None)
+                start_ns = time.time_ns()
+                try:
+                    return original_process_inputs(self, *args, **kwargs)
+                finally:
+                    emit_stage_duration(
+                        stage="processor.process_inputs",
+                        start_ns=start_ns,
+                        end_ns=time.time_ns(),
+                        request_id=request_id,
+                        request_name=request_name,
+                    )
+
+            Processor.process_inputs = _mark_patched(patched_process_inputs)
+            patch_logger.info("[VLLM_PATCH] Patched Processor.process_inputs.")
+
+    # 3) Patch OutputProcessor.add_request: 本进程入输出处理队列阶段
+    if hasattr(OutputProcessor, "add_request"):
+        original_output_add_request = OutputProcessor.add_request
+        if not _is_patched(original_output_add_request):
+            @wraps(original_output_add_request)
+            def patched_output_add_request(self, *args, **kwargs):
+                request = get_arg_value(original_output_add_request, "request", args, kwargs)
+                request_id = getattr(request, "request_id", None)
+                request_name = remember_request_name(request_id, None)
+                start_ns = time.time_ns()
+                try:
+                    return original_output_add_request(self, *args, **kwargs)
+                finally:
+                    emit_stage_duration(
+                        stage="output_processor.add_request",
+                        start_ns=start_ns,
+                        end_ns=time.time_ns(),
+                        request_id=request_id,
+                        request_name=request_name,
+                    )
+
+            OutputProcessor.add_request = _mark_patched(patched_output_add_request)
+            patch_logger.info("[VLLM_PATCH] Patched OutputProcessor.add_request.")
+
+    # 4) Patch EngineCore client add_request_async: RPC/IPC 发送阶段
+    patched_core_classes = []
+    for cls_name in ["AsyncMPClient", "DPAsyncMPClient", "DPLBAsyncMPClient", "InprocClient"]:
+        cls = getattr(core_client_module, cls_name, None)
+        if cls is None or not hasattr(cls, "add_request_async"):
+            continue
+        original_core_add = getattr(cls, "add_request_async")
+        if _is_patched(original_core_add):
+            continue
+
+        @wraps(original_core_add)
+        async def patched_core_add_request_async(self, *args, __orig=original_core_add, **kwargs):
+            request = get_arg_value(__orig, "request", args, kwargs)
+            request_id = getattr(request, "request_id", None)
+            request_name = remember_request_name(request_id, None)
+            start_ns = time.time_ns()
+            try:
+                return await __orig(self, *args, **kwargs)
+            finally:
+                emit_stage_duration(
+                    stage="engine_core.add_request_async",
+                    start_ns=start_ns,
+                    end_ns=time.time_ns(),
+                    request_id=request_id,
+                    request_name=request_name,
+                    extra={"client_class": self.__class__.__name__},
+                )
+
+        setattr(cls, "add_request_async", _mark_patched(patched_core_add_request_async))
+        patched_core_classes.append(cls_name)
+    if patched_core_classes:
+        patch_logger.info(f"[VLLM_PATCH] Patched EngineCore add_request_async on {patched_core_classes}.")
+
+    # 5) Patch AsyncLLM.add_request: 总请求注册阶段
+    if hasattr(AsyncLLM, "add_request"):
+        original_add_request = AsyncLLM.add_request
+        if not _is_patched(original_add_request):
+            @wraps(original_add_request)
+            async def patched_add_request(self, *args, **kwargs):
+                request_id = get_arg_value(original_add_request, "request_id", args, kwargs)
+                request_name = remember_request_name(request_id, None)
+                start_ns = time.time_ns()
+                try:
+                    return await original_add_request(self, *args, **kwargs)
+                finally:
+                    emit_stage_duration(
+                        stage="async_llm.add_request",
+                        start_ns=start_ns,
+                        end_ns=time.time_ns(),
+                        request_id=request_id,
+                        request_name=request_name,
+                    )
+
+            AsyncLLM.add_request = _mark_patched(patched_add_request)
+            patch_logger.info("[VLLM_PATCH] Patched AsyncLLM.add_request.")
+
+    # 6) Patch AsyncLLM._add_request: 单子请求发送总耗时阶段
+    if hasattr(AsyncLLM, "_add_request"):
+        original__add_request = AsyncLLM._add_request
+        if not _is_patched(original__add_request):
+            @wraps(original__add_request)
+            async def patched__add_request(self, *args, **kwargs):
+                request = get_arg_value(original__add_request, "request", args, kwargs)
+                request_id = getattr(request, "request_id", None)
+                request_name = remember_request_name(request_id, None)
+                start_ns = time.time_ns()
+                try:
+                    return await original__add_request(self, *args, **kwargs)
+                finally:
+                    emit_stage_duration(
+                        stage="async_llm._add_request",
+                        start_ns=start_ns,
+                        end_ns=time.time_ns(),
+                        request_id=request_id,
+                        request_name=request_name,
+                    )
+
+            AsyncLLM._add_request = _mark_patched(patched__add_request)
+            patch_logger.info("[VLLM_PATCH] Patched AsyncLLM._add_request.")
+
+    # 7) Patch AsyncLLM.generate: 保留现有生命周期事件，并补充 wrapper 开销阶段
     original_generate = AsyncLLM.generate
     patch_logger.info("[VLLM_PATCH] Patching AsyncLLM.generate ...")
 
     @wraps(original_generate)
     async def patched_generate(self, *args, **kwargs):
+        wrapper_start_ns = time.time_ns()
         request_id = None
         request_name = None
         if len(args) >= 3:
@@ -301,6 +508,13 @@ def patch_vllm():
         start_t = time.monotonic()
         ts_ns = time.time_ns()
         coroutine_timers[coro_id] = (request_id, start_t)
+        emit_stage_duration(
+            stage="async_llm.generate_wrapper_setup",
+            start_ns=wrapper_start_ns,
+            end_ns=ts_ns,
+            request_id=request_id,
+            request_name=request_name,
+        )
 
         send_event(
             source="monkey_patch",
@@ -343,7 +557,8 @@ def patch_vllm():
             )
 
     AsyncLLM.generate = patched_generate
-    patch_logger.info("[VLLM_PATCH] Patch applied successfully!")
+    AsyncLLM._de_latency_req_stage_patch_installed = True
+    patch_logger.info("[VLLM_PATCH] Request stage patch applied successfully!")
 
 
 patch_asyncio_scheduler()

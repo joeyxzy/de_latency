@@ -170,6 +170,8 @@ def process_logs(input_file, output_file):
     cupti_events = []
     req_metric_events = []
     coroutine_events = []
+    req_stage_events = []
+    enginecore_loop_events = []
     execute_model_span = []
     ebpf_sched_latency_events = []
     req_name_map = {}
@@ -226,6 +228,18 @@ def process_logs(input_file, output_file):
                     "type": etype,
                     "payload": payload,
                     "ts": payload.get('timestamp_ns', ts)
+                })
+            elif etype == "req_generate_stage":
+                req_stage_events.append({
+                    "type": etype,
+                    "payload": payload,
+                    "ts": payload.get('timestamp_ns', ts),
+                })
+            elif etype == "enginecore_mainloop_span":
+                enginecore_loop_events.append({
+                    "type": etype,
+                    "payload": payload,
+                    "ts": payload.get('timestamp_ns', payload.get('end_ns', ts)),
                 })
             elif etype=="worker_model_execute_span":
                 execute_model_span.append(payload)
@@ -381,6 +395,7 @@ def process_logs(input_file, output_file):
 
     active_coroutines = {}
     request_spans = {}
+    req_generate_start_map = {}
     req_coro_sched_ns = defaultdict(int)
     req_coro_sched_intervals = defaultdict(list)
 
@@ -405,6 +420,9 @@ def process_logs(input_file, output_file):
             continue
 
         if etype == 'coroutine_start' and rid and cid and ts_ns:
+            prev_start = req_generate_start_map.get(rid)
+            if prev_start is None or ts_ns < prev_start:
+                req_generate_start_map[rid] = ts_ns
             active_coroutines[cid] = {
                 "request_id": rid,
                 "start_ns": ts_ns,
@@ -571,6 +589,151 @@ def process_logs(input_file, output_file):
             )
     else:
         print("  未统计到 vLLM 内部排队时间（Scheduler口径）")
+
+    # --- 4.5 generate->enqueue 阶段耗时拆分（统计 + 部分阶段可视化数据准备） ---
+    print(f"Processing Request Stage Events ({len(req_stage_events)})...")
+    req_stage_ns = defaultdict(lambda: defaultdict(int))
+    req_stage_counts = defaultdict(lambda: defaultdict(int))
+    req_stage_intervals = defaultdict(list)
+
+    for ev in req_stage_events:
+        payload = ev.get("payload", {})
+        rid = payload.get("request_id") or payload.get("req_id")
+        if not rid:
+            continue
+        rname = payload.get("request_name")
+        if rname:
+            req_name_map[rid] = rname
+        stage = payload.get("stage")
+        if not stage:
+            continue
+        start_ns = to_ns(payload.get("start_ns"))
+        end_ns = to_ns(payload.get("end_ns"))
+        dur_ns = to_int(payload.get("duration_ns"))
+        if dur_ns is None:
+            if start_ns is None or end_ns is None or end_ns < start_ns:
+                continue
+            dur_ns = end_ns - start_ns
+        if dur_ns < 0:
+            continue
+        req_stage_ns[rid][stage] += dur_ns
+        req_stage_counts[rid][stage] += 1
+        if start_ns is not None and end_ns is not None and end_ns > start_ns:
+            req_stage_intervals[rid].append({
+                "stage": stage,
+                "start_ns": start_ns,
+                "end_ns": end_ns,
+                "duration_ns": end_ns - start_ns,
+            })
+
+    if req_stage_ns:
+        stage_order = [
+            "async_llm.generate_wrapper_setup",
+            "async_llm._run_output_handler",
+            "processor.process_inputs",
+            "output_processor.add_request",
+            "engine_core.add_request_async",
+            "engine_core.preprocess_add_request",
+            "engine_core.input_queue_wait_after_preprocess",
+            "engine_core.handle_client_add",
+            "engine_core.add_request",
+            "async_llm._add_request",
+            "async_llm.add_request",
+        ]
+        all_stage_reqs = set(req_stage_ns.keys()) | set(req_generate_start_map.keys()) | set(req_enqueue_map.keys())
+        print("=== Generate -> Scheduler Enqueue Breakdown ===")
+        for rid in sorted(
+            all_stage_reqs,
+            key=lambda x: (
+                (to_ns(req_enqueue_map.get(x)) or 0) - (to_ns(req_generate_start_map.get(x)) or 0)
+                if (to_ns(req_enqueue_map.get(x)) and to_ns(req_generate_start_map.get(x)))
+                else sum(req_stage_ns.get(x, {}).values())
+            ),
+            reverse=True,
+        ):
+            stage_map = req_stage_ns.get(rid, {})
+            if not stage_map:
+                continue
+            known_ns = sum(stage_map.values())
+            gen_start_ns = to_ns(req_generate_start_map.get(rid))
+            enqueue_ns = to_ns(req_enqueue_map.get(rid))
+            pre_enqueue_total_ns = None
+            if gen_start_ns is not None and enqueue_ns is not None and enqueue_ns >= gen_start_ns:
+                pre_enqueue_total_ns = enqueue_ns - gen_start_ns
+            uncovered_ns = None
+            if pre_enqueue_total_ns is not None:
+                uncovered_ns = max(0, pre_enqueue_total_ns - known_ns)
+
+            label = req_name_map.get(rid, rid)
+            total_str = f"{pre_enqueue_total_ns / 1e6:.3f} ms" if pre_enqueue_total_ns is not None else "N/A"
+            uncovered_str = f"{uncovered_ns / 1e6:.3f} ms" if uncovered_ns is not None else "N/A"
+            print(f"  - {rid} ({label}): total(generate->enqueue)={total_str}, known_stages={known_ns / 1e6:.3f} ms, uncovered={uncovered_str}")
+
+            printed = set()
+            for stage in stage_order:
+                if stage in stage_map:
+                    print(
+                        f"      * {stage}: {stage_map[stage] / 1e6:.3f} ms "
+                        f"(count={req_stage_counts[rid].get(stage, 0)})"
+                    )
+                    printed.add(stage)
+            for stage, dur_ns in sorted(stage_map.items(), key=lambda x: x[1], reverse=True):
+                if stage in printed:
+                    continue
+                print(
+                    f"      * {stage}: {dur_ns / 1e6:.3f} ms "
+                    f"(count={req_stage_counts[rid].get(stage, 0)})"
+                )
+    else:
+        print("  未统计到 generate->enqueue 阶段事件")
+
+    # --- 4.6 EngineCore 主循环可视化（单独轨道） ---
+    print(f"Processing EngineCore Main Loop Events ({len(enginecore_loop_events)})...")
+    if enginecore_loop_events:
+        ENGINECORE_PID = 12000
+        trace_events.append({"name": "process_name", "ph": "M", "pid": ENGINECORE_PID, "args": {"name": "EngineCore Main Loop"}})
+        tid_alias_map = {}
+        next_tid_alias = 1
+        for item in sorted(enginecore_loop_events, key=lambda x: x.get("ts") or 0):
+            payload = item.get("payload", {})
+            phase = payload.get("phase", "unknown")
+            start_ns = to_ns(payload.get("start_ns"))
+            end_ns = to_ns(payload.get("end_ns"))
+            pid = payload.get("pid")
+            tid = payload.get("tid")
+            if start_ns is None or end_ns is None or end_ns <= start_ns:
+                continue
+
+            key = (pid, tid)
+            if key not in tid_alias_map:
+                tid_alias_map[key] = next_tid_alias
+                trace_events.append({
+                    "name": "thread_name",
+                    "ph": "M",
+                    "pid": ENGINECORE_PID,
+                    "tid": next_tid_alias,
+                    "args": {"name": f"pid={pid} tid={tid}"},
+                })
+                next_tid_alias += 1
+            tid_alias = tid_alias_map[key]
+
+            display_name = "EngineCore: Input Queue Phase" if phase == "_process_input_queue" else "EngineCore: Engine Step Phase"
+            trace_events.append(create_perfetto_event(
+                name=display_name,
+                cat="enginecore_loop",
+                ph="X",
+                ts=start_ns,
+                dur=end_ns - start_ns,
+                pid=ENGINECORE_PID,
+                tid=tid_alias,
+                args={
+                    "phase": phase,
+                    "source_pid": pid,
+                    "source_tid": tid,
+                    "duration_ms": round((end_ns - start_ns) / 1e6, 3),
+                },
+                cname="rail_idle" if phase == "_process_input_queue" else "rail_response",
+            ))
 
 
     # --- 4. CUPTI 关联 (使用生成的 Dispatch Slices) ---
@@ -759,7 +922,7 @@ def process_logs(input_file, output_file):
     REQUEST_PID = 11000
     trace_events.append({"name": "process_name", "ph": "M", "pid": REQUEST_PID, "args": {"name": "Request Interference"}})
 
-    all_req_ids = set(request_spans.keys()) | set(req_coro_sched_ns.keys()) | set(req_vllm_queue_ns.keys()) | set(req_latency_map.keys())
+    all_req_ids = set(request_spans.keys()) | set(req_coro_sched_ns.keys()) | set(req_vllm_queue_ns.keys()) | set(req_latency_map.keys()) | set(req_stage_ns.keys())
     req_os_intervals_wall = defaultdict(list)
     if global_mono_to_wall_offset is not None:
         for rid, intervals in req_os_overlap_intervals.items():
@@ -785,6 +948,9 @@ def process_logs(input_file, output_file):
         o = req_os_intervals_wall.get(rid)
         if o:
             return o[0]["start_ns"]
+        s = req_stage_intervals.get(rid)
+        if s:
+            return min(it["start_ns"] for it in s)
         return float("inf")
 
     for req_tid, rid in enumerate(sorted(all_req_ids, key=req_sort_key), start=1):
@@ -801,6 +967,8 @@ def process_logs(input_file, output_file):
         vllm_queue_from_enqueue_ms = req_vllm_queue_from_enqueue_ns.get(rid, 0) / 1e6
         vllm_queue_from_step_ready_ms = req_vllm_queue_from_step_ready_ns.get(rid, 0) / 1e6
         os_delay_ms = req_latency_map.get(rid, 0) / 1e6
+        engine_input_queue_wait_ms = req_stage_ns.get(rid, {}).get(
+            "engine_core.input_queue_wait_after_preprocess", 0) / 1e6
 
         span = request_spans.get(rid)
         if span and span.get("end_ns", 0) > span.get("start_ns", 0):
@@ -819,6 +987,7 @@ def process_logs(input_file, output_file):
                     "vllm_queue_ms": round(vllm_queue_ms, 3),
                     "vllm_queue_from_enqueue_ms": round(vllm_queue_from_enqueue_ms, 3),
                     "vllm_queue_from_step_ready_ms": round(vllm_queue_from_step_ready_ms, 3),
+                    "engine_input_queue_wait_ms": round(engine_input_queue_wait_ms, 3),
                     "os_sched_delay_ms": round(os_delay_ms, 3),
                 },
                 cname="good",
@@ -879,6 +1048,25 @@ def process_logs(input_file, output_file):
                     args={"request_id": rid, "worker_tid": o["worker_tid"]},
                     cname="terrible",
                 ))
+
+        for s in req_stage_intervals.get(rid, []):
+            if s["stage"] != "engine_core.input_queue_wait_after_preprocess":
+                continue
+            trace_events.append(create_perfetto_event(
+                name="EngineCore Input Queue Wait",
+                cat="request_engine_core_input_queue",
+                ph="X",
+                ts=s["start_ns"],
+                dur=s["end_ns"] - s["start_ns"],
+                pid=REQUEST_PID,
+                tid=req_tid,
+                args={
+                    "request_id": rid,
+                    "stage": s["stage"],
+                    "duration_ms": round((s["end_ns"] - s["start_ns"]) / 1e6, 3),
+                },
+                cname="yellow",
+            ))
 
     print("=== Request Interference Summary ===")
     for rid in sorted(all_req_ids, key=lambda x: (req_coro_sched_ns.get(x, 0) + req_vllm_queue_ns.get(x, 0) + req_latency_map.get(x, 0)), reverse=True):
