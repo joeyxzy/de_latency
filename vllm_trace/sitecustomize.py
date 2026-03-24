@@ -635,6 +635,51 @@ def patch_v1_executor(module):
     apply_method_patch(cls, "execute_model", execute_model_wrapper)
 
 
+@register_hook("vllm.v1.executor.abstract")
+def patch_v1_uniproc_executor(module):
+    target_cls = None
+    for candidate in ["UniProcExecutor", "Executor"]:
+        if hasattr(module, candidate):
+            target_cls = getattr(module, candidate)
+            break
+
+    if target_cls is None:
+        return
+
+    def execute_model_wrapper(original_func):
+        def wrapper(self, scheduler_output, *args, **kwargs):
+            req_ids = []
+            try:
+                if hasattr(scheduler_output, "scheduled_new_reqs"):
+                    for req in scheduler_output.scheduled_new_reqs:
+                        if hasattr(req, "request_id"):
+                            req_ids.append(req.request_id)
+                        elif hasattr(req, "req_id"):
+                            req_ids.append(req.req_id)
+
+                if hasattr(scheduler_output, "scheduled_cached_reqs"):
+                    cached_data = scheduler_output.scheduled_cached_reqs
+                    if cached_data is not None and hasattr(cached_data, "req_ids"):
+                        req_ids.extend(cached_data.req_ids)
+            except Exception:
+                pass
+
+            if req_ids:
+                TraceSender.emit(
+                    event_type="req_scheduler_out_rpc",
+                    payload={
+                        "req_ids": req_ids,
+                        "event": "execute_start",
+                        "batch_size": len(req_ids),
+                        "timestamp_ns": time.time_ns()
+                    }
+                )
+            return original_func(self, scheduler_output, *args, **kwargs)
+        return wrapper
+
+    apply_method_patch(target_cls, "execute_model", execute_model_wrapper)
+
+
 @register_hook("vllm.v1.worker.gpu_worker")
 def patch_worker_base(module):
     target_cls_name = None
