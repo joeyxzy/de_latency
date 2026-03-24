@@ -133,8 +133,10 @@ run_controller:
 
 run_ebpf_monitor:
 	@echo "--- Running eBPF Monitor (STANDALONE) ---"
-	@echo "Usage: sudo ./$(TARGET_EBPF_MONITOR) -p <PID>"
-	@echo "Example: sudo ./$(TARGET_EBPF_MONITOR) -p $$(pgrep -f 'python -c')"
+	@echo "Auto mode: sudo ./$(TARGET_EBPF_MONITOR)"
+	@echo "With root pid: sudo ./$(TARGET_EBPF_MONITOR) --auto --root-pid <pid>"
+	@echo "With worker pid file: sudo ./$(TARGET_EBPF_MONITOR) --auto --root-pid <pid> --worker-pid-file /tmp/tracer_worker_pids"
+	@echo "Manual mode: sudo ./$(TARGET_EBPF_MONITOR) <TID1> [TID2] ..."
 
 run: all
 	@echo "Build complete. Two independent executables created:"

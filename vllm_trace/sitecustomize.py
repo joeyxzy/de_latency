@@ -73,6 +73,31 @@ class TraceSender:
 
 # --- Hook 注册表 ---
 HOOK_REGISTRY = {}
+_WORKER_READY_PIDS = set()
+_WORKER_READY_LOCK = threading.Lock()
+
+
+def emit_worker_process_ready(stage):
+    pid = os.getpid()
+    with _WORKER_READY_LOCK:
+        if pid in _WORKER_READY_PIDS:
+            return
+        _WORKER_READY_PIDS.add(pid)
+
+    try:
+        tid = threading.get_native_id()
+    except AttributeError:
+        tid = threading.get_ident()
+
+    TraceSender.emit(
+        event_type="worker_process_ready",
+        payload={
+            "pid": pid,
+            "tid": tid,
+            "stage": stage,
+            "timestamp_ns": time.time_ns(),
+        },
+    )
 
 def register_hook(module_name):
     """装饰器：将函数注册为指定模块的 Patch 逻辑"""
@@ -369,8 +394,76 @@ def patch_v1_scheduler(module):
             )
             return original_func(self, request)
         return wrapper
+    def _safe_int(val):
+        try:
+            return int(val)
+        except Exception:
+            return None
+
+    def _phase_from_counts(num_computed_tokens, num_prompt_tokens):
+        if num_computed_tokens is None or num_prompt_tokens is None:
+            return None
+        return "prefill" if num_computed_tokens < num_prompt_tokens else "decode"
+
+    def _build_scheduled_phase_map(scheduler_obj, scheduler_output) -> Dict[str, str]:
+        """
+        为当前调度步构建 req_id -> phase 映射。
+        判定标准：num_computed_tokens < num_prompt_tokens => prefill，否则 decode。
+        这能正确覆盖 chunked prefill（包含被抢占后恢复仍在 prefill 的情况）。
+        """
+        phase_by_req = {}
+        prompt_tokens_by_req = {}
+
+        try:
+            req_map = getattr(scheduler_obj, "requests", {}) or {}
+            for rid, req in req_map.items():
+                npt = _safe_int(getattr(req, "num_prompt_tokens", None))
+                if rid and npt is not None:
+                    prompt_tokens_by_req[rid] = npt
+        except Exception:
+            pass
+
+        # 新请求：使用 NewRequestData.num_computed_tokens + num_prompt_tokens 判定
+        try:
+            if hasattr(scheduler_output, "scheduled_new_reqs"):
+                for req in scheduler_output.scheduled_new_reqs:
+                    rid = getattr(req, "request_id", None) or getattr(req, "req_id", None)
+                    if not rid:
+                        continue
+                    num_computed = _safe_int(getattr(req, "num_computed_tokens", None))
+                    num_prompt = prompt_tokens_by_req.get(rid)
+                    if num_prompt is None:
+                        prompt_ids = getattr(req, "prompt_token_ids", None)
+                        if prompt_ids is not None:
+                            num_prompt = _safe_int(len(prompt_ids))
+                    phase = _phase_from_counts(num_computed, num_prompt)
+                    if phase:
+                        phase_by_req[rid] = phase
+        except Exception:
+            pass
+
+        # 缓存请求：直接用 CachedRequestData.num_computed_tokens 判定
+        try:
+            if hasattr(scheduler_output, "scheduled_cached_reqs"):
+                cached = scheduler_output.scheduled_cached_reqs
+                if cached is not None and hasattr(cached, "req_ids"):
+                    req_ids = list(cached.req_ids)
+                    num_computed_list = list(getattr(cached, "num_computed_tokens", []) or [])
+                    for i, rid in enumerate(req_ids):
+                        if not rid:
+                            continue
+                        num_computed = _safe_int(num_computed_list[i]) if i < len(num_computed_list) else None
+                        num_prompt = prompt_tokens_by_req.get(rid)
+                        phase = _phase_from_counts(num_computed, num_prompt)
+                        if phase:
+                            phase_by_req[rid] = phase
+        except Exception:
+            pass
+
+        return phase_by_req
+
     #这个函数帮助我们将update_from_output函数返回的dict[int, EngineCoreOutputs]中的每个req的时间戳事件提取出来
-    def extract_events_from_results(results_dict: Dict[int, Any]) -> List[Dict]:
+    def extract_events_from_results(results_dict: Dict[int, Any], scheduled_phase_by_req: Dict[str, str]) -> List[Dict]:
         """
         针对确定的 vLLM V1 结构提取事件
         Input: dict[int, EngineCoreOutputs]
@@ -388,6 +481,7 @@ def patch_v1_scheduler(module):
             request_outputs_list = core_outputs_batch.outputs
             # 3. 遍历每个请求的输出
             for req_output in request_outputs_list:
+                req_id = getattr(req_output, "request_id", "unknown")
                 # req_output 就是 EngineCoreOutput 对象
                 
                 # A. 必须要有 events 才有发送价值
@@ -407,15 +501,22 @@ def patch_v1_scheduler(module):
                         e_type = str(e_type)
 
                     if e_type and e_ts:
-                        parsed_events.append({
+                        parsed = {
                             "type": e_type,
                             "ts": e_ts
-                        })
+                        }
+                        up = e_type.upper()
+                        is_scheduled = (e_type == "2") or ("SCHEDULED" in up)
+                        if is_scheduled:
+                            phase = scheduled_phase_by_req.get(req_id)
+                            if phase in ("prefill", "decode"):
+                                parsed["phase"] = phase
+                        parsed_events.append(parsed)
                 
                 # C. 如果提取到了事件，加入列表
                 if parsed_events:
                     extracted_updates.append({
-                        "req_id": getattr(req_output, "request_id", "unknown"),
+                        "req_id": req_id,
                         "events": parsed_events,
                         # 还可以带上 engine_id 方便调试
                         "engine_id": engine_id 
@@ -425,6 +526,7 @@ def patch_v1_scheduler(module):
 
     def update_from_output_wrapper(original_func):
         def wrapper(self, scheduler_output, model_output):
+            scheduled_phase_by_req = _build_scheduled_phase_map(self, scheduler_output)
             # 1. 先执行原逻辑 (确保状态更新完毕)
             res = original_func(self, scheduler_output, model_output)
             
@@ -450,12 +552,13 @@ def patch_v1_scheduler(module):
                     event_type="req_step_ready", # 事件名：这一步跑完了，准备好跑下一步了
                     payload={
                         "req_ids": req_ids,
+                        "phase_by_req": scheduled_phase_by_req,
                         "event": "step_ready",
                         "timestamp_ns": time.time_ns(),
                     }
                 )
             try:
-                req_events = extract_events_from_results(res)
+                req_events = extract_events_from_results(res, scheduled_phase_by_req)
                 if req_events:
                     #这里发送的是在这一轮update_from_output中多个req的多个时间戳时间
                     #需要在后续进行解析，将每个req的时间平铺
@@ -534,18 +637,32 @@ def patch_v1_executor(module):
 
 @register_hook("vllm.v1.worker.gpu_worker")
 def patch_worker_base(module):
-    # 修改目标为 WorkerBase
-    target_cls_name = "Worker"
-    
-    if not hasattr(module, target_cls_name):
-        logger.warning(f"⚠️ [HOOK FAIL] {target_cls_name} not found in {module.__name__}")
+    target_cls_name = None
+    cls = None
+    for candidate in ["Worker", "GPUWorker", "WorkerBase"]:
+        if hasattr(module, candidate):
+            target_cls_name = candidate
+            cls = getattr(module, candidate)
+            break
+
+    if cls is None:
+        logger.warning(f"⚠️ [HOOK FAIL] worker class not found in {module.__name__}")
         return
-    
-    cls = getattr(module, target_cls_name)
+
     logger.info(f">>> [HOOK SUCCESS] Patching Worker Entry: {cls.__name__}")
+
+    def emit_ready_wrapper_factory(stage):
+        def _factory(original_func):
+            def _wrapper(self, *args, **kwargs):
+                result = original_func(self, *args, **kwargs)
+                emit_worker_process_ready(stage=stage)
+                return result
+            return _wrapper
+        return _factory
 
     def execute_model_wrapper(original_func):
         def wrapper(self, scheduler_output, *args, **kwargs):
+            emit_worker_process_ready(stage="execute_model")
             # --- [采集点：Worker 进程入口] ---
             # 无论这是不是 Wrapper，这里都是 Worker 收到任务的第一时间
             start_ns = time.time_ns()
@@ -607,6 +724,11 @@ def patch_worker_base(module):
         apply_method_patch(cls, "execute_model", execute_model_wrapper)
     else:
         logger.warning(f"⚠️ [HOOK FAIL] execute_model not found in {target_cls_name}")
+
+    # 尽早发 ready 事件：不同版本方法名可能不同，尽量多兼容几个初始化路径
+    for method_name in ["__init__", "init_device", "load_model"]:
+        if hasattr(cls, method_name):
+            apply_method_patch(cls, method_name, emit_ready_wrapper_factory(method_name))
 
 
 # --- (示例) 可以在这里添加更多模块的 Hook ---

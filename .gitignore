@@ -6,3 +6,4 @@
 *.log
 *.dSYM
 *.json
+*.pyc

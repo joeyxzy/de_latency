@@ -69,21 +69,106 @@ LD_LIBRARY_PATH=/home/joeyxzy/zeromq_install/lib:/home/joeyxzy/jsonc_install/lib
 --load-format dummy \
 --tensor-parallel-size 2
 
+# 使用控制参数切换 vLLM 启动模式（start_server.py）
+# 说明：
+# 1) 默认模式是 serve（不传 --mode 也会走 serve）
+# 2) --mode bench 时，可用 --bench-subcommand 指定 bench 子命令
+# 3) 也支持环境变量：DE_LATENCY_VLLM_MODE / DE_LATENCY_BENCH_SUBCOMMAND
+
+# A. serve 模式（默认）
+sudo -E \
+PYTHONPATH=/home/joeyxzy/de_latency/de_latency/vllm_trace \
+LD_LIBRARY_PATH=/home/joeyxzy/zeromq_install/lib:/home/joeyxzy/jsonc_install/lib \
+./controller \
+/home/joeyxzy/miniconda3/envs/vllm/bin/python \
+/home/joeyxzy/de_latency/de_latency/vllm_trace/start_server.py \
+--model /home/joeyxzy/models/Qwen1.5-4B-Chat \
+--tensor-parallel-size 1 \
+--dtype auto \
+--max-model-len 4096 \
+--port 8001
+
+# B. bench latency 模式
+sudo -E \
+PYTHONPATH=/home/joeyxzy/de_latency/de_latency/vllm_trace \
+LD_LIBRARY_PATH=/home/joeyxzy/zeromq_install/lib:/home/joeyxzy/jsonc_install/lib \
+./controller \
+/home/joeyxzy/miniconda3/envs/vllm/bin/python \
+/home/joeyxzy/de_latency/de_latency/vllm_trace/start_server.py \
+--mode bench \
+--bench-subcommand latency \
+--model /home/joeyxzy/models/Qwen1.5-4B-Chat \
+--tensor-parallel-size 1 \
+--input-len 32 \
+--output-len 1 \
+--max-model-len 4096 \
+--enforce-eager \
+--load-format dummy
+
+# C. bench serve 模式
+sudo -E \
+PYTHONPATH=/home/joeyxzy/de_latency/de_latency/vllm_trace \
+LD_LIBRARY_PATH=/home/joeyxzy/zeromq_install/lib:/home/joeyxzy/jsonc_install/lib \
+./controller \
+/home/joeyxzy/miniconda3/envs/vllm/bin/python \
+/home/joeyxzy/de_latency/de_latency/vllm_trace/start_server.py \
+--mode bench \
+--bench-subcommand serve \
+--backend vllm \
+--model /home/joeyxzy/models/Qwen1.5-4B-Chat \
+--host 127.0.0.1 \
+--port 8001 \
+--endpoint /v1/completions \
+--dataset-name random \
+--num-prompts 200
+
+# D. 环境变量方式（等价于 --mode bench --bench-subcommand serve）
+DE_LATENCY_VLLM_MODE=bench \
+DE_LATENCY_BENCH_SUBCOMMAND=serve \
+sudo -E \
+PYTHONPATH=/home/joeyxzy/de_latency/de_latency/vllm_trace \
+LD_LIBRARY_PATH=/home/joeyxzy/zeromq_install/lib:/home/joeyxzy/jsonc_install/lib \
+./controller \
+/home/joeyxzy/miniconda3/envs/vllm/bin/python \
+/home/joeyxzy/de_latency/de_latency/vllm_trace/start_server.py \
+--backend vllm \
+--model /home/joeyxzy/models/Qwen1.5-4B-Chat \
+--host 127.0.0.1 \
+--port 8001 \
+--endpoint /v1/completions \
+--dataset-name random \
+--num-prompts 200
+
 #全流程使用总结：
 #编译
 make clean && make
 
 # 终端A：跑服务程序并写日志（collector 会写 perfetto/de_latency.log）
+# controller 会自动拉起 ebpf_monitor，并自动发现 worker 进程开始调度追踪
+# worker PID 由 monkey_patch 的 worker_process_ready 事件自动发现，不依赖进程名匹配
 cd /de_latency/build
 sudo -E   PYTHONPATH=/home/joeyxzy/de_latency/de_latency/vllm_trace  LD_LIBRARY_PATH=/home/joeyxzy/zeromq_install/lib:/home/joeyxzy/jsonc_install/lib   ./controller   /home/joeyxzy/miniconda3/envs/vllm/bin/python   /home/joeyxzy/de_latency/de_latency/vllm_trace/start_server.py   --model /home/joeyxzy/models/Qwen1.5-4B-Chat   --tensor-parallel-size 1   --dtype auto   --max-model-len 4096   --port 8001
 
-# 终端B（可选）：采集 eBPF 调度延迟
-#这里会一并写入de_latency.log
-sudo ./ebpf_monitor <worker_tid>
+# 手动单独运行（可选）：
+# 自动模式：sudo ./ebpf_monitor
+# 手动模式：sudo ./ebpf_monitor <worker_tid>
 
 # 终端C：将日志转换为 trace.json
 cd /de_latency/perfetto
 python log_to_trace.py de_latency.log trace.json
+
+#benchmarks
+#客户端压测：
+#1.sharegpt
+/home/joeyxzy/miniconda3/envs/vllm/bin/vllm bench serve   --backend vllm   --model /home/joeyxzy/models/Qwen1.5-4B-Chat   --host 127.0.0.1   --port 8001   --endpoint /v1/completions   --dataset-name sharegpt  --dataset-path /home/joeyxzy/vllm_bench/benchmarks/ShareGPT_V3_unfiltered_cleaned_split.json --num-prompts 200   --ready-check-timeout-sec 30
+#2.random
+/home/joeyxzy/miniconda3/envs/vllm/bin/vllm bench serve   --backend vllm   --model /home/joeyxzy/models/Qwen1.5-4B-Chat   --host 127.0.0.1   --port 8001   --endpoint /v1/completions   --dataset-name random   --num-prompts 200   --ready-check-timeout-sec 30
+
+#服务端启动：
+#1.使用trace工具
+sudo -E PYTHONPATH=/home/joeyxzy/de_latency/de_latency/vllm_trace LD_LIBRARY_PATH=/home/joeyxzy/zeromq_install/lib:/home/joeyxzy/jsonc_install/lib ./controller /home/joeyxzy/miniconda3/envs/vllm/bin/python /home/joeyxzy/de_latency/de_latency/vllm_trace/start_server.py --model /home/joeyxzy/models/Qwen1.5-4B-Chat --tensor-parallel-size 1 --dtype auto --max-model-len 4096 --port 8001
+#2.纯净启动：
+/home/joeyxzy/miniconda3/envs/vllm/bin/vllm serve /home/joeyxzy/models/Qwen1.5-4B-Chat   --host 127.0.0.1   --port 8001   --tensor-parallel-size 1   --dtype auto   --max-model-len 4096
 
 ```
 

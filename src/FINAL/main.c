@@ -12,10 +12,13 @@
 static volatile sig_atomic_t exiting = 0;
 static pid_t child_pid = 0;
 static pid_t collector_pid = 0;
+static pid_t ebpf_pid = 0;
 
 #define COLLECTOR_PY "/home/joeyxzy/miniconda3/envs/vllm/bin/python"
 #define COLLECTOR_SCRIPT "../src/FINAL/collector.py"
 #define ZMQ_ADDR "ipc:///tmp/tracer.sock"
+#define EBPF_MONITOR_BIN "./ebpf_monitor"
+#define WORKER_PID_FILE "/tmp/tracer_worker_pids"
 
 // --- Helper: wait for collector socket ---
 static int wait_for_path(const char *path, int timeout_ms) {
@@ -51,6 +54,44 @@ static int start_collector_process(void) {
     return pid;
 }
 
+// --- Start eBPF monitor in auto-discovery mode ---
+static pid_t start_ebpf_monitor_process(pid_t root_pid) {
+    pid_t pid;
+    char root_pid_arg[32];
+    int status;
+
+    if (root_pid <= 0) return 0;
+
+    pid = fork();
+    if (pid < 0) {
+        perror("fork ebpf_monitor");
+        return 0;
+    }
+
+    if (pid == 0) {
+        snprintf(root_pid_arg, sizeof(root_pid_arg), "%d", (int)root_pid);
+        execl(EBPF_MONITOR_BIN,
+              EBPF_MONITOR_BIN,
+              "--auto",
+              "--root-pid",
+              root_pid_arg,
+              "--worker-pid-file",
+              WORKER_PID_FILE,
+              (char *)NULL);
+        perror("execl ebpf_monitor");
+        _exit(127);
+    }
+
+    // If the monitor exits immediately, treat it as startup failure but keep controller running.
+    usleep(200 * 1000);
+    if (waitpid(pid, &status, WNOHANG) == pid) {
+        fprintf(stderr, "warning: ebpf_monitor exited during startup (status=%d)\n", status);
+        return 0;
+    }
+
+    return pid;
+}
+
 // --- ZMQ cleanup ---
 void shutdown_zmq_sender(void *ctx, void *sock) {
     if (sock) zmq_close(sock);
@@ -62,6 +103,9 @@ static void sigint_handler(int sig) {
     exiting = 1;
     if (child_pid > 0) {
         kill(child_pid, SIGTERM);
+    }
+    if (ebpf_pid > 0) {
+        kill(ebpf_pid, SIGTERM);
     }
 }
 
@@ -122,9 +166,18 @@ int main(int argc, char **argv) {
 
     printf("Launched target process PID: %d\n", child_pid);
     printf("Collector PID: %d\n", collector_pid);
+
+    // 4. Start standalone eBPF monitor automatically
+    ebpf_pid = start_ebpf_monitor_process(child_pid);
+    if (ebpf_pid > 0) {
+        printf("eBPF monitor PID: %d (auto mode)\n", ebpf_pid);
+    } else {
+        fprintf(stderr, "warning: eBPF monitor failed to start; continue without scheduler tracing\n");
+    }
+
     printf("Waiting for target to finish...\n");
 
-    // 4. Wait for child to exit
+    // 5. Wait for child to exit
     int status;
     while (!exiting) {
         if (waitpid(child_pid, &status, WNOHANG) == child_pid) {
@@ -145,6 +198,10 @@ cleanup:
     if (collector_pid > 0) {
         kill(collector_pid, SIGTERM);
         waitpid(collector_pid, NULL, 0);
+    }
+    if (ebpf_pid > 0) {
+        kill(ebpf_pid, SIGTERM);
+        waitpid(ebpf_pid, NULL, 0);
     }
 
     printf("Controller exiting.\n");

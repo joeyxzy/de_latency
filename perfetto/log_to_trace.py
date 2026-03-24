@@ -54,6 +54,14 @@ def to_ns(raw_ts):
         return int(val)
     return int(val * 1e9)
 
+def to_int(raw_val):
+    if raw_val is None:
+        return None
+    try:
+        return int(raw_val)
+    except (TypeError, ValueError):
+        return None
+
 def normalize_req_event_type(raw_type):
     if raw_type is None:
         return None
@@ -164,6 +172,7 @@ def process_logs(input_file, output_file):
     coroutine_events = []
     execute_model_span = []
     ebpf_sched_latency_events = []
+    req_name_map = {}
     
     # 辅助字典：存储 Kernel 信息
     all_kernels_map = {}
@@ -186,6 +195,10 @@ def process_logs(input_file, output_file):
             ts = entry.get('timestamp_ns', payload.get('timestamp_ns'))
 
         if not payload: continue
+        rid = payload.get("request_id") or payload.get("req_id")
+        rname = payload.get("request_name")
+        if rid and rname:
+            req_name_map[rid] = rname
         # 兜底：确保 payload 里有 timestamp_ns
         if 'timestamp_ns' not in payload and ts:
             payload['timestamp_ns'] = ts
@@ -208,7 +221,7 @@ def process_logs(input_file, output_file):
                     "payload": payload,
                     "batch_ts_ns": ts
                 })
-            elif etype in ['coroutine_start', 'coroutine_end']:
+            elif etype in ['coroutine_start', 'coroutine_end', 'coroutine_sched_latency']:
                 coroutine_events.append({
                     "type": etype,
                     "payload": payload,
@@ -368,6 +381,8 @@ def process_logs(input_file, output_file):
 
     active_coroutines = {}
     request_spans = {}
+    req_coro_sched_ns = defaultdict(int)
+    req_coro_sched_intervals = defaultdict(list)
 
     for ev in coroutine_events:
         etype = ev['type']
@@ -375,6 +390,19 @@ def process_logs(input_file, output_file):
         rid = payload.get('request_id')
         cid = payload.get('coroutine_id')
         ts_ns = payload.get('timestamp_ns', ev.get('ts'))
+
+        if etype == 'coroutine_sched_latency':
+            ready_ts_ns = to_int(payload.get('ready_ts_ns'))
+            run_ts_ns = to_int(payload.get('run_ts_ns'))
+            queue_ns = to_int(payload.get('queue_ns'))
+            if rid and queue_ns is not None and queue_ns >= 0:
+                req_coro_sched_ns[rid] += queue_ns
+            if rid and ready_ts_ns and run_ts_ns and run_ts_ns > ready_ts_ns:
+                req_coro_sched_intervals[rid].append({
+                    "start_ns": ready_ts_ns,
+                    "end_ns": run_ts_ns,
+                })
+            continue
 
         if etype == 'coroutine_start' and rid and cid and ts_ns:
             active_coroutines[cid] = {
@@ -409,6 +437,14 @@ def process_logs(input_file, output_file):
                 else:
                     request_spans[rid]["start_ns"] = min(request_spans[rid]["start_ns"], start_ns)
                     request_spans[rid]["end_ns"] = max(request_spans[rid]["end_ns"], ts_ns)
+
+    if req_coro_sched_ns:
+        print(f"共统计到 {len(req_coro_sched_ns)} 个请求的协程调度排队时间：")
+        for rid, lat_ns in sorted(req_coro_sched_ns.items(), key=lambda x: x[1], reverse=True):
+            label = req_name_map.get(rid, rid)
+            print(f"  - Request {rid} ({label}): {lat_ns / 1e6:.3f} ms (Coroutine Scheduler Queue)")
+    else:
+        print("  未统计到协程调度排队时间")
 
     # --- 4. Scheduler 处理 (保持原逻辑) ---
     print("Processing Scheduler Events...")
@@ -531,7 +567,9 @@ def process_logs(input_file, output_file):
     print(f"Processing Request Metric Events ({len(req_metric_events)})...")
     req_lifecycle = defaultdict(list)  # Key=req_id, Value=list[dict]
     queue_intervals_map = defaultdict(list)  # 可视化用（墙上时间）
-    req_vllm_queue_ns = defaultdict(int)  # 聚合统计
+    req_vllm_queue_ns = defaultdict(int)  # 聚合统计（总排队）
+    req_vllm_prefill_queue_ns = defaultdict(int)  # 聚合统计（Prefill排队）
+    req_vllm_decode_queue_ns = defaultdict(int)  # 聚合统计（Decode排队）
     mono_to_wall_offsets = []
 
     for item in req_metric_events:
@@ -562,10 +600,16 @@ def process_logs(input_file, output_file):
                 if not etype or not mono_ns:
                     continue
                 wall_ns = mono_ns + batch_offset if batch_offset is not None else None
+                phase = ev.get("phase")
+                if phase is not None:
+                    phase = str(phase).strip().lower()
+                    if phase not in ("prefill", "decode"):
+                        phase = None
                 req_lifecycle[rid].append({
                     "type": etype,
                     "mono_ns": mono_ns,
                     "wall_ns": wall_ns,
+                    "phase": phase,
                 })
 
     for rid in req_lifecycle:
@@ -578,42 +622,60 @@ def process_logs(input_file, output_file):
 
     print("Calculating request queue times...")
     for rid, events in req_lifecycle.items():
-        enqueue_ev = None
-        preempt_ev = None
+        pending_wait_ev = None
         for ev in events:
             etype = ev['type']
-            if etype == "enqueue":
-                enqueue_ev = ev
-            elif etype == "preempt":
-                preempt_ev = ev
-            elif etype == "dequeue":
-                start_ev = enqueue_ev if enqueue_ev else preempt_ev
-                if not start_ev:
-                    continue
+            if etype in ("enqueue", "preempt"):
+                pending_wait_ev = ev
+                continue
 
-                queue_ns = None
-                if start_ev.get("mono_ns") and ev.get("mono_ns"):
-                    queue_ns = ev["mono_ns"] - start_ev["mono_ns"]
-                elif start_ev.get("wall_ns") and ev.get("wall_ns"):
-                    queue_ns = ev["wall_ns"] - start_ev["wall_ns"]
+            if etype != "dequeue":
+                continue
 
-                if queue_ns and queue_ns > 0:
-                    req_vllm_queue_ns[rid] += queue_ns
+            start_ev = pending_wait_ev
+            if not start_ev:
+                continue
 
-                if start_ev.get("wall_ns") and ev.get("wall_ns") and ev["wall_ns"] > start_ev["wall_ns"]:
-                    queue_intervals_map[rid].append({
-                        "start_ns": start_ev["wall_ns"],
-                        "end_ns": ev["wall_ns"],
-                        "reason": "enqueue_wait" if enqueue_ev else "preempt_wait",
-                    })
+            queue_ns = None
+            if start_ev.get("mono_ns") and ev.get("mono_ns"):
+                queue_ns = ev["mono_ns"] - start_ev["mono_ns"]
+            elif start_ev.get("wall_ns") and ev.get("wall_ns"):
+                queue_ns = ev["wall_ns"] - start_ev["wall_ns"]
 
-                enqueue_ev = None
-                preempt_ev = None
+            # 新日志优先使用 SCHEDULED 事件携带的 phase（可正确覆盖 chunked prefill）。
+            # 旧日志回退：enqueue->prefill, preempt->decode。
+            phase = ev.get("phase")
+            if phase not in ("prefill", "decode"):
+                phase = "prefill" if start_ev["type"] == "enqueue" else "decode"
+
+            if queue_ns and queue_ns > 0:
+                req_vllm_queue_ns[rid] += queue_ns
+                if phase == "prefill":
+                    req_vllm_prefill_queue_ns[rid] += queue_ns
+                else:
+                    req_vllm_decode_queue_ns[rid] += queue_ns
+
+            if start_ev.get("wall_ns") and ev.get("wall_ns") and ev["wall_ns"] > start_ev["wall_ns"]:
+                scheduled_from = start_ev.get("type")
+                queue_intervals_map[rid].append({
+                    "start_ns": start_ev["wall_ns"],
+                    "end_ns": ev["wall_ns"],
+                    "reason": "prefill_wait" if phase == "prefill" else "decode_wait",
+                    "phase": phase,
+                    "scheduled_from": scheduled_from,
+                })
+
+            pending_wait_ev = None
 
     if req_vllm_queue_ns:
         print(f"共统计到 {len(req_vllm_queue_ns)} 个请求的 vLLM 内部排队时间：")
         for rid, lat_ns in sorted(req_vllm_queue_ns.items(), key=lambda x: x[1], reverse=True):
-            print(f"  - Request {rid}: {lat_ns / 1e6:.3f} ms (vLLM Internal Queue)")
+            prefill_ns = req_vllm_prefill_queue_ns.get(rid, 0)
+            decode_ns = req_vllm_decode_queue_ns.get(rid, 0)
+            print(
+                f"  - Request {rid}: {lat_ns / 1e6:.3f} ms "
+                f"(prefill={prefill_ns / 1e6:.3f} ms, decode={decode_ns / 1e6:.3f} ms)"
+            )
     else:
         print("  未统计到 vLLM 内部排队时间")
 
@@ -718,7 +780,7 @@ def process_logs(input_file, output_file):
     REQUEST_PID = 11000
     trace_events.append({"name": "process_name", "ph": "M", "pid": REQUEST_PID, "args": {"name": "Request Interference"}})
 
-    all_req_ids = set(request_spans.keys()) | set(req_vllm_queue_ns.keys()) | set(req_latency_map.keys())
+    all_req_ids = set(request_spans.keys()) | set(req_coro_sched_ns.keys()) | set(req_vllm_queue_ns.keys()) | set(req_latency_map.keys())
     req_os_intervals_wall = defaultdict(list)
     if global_mono_to_wall_offset is not None:
         for rid, intervals in req_os_overlap_intervals.items():
@@ -755,7 +817,10 @@ def process_logs(input_file, output_file):
             "args": {"name": rid[:12]},
         })
 
+        coro_sched_queue_ms = req_coro_sched_ns.get(rid, 0) / 1e6
         vllm_queue_ms = req_vllm_queue_ns.get(rid, 0) / 1e6
+        vllm_prefill_queue_ms = req_vllm_prefill_queue_ns.get(rid, 0) / 1e6
+        vllm_decode_queue_ms = req_vllm_decode_queue_ns.get(rid, 0) / 1e6
         os_delay_ms = req_latency_map.get(rid, 0) / 1e6
 
         span = request_spans.get(rid)
@@ -770,23 +835,57 @@ def process_logs(input_file, output_file):
                 tid=req_tid,
                 args={
                     "request_id": rid,
+                    "request_name": req_name_map.get(rid, rid),
+                    "coro_sched_queue_ms": round(coro_sched_queue_ms, 3),
                     "vllm_queue_ms": round(vllm_queue_ms, 3),
+                    "vllm_prefill_queue_ms": round(vllm_prefill_queue_ms, 3),
+                    "vllm_decode_queue_ms": round(vllm_decode_queue_ms, 3),
                     "os_sched_delay_ms": round(os_delay_ms, 3),
                 },
                 cname="good",
             ))
 
+        for q0 in req_coro_sched_intervals.get(rid, []):
+            if q0["end_ns"] > q0["start_ns"]:
+                trace_events.append(create_perfetto_event(
+                    name="Coroutine Scheduler Queue Wait",
+                    cat="request_coro_sched_queue",
+                    ph="X",
+                    ts=q0["start_ns"],
+                    dur=q0["end_ns"] - q0["start_ns"],
+                    pid=REQUEST_PID,
+                    tid=req_tid,
+                    args={"request_id": rid, "request_name": req_name_map.get(rid, rid)},
+                    cname="yellow",
+                ))
+
         for q in queue_intervals_map.get(rid, []):
             if q["end_ns"] > q["start_ns"]:
+                phase = q.get("phase")
+                scheduled_from = q.get("scheduled_from")
+                if scheduled_from == "enqueue":
+                    q_name = "vLLM Queue Wait (scheduled-enqueue)"
+                    q_cat = "request_queue_scheduled_enqueue"
+                elif scheduled_from == "preempt":
+                    q_name = "vLLM Queue Wait (scheduled-preempt)"
+                    q_cat = "request_queue_scheduled_preempt"
+                else:
+                    q_name = "vLLM Queue Wait"
+                    q_cat = "request_queue"
                 trace_events.append(create_perfetto_event(
-                    name="vLLM Queue Wait",
-                    cat="request_queue",
+                    name=q_name,
+                    cat=q_cat,
                     ph="X",
                     ts=q["start_ns"],
                     dur=q["end_ns"] - q["start_ns"],
                     pid=REQUEST_PID,
                     tid=req_tid,
-                    args={"request_id": rid, "reason": q["reason"]},
+                    args={
+                        "request_id": rid,
+                        "reason": q["reason"],
+                        "phase": phase,
+                        "scheduled_from": scheduled_from,
+                    },
                     cname="yellow",
                 ))
 
@@ -805,14 +904,17 @@ def process_logs(input_file, output_file):
                 ))
 
     print("=== Request Interference Summary ===")
-    for rid in sorted(all_req_ids, key=lambda x: (req_vllm_queue_ns.get(x, 0) + req_latency_map.get(x, 0)), reverse=True):
+    for rid in sorted(all_req_ids, key=lambda x: (req_coro_sched_ns.get(x, 0) + req_vllm_queue_ns.get(x, 0) + req_latency_map.get(x, 0)), reverse=True):
         lifecycle_ms = None
         if rid in request_spans:
             lifecycle_ms = (request_spans[rid]["end_ns"] - request_spans[rid]["start_ns"]) / 1e6
         print(
             f"  - {rid}: "
             f"lifecycle={f'{lifecycle_ms:.3f} ms' if lifecycle_ms is not None else 'N/A'}, "
-            f"vllm_queue={req_vllm_queue_ns.get(rid, 0) / 1e6:.3f} ms, "
+            f"coro_sched_queue={req_coro_sched_ns.get(rid, 0) / 1e6:.3f} ms, "
+            f"vllm_queue={req_vllm_queue_ns.get(rid, 0) / 1e6:.3f} ms "
+            f"(prefill={req_vllm_prefill_queue_ns.get(rid, 0) / 1e6:.3f} ms, "
+            f"decode={req_vllm_decode_queue_ns.get(rid, 0) / 1e6:.3f} ms), "
             f"os_delay={req_latency_map.get(rid, 0) / 1e6:.3f} ms"
         )
 
