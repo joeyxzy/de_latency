@@ -243,6 +243,101 @@ def to_int(raw_val):
     except (TypeError, ValueError):
         return None
 
+def normalize_request_id(raw_rid):
+    if raw_rid is None or isinstance(raw_rid, bool):
+        return None
+
+    if isinstance(raw_rid, bytes):
+        try:
+            raw_rid = raw_rid.decode("utf-8", errors="ignore")
+        except Exception:
+            raw_rid = str(raw_rid)
+
+    if isinstance(raw_rid, str):
+        rid = raw_rid.strip()
+        return rid or None
+
+    if isinstance(raw_rid, (int, float, Decimal)):
+        rid = str(raw_rid).strip()
+        return rid or None
+
+    if isinstance(raw_rid, dict):
+        for key in ("request_id", "req_id", "id", "rid", "value"):
+            if key in raw_rid:
+                candidate = normalize_request_id(raw_rid.get(key))
+                if candidate:
+                    return candidate
+        try:
+            rid = json.dumps(raw_rid, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            rid = str(raw_rid)
+        rid = rid.strip()
+        return rid or None
+
+    if isinstance(raw_rid, (list, tuple, set)):
+        if len(raw_rid) == 1:
+            return normalize_request_id(next(iter(raw_rid)))
+        items = [normalize_request_id(item) for item in raw_rid]
+        items = [item for item in items if item]
+        if not items:
+            return None
+        try:
+            rid = json.dumps(items, ensure_ascii=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            rid = str(items)
+        rid = rid.strip()
+        return rid or None
+
+    rid = str(raw_rid).strip()
+    return rid or None
+
+def normalize_request_ids(raw_req_ids):
+    if raw_req_ids is None:
+        return []
+    if isinstance(raw_req_ids, (list, tuple, set)):
+        values = raw_req_ids
+    else:
+        values = [raw_req_ids]
+    normalized = []
+    for item in values:
+        rid = normalize_request_id(item)
+        if rid:
+            normalized.append(rid)
+    return normalized
+
+def normalize_payload_request_fields(payload):
+    if not isinstance(payload, dict):
+        return payload
+
+    request_name = normalize_request_id(payload.get("request_name"))
+    if "request_name" in payload:
+        payload["request_name"] = request_name
+
+    if "request_id" in payload:
+        raw_request_id = payload.get("request_id")
+        normalized_request_id = normalize_request_id(raw_request_id)
+        # 有些日志把 prompt/prompt_token_ids 整个对象塞进 request_id。
+        # 这类场景优先使用 request_name 作为稳定主键，避免污染汇总输出。
+        if isinstance(raw_request_id, (dict, list, tuple, set)) and request_name:
+            normalized_request_id = request_name
+        payload["request_id"] = normalized_request_id
+    if "req_id" in payload:
+        raw_req_id = payload.get("req_id")
+        normalized_req_id = normalize_request_id(raw_req_id)
+        if isinstance(raw_req_id, (dict, list, tuple, set)) and request_name:
+            normalized_req_id = request_name
+        payload["req_id"] = normalized_req_id
+    if "req_ids" in payload:
+        payload["req_ids"] = normalize_request_ids(payload.get("req_ids"))
+
+    req_events = payload.get("req_events")
+    if isinstance(req_events, list):
+        for update in req_events:
+            if isinstance(update, dict) and "req_id" in update:
+                update["req_id"] = normalize_request_id(update.get("req_id"))
+
+    return payload
+
 def normalize_req_event_type(raw_type):
     if raw_type is None:
         return None
@@ -377,7 +472,11 @@ def process_logs(input_file, output_file):
             etype = entry.get('event_type')
             ts = entry.get('timestamp_ns', payload.get('timestamp_ns'))
 
-        if not payload: continue
+        if not payload:
+            continue
+        payload = normalize_payload_request_fields(payload)
+        if not isinstance(payload, dict):
+            continue
         rid = payload.get("request_id") or payload.get("req_id")
         rname = payload.get("request_name")
         if rid and rname:
@@ -595,8 +694,8 @@ def process_logs(input_file, output_file):
     for ev in coroutine_events:
         etype = ev['type']
         payload = ev.get('payload', {})
-        rid = payload.get('request_id')
-        cid = payload.get('coroutine_id')
+        rid = payload.get('request_id') or payload.get('req_id')
+        cid = normalize_request_id(payload.get('coroutine_id'))
         ts_ns = payload.get('timestamp_ns', ev.get('ts'))
 
         if etype == 'coroutine_sched_latency':
