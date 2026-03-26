@@ -7,6 +7,7 @@
 #include <map>
 #include <vector>
 #include <mutex>
+#include <climits>
 #include <stdarg.h> // For va_list, va_start, etc.
 #include <fcntl.h>  // For fcntl
 #include <errno.h>  // For errno
@@ -53,7 +54,7 @@ void tracer_log(const char* format, ...) {
     }                                                                   \
   } while (0)
 
-#define BUF_SIZE (64 * 1024)
+#define BUF_SIZE (1024 * 1024)
 #define ALIGN_SIZE (8)
 #define ALIGN_BUFFER(buffer, align)                                            \
   (((uintptr_t) (buffer) & ((align)-1)) ? ((buffer) + (align) - ((uintptr_t) (buffer) & ((align)-1))) : (buffer))
@@ -74,10 +75,29 @@ getMemcpyKindString(CUpti_ActivityMemcpyKind kind)
 // --- GLOBAL STATE ---
 static std::map<uint32_t, pid_t> g_corr_to_ostid_map;
 static std::mutex g_corr_mutex;
+static std::mutex g_zmq_send_mutex;
 static CUpti_SubscriberHandle g_subscriber;
 static void *g_zmq_ctx = NULL;
 static void *g_zmq_push = NULL;
 static char g_zmq_addr[256] = {0};
+static int g_zmq_send_retry = 200;
+static int g_zmq_send_retry_us = 50;
+
+static int read_env_int(const char *key, int default_value, int min_value, int max_value) {
+    const char *s = getenv(key);
+    if (!s || !*s) return default_value;
+
+    errno = 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0') {
+        tracer_log("Invalid integer for %s=%s, fallback to %d", key, s, default_value);
+        return default_value;
+    }
+    if (v < min_value) v = min_value;
+    if (v > max_value) v = max_value;
+    return (int)v;
+}
 
 static void init_zmq_from_env() {
     const char *addr = getenv("TRACER_ZMQ_ADDR");
@@ -97,13 +117,24 @@ static void init_zmq_from_env() {
         zmq_ctx_term(g_zmq_ctx); g_zmq_ctx=NULL;
         return;
     }
+    int sndhwm = read_env_int("TRACER_ZMQ_SNDHWM", 200000, 1000, INT_MAX);
+    if (zmq_setsockopt(g_zmq_push, ZMQ_SNDHWM, &sndhwm, sizeof(sndhwm)) != 0) {
+        tracer_log("zmq_setsockopt(ZMQ_SNDHWM=%d) failed: %s", sndhwm, zmq_strerror(errno));
+    }
+    int immediate = 1;
+    if (zmq_setsockopt(g_zmq_push, ZMQ_IMMEDIATE, &immediate, sizeof(immediate)) != 0) {
+        tracer_log("zmq_setsockopt(ZMQ_IMMEDIATE=1) failed: %s", zmq_strerror(errno));
+    }
+    g_zmq_send_retry = read_env_int("TRACER_ZMQ_SEND_RETRY", 200, 0, 100000);
+    g_zmq_send_retry_us = read_env_int("TRACER_ZMQ_SEND_RETRY_US", 50, 0, 1000000);
     if (zmq_connect(g_zmq_push, g_zmq_addr) != 0) {
         tracer_log("zmq_connect(%s) failed: %s", g_zmq_addr, zmq_strerror(errno));
         zmq_close(g_zmq_push); zmq_ctx_term(g_zmq_ctx);
         g_zmq_push=NULL; g_zmq_ctx=NULL;
         return;
     }
-    tracer_log("ZMQ connected: %s", g_zmq_addr);
+    tracer_log("ZMQ connected: %s (sndhwm=%d, retry=%d, retry_us=%d)",
+               g_zmq_addr, sndhwm, g_zmq_send_retry, g_zmq_send_retry_us);
 }
 
 static const char *record_type_str(uint32_t t) {
@@ -189,9 +220,25 @@ static void send_record_payload(const UnifiedTraceRecord *rec) {
     struct json_object *meta = make_metadata("CUPTI", record_type_str(rec->type), NULL, -1);
     json_object_object_add(meta, "payload", payload);
     const char *js = metadata_to_bytes(meta);
-    int rc = zmq_send(g_zmq_push, js, strlen(js), ZMQ_DONTWAIT);
+    int rc = -1;
+    int saved_errno = 0;
+    for (int attempt = 0; attempt <= g_zmq_send_retry; ++attempt) {
+        {
+            std::lock_guard<std::mutex> lock(g_zmq_send_mutex);
+            rc = zmq_send(g_zmq_push, js, strlen(js), ZMQ_DONTWAIT);
+            saved_errno = errno;
+        }
+        if (rc >= 0) break;
+        if (saved_errno != EAGAIN || attempt == g_zmq_send_retry) break;
+        if (g_zmq_send_retry_us > 0) usleep((useconds_t)g_zmq_send_retry_us);
+    }
     if (rc < 0) {
-        tracer_log("zmq_send failed: %s", zmq_strerror(errno));
+        if (saved_errno == EAGAIN) {
+            tracer_log("zmq_send failed after retries (%d): %s",
+                       g_zmq_send_retry, zmq_strerror(saved_errno));
+        } else {
+            tracer_log("zmq_send failed: %s", zmq_strerror(saved_errno));
+        }
     }
     json_object_put(meta);
   }
@@ -353,6 +400,20 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
 
     } while (status == CUPTI_SUCCESS);
 
+    size_t dropped = 0;
+    CUptiResult drop_status = cuptiActivityGetNumDroppedRecords(ctx, streamId, &dropped);
+    if (drop_status == CUPTI_SUCCESS) {
+        if (dropped > 0) {
+            tracer_log("Warning: CUPTI dropped %zu activity records (streamId=%u).",
+                       dropped, streamId);
+        }
+    } else if (drop_status != CUPTI_ERROR_INVALID_PARAMETER) {
+        const char *errstr = NULL;
+        cuptiGetResultString(drop_status, &errstr);
+        tracer_log("Warning: cuptiActivityGetNumDroppedRecords failed: %s",
+                   errstr ? errstr : "unknown");
+    }
+
     free(buffer);
 }
 
@@ -415,7 +476,7 @@ void deinitCuptiTracer() {
     // 确保在关闭追踪之前，处理完所有已经产生但在缓冲区中的数据。
     // --------------------------------------------------------------------
     tracer_log("[DEINIT] Flushing all remaining CUPTI activity...");
-    CUPTI_CALL(cuptiActivityFlushAll(0)); // 0 表示同步刷新，等待所有buffer被处理完
+    CUPTI_CALL(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED));
     tracer_log("[DEINIT] Flushed all activity.");
 
 

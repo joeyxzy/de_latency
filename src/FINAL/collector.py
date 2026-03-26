@@ -1,9 +1,22 @@
 import json
+import os
 from pathlib import Path
 
 import zmq
 
 SOCK_ADDR = "ipc:///tmp/tracer.sock"
+
+
+def _env_int(name, default, min_value):
+    try:
+        value = int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+    return max(min_value, value)
+
+
+RCVHWM = _env_int("TRACER_ZMQ_RCVHWM", 200000, 1000)
+LOG_FLUSH_EVERY = _env_int("TRACER_LOG_FLUSH_EVERY", 1000, 1)
 
 LOG_DIR = Path.cwd()
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -20,7 +33,7 @@ WORKER_PID_EVENTS = {
 _known_worker_pids = set()
 
 
-def _log(src, meta, payload):
+def _log(log_file, src, meta, payload):
     rec = {
         "src": src,
         "meta": meta,
@@ -29,8 +42,7 @@ def _log(src, meta, payload):
             if isinstance(payload, (bytes, bytearray)) else payload
         ),
     }
-    with open(CUPTI_LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    log_file.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
 def _get_src(meta):
@@ -81,7 +93,7 @@ def _persist_worker_pid(pid):
     print(f"[collector] discovered worker pid={pid}", flush=True)
 
 
-def handle_frames(frames):
+def handle_frames(frames, log_file):
     meta = None
     payload = None
 
@@ -90,7 +102,7 @@ def handle_frames(frames):
         meta = json.loads(meta_json)
     except Exception as e:
         print(f"[collector] invalid JSON: {e}", flush=True)
-        return
+        return False
 
     if len(frames) == 2:
         try:
@@ -102,26 +114,34 @@ def handle_frames(frames):
         payload = meta.get("payload")
     else:
         print(f"[ERROR] Unexpected multipart size: {len(frames)}", flush=True)
-        return
+        return False
 
     src = _get_src(meta)
     _persist_worker_pid(_extract_worker_pid(src, meta, payload))
 
     if src == "ebpf" or src == "cupti" or src == "monkey_patch":
-        _log(src, meta, payload)
-        return
+        _log(log_file, src, meta, payload)
+        return True
+    return False
 
 
 def collector():
     ctx = zmq.Context()
     sock = ctx.socket(zmq.PULL)
+    sock.setsockopt(zmq.RCVHWM, RCVHWM)
+    sock.setsockopt(zmq.LINGER, 0)
     sock.bind(SOCK_ADDR)
 
-    print("[collector] started, listening on", SOCK_ADDR)
+    print("[collector] started, listening on", SOCK_ADDR, f"(rcvhwm={RCVHWM}, flush_every={LOG_FLUSH_EVERY})")
 
-    while True:
-        frames = sock.recv_multipart()
-        handle_frames(frames)
+    written = 0
+    with open(CUPTI_LOG, "a", encoding="utf-8") as log_file:
+        while True:
+            frames = sock.recv_multipart()
+            if handle_frames(frames, log_file):
+                written += 1
+                if written % LOG_FLUSH_EVERY == 0:
+                    log_file.flush()
 
 
 if __name__ == "__main__":
