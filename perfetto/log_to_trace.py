@@ -1,7 +1,11 @@
 import json
 import sys
-from collections import defaultdict
+from collections import defaultdict, deque
 import os
+import math
+from decimal import Decimal, InvalidOperation
+
+TRACE_TS_ORIGIN_NS = 0
 
 def load_log_lines(filepath):
     events = []
@@ -21,7 +25,7 @@ def load_log_lines(filepath):
 def create_perfetto_event(name, cat, ph, ts, dur, pid, tid, args=None, cname=None):
     # Perfetto 要求时间单位是微秒 (us)
     event = {
-        "name": name, "cat": cat, "ph": ph, "ts": ts / 1000.0, 
+        "name": name, "cat": cat, "ph": ph, "ts": (ts - TRACE_TS_ORIGIN_NS) / 1000.0, 
         "pid": pid, "tid": tid, "args": args or {}
     }
     if dur is not None: 
@@ -32,9 +36,145 @@ def create_perfetto_event(name, cat, ph, ts, dur, pid, tid, args=None, cname=Non
 
 def create_flow_event(ph, ts, pid, tid, corr_id):
     return {
-        "name": "link", "cat": "flow", "ph": ph, "ts": ts / 1000.0, 
+        "name": "link", "cat": "flow", "ph": ph, "ts": (ts - TRACE_TS_ORIGIN_NS) / 1000.0, 
         "pid": pid, "tid": tid, "id": corr_id
     }
+
+def infer_trace_origin_ns(
+    worker_events,
+    scheduler_events,
+    coroutine_events,
+    req_stage_events,
+    enginecore_loop_events,
+    execute_model_span,
+):
+    """
+    推断 wall 时间轴的最小 ns 作为 trace 原点。
+    目的是把超大绝对时间戳平移到接近 0，避免浮点在 1e15 us 量级产生 0.25us 量化误差。
+    """
+    min_ns = None
+
+    def _update(candidate):
+        nonlocal min_ns
+        ns = to_ns(candidate)
+        if ns is None:
+            return
+        if min_ns is None or ns < min_ns:
+            min_ns = ns
+
+    for ev in worker_events:
+        p = ev.get("payload", {})
+        _update(p.get("timestamp_ns", ev.get("ts")))
+        _update(p.get("start_ns"))
+        _update(p.get("end_ns"))
+
+    for ev in scheduler_events:
+        p = ev.get("payload", {})
+        _update(p.get("timestamp_ns"))
+
+    for ev in coroutine_events:
+        p = ev.get("payload", {})
+        _update(p.get("timestamp_ns", ev.get("ts")))
+
+    for ev in req_stage_events:
+        p = ev.get("payload", {})
+        _update(p.get("timestamp_ns", ev.get("ts")))
+        _update(p.get("start_ns"))
+        _update(p.get("end_ns"))
+
+    for ev in enginecore_loop_events:
+        p = ev.get("payload", {})
+        _update(p.get("timestamp_ns", ev.get("ts")))
+        _update(p.get("start_ns"))
+        _update(p.get("end_ns"))
+
+    for p in execute_model_span:
+        _update(p.get("timestamp_ns"))
+        _update(p.get("start_ns"))
+        _update(p.get("end_ns"))
+
+    return min_ns or 0
+
+def nudge_equal_boundaries(
+    trace_events,
+    target_pid=None,
+    epsilon_us=0.001,
+    cat_prefixes=None,
+    snap_tolerance_us=0.0,
+):
+    """
+    某些可视化器在同一轨道上遇到“前一个块的 end == 后一个块的 start”时，
+    可能出现后一个块不稳定渲染。这里做最小量微调：
+    - 仅处理 ph='X' 且 dur>0 的区间事件；
+    - 同一 (pid, tid) 轨道上，若 start 与上一个 end 完全相等，则将 start + epsilon，
+      同时 dur - epsilon（保持 end 基本不变，且不会改成负数）。
+    """
+    prefixes = tuple(cat_prefixes or ())
+    slots = []
+    for idx, ev in enumerate(trace_events):
+        if ev.get("ph") != "X":
+            continue
+        if target_pid is not None and ev.get("pid") != target_pid:
+            continue
+        if prefixes:
+            cat = ev.get("cat", "")
+            if not any(str(cat).startswith(pre) for pre in prefixes):
+                continue
+        ts = ev.get("ts")
+        dur = ev.get("dur")
+        if ts is None or dur is None:
+            continue
+        try:
+            ts = float(ts)
+            dur = float(dur)
+        except (TypeError, ValueError):
+            continue
+        if dur <= 0:
+            continue
+        slots.append((ev.get("pid"), ev.get("tid"), ts, ts + dur, idx))
+
+    slots.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
+    last_end_by_track = {}
+    nudged = 0
+
+    for pid, tid, start, _end, idx in slots:
+        track = (pid, tid)
+        prev_end = last_end_by_track.get(track)
+        if prev_end is not None:
+            gap = start - prev_end
+        else:
+            gap = None
+
+        # 两类情况都做修正：
+        # 1) 完全相等：start == prev_end
+        # 2) 近似贴边/微小重叠：|start - prev_end| <= snap_tolerance_us
+        need_nudge = (
+            prev_end is not None
+            and (
+                start == prev_end
+                or (
+                    snap_tolerance_us > 0
+                    and gap is not None
+                    and -snap_tolerance_us <= gap <= snap_tolerance_us
+                )
+            )
+        )
+
+        if need_nudge:
+            ev = trace_events[idx]
+            old_dur = float(ev["dur"])
+            # 只做最小修正，保持事件仍为正时长
+            target_start = prev_end + epsilon_us
+            delta = target_start - start
+            if delta > 0 and old_dur > delta:
+                ev["ts"] = start + delta
+                ev["dur"] = old_dur - delta
+                nudged += 1
+                start = float(ev["ts"])
+                _end = start + float(ev["dur"])
+        last_end_by_track[track] = _end
+
+    return nudged
 
 def to_ns(raw_ts):
     """
@@ -44,15 +184,56 @@ def to_ns(raw_ts):
     """
     if raw_ts is None:
         return None
+
+    # 优先走整数通道，避免 1e18 量级 ns 经 float 造成 256ns 级精度丢失。
+    if isinstance(raw_ts, bool):
+        return None
+    if isinstance(raw_ts, int):
+        val_int = raw_ts
+        if val_int <= 0:
+            return None
+        if val_int > 1e14:
+            return val_int
+        return int(val_int * 1e9)
+
+    if isinstance(raw_ts, str):
+        s = raw_ts.strip()
+        if not s:
+            return None
+        try:
+            if s.isdigit() or (s[0] in "+-" and s[1:].isdigit()):
+                val_int = int(s)
+                if val_int <= 0:
+                    return None
+                if val_int > 1e14:
+                    return val_int
+                return int(val_int * 1e9)
+
+            val_dec = Decimal(s)
+            if not val_dec.is_finite() or val_dec <= 0:
+                return None
+            if val_dec > Decimal("1e14"):
+                return int(val_dec)
+            return int(val_dec * Decimal("1e9"))
+        except (ValueError, InvalidOperation):
+            return None
+
+    if isinstance(raw_ts, float):
+        if not math.isfinite(raw_ts) or raw_ts <= 0:
+            return None
+        if raw_ts > 1e14:
+            return int(raw_ts)
+        return int(raw_ts * 1e9)
+
     try:
-        val = float(raw_ts)
+        val_int = int(raw_ts)
+        if val_int <= 0:
+            return None
+        if val_int > 1e14:
+            return val_int
+        return int(val_int * 1e9)
     except (TypeError, ValueError):
         return None
-    if val <= 0:
-        return None
-    if val > 1e14:
-        return int(val)
-    return int(val * 1e9)
 
 def to_int(raw_val):
     if raw_val is None:
@@ -259,6 +440,18 @@ def process_logs(input_file, output_file):
             if etype == 'sched_latency':
                 ebpf_sched_latency_events.append(payload)
 
+    global TRACE_TS_ORIGIN_NS
+    TRACE_TS_ORIGIN_NS = infer_trace_origin_ns(
+        worker_events=worker_events,
+        scheduler_events=scheduler_events,
+        coroutine_events=coroutine_events,
+        req_stage_events=req_stage_events,
+        enginecore_loop_events=enginecore_loop_events,
+        execute_model_span=execute_model_span,
+    )
+    if TRACE_TS_ORIGIN_NS:
+        print(f"Trace time origin (wall ns): {TRACE_TS_ORIGIN_NS}")
+
     # --- 2. Worker 状态机 (支持细粒度阶段) ---
     print(f"Processing Worker Events ({len(worker_events)})...")
     
@@ -464,6 +657,29 @@ def process_logs(input_file, output_file):
     else:
         print("  未统计到协程调度排队时间")
 
+    # 为 request dispatch phase 做回退兜底：
+    # 从 req_metrics_events 中按时间提取每个请求的 "scheduled/dequeue" phase 顺序。
+    phase_hint_queue_by_req = defaultdict(deque)
+    req_metric_events_sorted = sorted(
+        req_metric_events,
+        key=lambda x: to_ns(x.get("batch_ts_ns")) or 0,
+    )
+    for item in req_metric_events_sorted:
+        payload = item.get("payload", item)
+        updates = payload.get("req_events", [])
+        for update in updates:
+            rid = update.get("req_id")
+            if not rid:
+                continue
+            for ev in update.get("events", []):
+                ev_type = normalize_req_event_type(ev.get("type"))
+                if ev_type != "dequeue":
+                    continue
+                phase = ev.get("phase")
+                if phase in ("prefill", "decode"):
+                    phase_hint_queue_by_req[rid].append(phase)
+                break
+
     # --- 4. Scheduler 处理 (保持原逻辑) ---
     print("Processing Scheduler Events...")
     QUEUE_PID = 1000
@@ -471,12 +687,14 @@ def process_logs(input_file, output_file):
     trace_events.append({"name": "process_name", "ph": "M", "pid": QUEUE_PID, "args": {"name": "Scheduler Queue"}})
     
     req_enqueue_map = {}
-    req_ready_map = {}
     req_first_dispatch_done = set()
     queue_intervals_map = defaultdict(list)  # 可视化用（墙上时间）
     req_vllm_queue_ns = defaultdict(int)  # 聚合统计（总排队）
     req_vllm_queue_from_enqueue_ns = defaultdict(int)  # 初次调度等待
     req_vllm_queue_from_step_ready_ns = defaultdict(int)  # 后续step等待
+    req_dispatch_intervals_map = defaultdict(list)  # 请求每次被调度执行的区间（out_rpc -> step_ready）
+    req_dispatch_phase_ns = defaultdict(lambda: defaultdict(int))
+    req_dispatch_phase_count = defaultdict(lambda: defaultdict(int))
     
     # 3.1 入队
     for item in scheduler_events:
@@ -485,7 +703,8 @@ def process_logs(input_file, output_file):
             rid = p.get('req_id')
             ts = p.get('timestamp_ns')
             if rid and ts:
-                req_enqueue_map[rid] = ts
+                if rid not in req_enqueue_map:
+                    req_enqueue_map[rid] = ts
                 flow_id = hash(rid) & 0x7FFFFFFF
                 
                 trace_events.append(create_perfetto_event(
@@ -513,8 +732,6 @@ def process_logs(input_file, output_file):
             p = item['payload']
             ts = p.get('timestamp_ns')
             for rid in p.get('req_ids', []):
-                if rid and ts:
-                    req_ready_map[rid] = ts
                 if rid in req_enqueue_map:
                     flow_id = hash(rid) & 0x7FFFFFFF
                     trace_events.append(create_perfetto_event(
@@ -523,22 +740,32 @@ def process_logs(input_file, output_file):
                     # 回到了 Scheduler 视野
                     trace_events.append(create_flow_event("t", ts, QUEUE_PID, QUEUE_TID, flow_id))
 
-    # 3.4 Version A 排队时间计算：
+    # 3.4 排队时间计算（顺序配对）：
     # 初次：req_scheduler_out_rpc - req_enqueue_scheduler
-    # 后续：req_scheduler_out_rpc - req_step_ready
+    # 后续：req_scheduler_out_rpc - 上一次 req_step_ready
     scheduler_events_sorted = sorted(
         scheduler_events,
         key=lambda x: to_ns(x.get("payload", {}).get("timestamp_ns")) or 0,
     )
+    pending_ready_by_req = defaultdict(deque)
 
     for item in scheduler_events_sorted:
-        if item.get("type") != "req_scheduler_out_rpc":
-            continue
         p = item.get("payload", {})
-        out_ts = to_ns(p.get("timestamp_ns"))
-        if out_ts is None:
+        ev_type = item.get("type")
+        ts_ns = to_ns(p.get("timestamp_ns"))
+        if ts_ns is None:
             continue
 
+        if ev_type == "req_step_ready":
+            for rid in p.get("req_ids", []):
+                if rid:
+                    pending_ready_by_req[rid].append(ts_ns)
+            continue
+
+        if ev_type != "req_scheduler_out_rpc":
+            continue
+
+        out_ts = ts_ns
         for rid in p.get("req_ids", []):
             if not rid:
                 continue
@@ -547,7 +774,6 @@ def process_logs(input_file, output_file):
             scheduled_from = None
 
             enqueue_ts = to_ns(req_enqueue_map.get(rid))
-            ready_ts = to_ns(req_ready_map.get(rid))
 
             # 初次调度优先使用 enqueue->out_rpc
             if rid not in req_first_dispatch_done and enqueue_ts is not None and enqueue_ts <= out_ts:
@@ -555,10 +781,9 @@ def process_logs(input_file, output_file):
                 scheduled_from = "enqueue"
                 req_first_dispatch_done.add(rid)
             # 后续step使用 step_ready->out_rpc
-            elif ready_ts is not None and ready_ts <= out_ts:
-                start_ts = ready_ts
+            elif pending_ready_by_req[rid] and pending_ready_by_req[rid][0] <= out_ts:
+                start_ts = pending_ready_by_req[rid].popleft()
                 scheduled_from = "step_ready"
-                req_ready_map.pop(rid, None)
 
             if start_ts is None or out_ts <= start_ts:
                 continue
@@ -589,6 +814,84 @@ def process_logs(input_file, output_file):
             )
     else:
         print("  未统计到 vLLM 内部排队时间（Scheduler口径）")
+
+    # 3.5 每次调度执行区间：
+    # 用 req_scheduler_out_rpc 作为步开始，用 req_step_ready 作为步结束；
+    # phase 优先来自 req_step_ready.phase_by_req，缺失时回退到 req_metrics_events 的 phase 队列。
+    pending_dispatch_start = defaultdict(deque)
+    for item in scheduler_events_sorted:
+        p = item.get("payload", {})
+        ev_type = item.get("type")
+        ts_ns = to_ns(p.get("timestamp_ns"))
+        if ts_ns is None:
+            continue
+
+        if ev_type == "req_scheduler_out_rpc":
+            for rid in p.get("req_ids", []):
+                if rid:
+                    pending_dispatch_start[rid].append(ts_ns)
+            continue
+
+        if ev_type != "req_step_ready":
+            continue
+
+        phase_by_req = p.get("phase_by_req")
+        if not isinstance(phase_by_req, dict):
+            phase_by_req = {}
+
+        for rid in p.get("req_ids", []):
+            if not rid:
+                continue
+            if not pending_dispatch_start[rid]:
+                continue
+            start_ns = pending_dispatch_start[rid].popleft()
+            if ts_ns <= start_ns:
+                continue
+
+            phase = phase_by_req.get(rid)
+            if phase not in ("prefill", "decode"):
+                if phase_hint_queue_by_req[rid]:
+                    phase = phase_hint_queue_by_req[rid].popleft()
+                else:
+                    phase = "unknown"
+            else:
+                # 若 hint 队列头和当前 phase 一致，则消费掉，保持两路数据大致对齐。
+                if phase_hint_queue_by_req[rid] and phase_hint_queue_by_req[rid][0] == phase:
+                    phase_hint_queue_by_req[rid].popleft()
+
+            dur_ns = ts_ns - start_ns
+            req_dispatch_intervals_map[rid].append({
+                "start_ns": start_ns,
+                "end_ns": ts_ns,
+                "phase": phase,
+                "duration_ns": dur_ns,
+            })
+            req_dispatch_phase_ns[rid][phase] += dur_ns
+            req_dispatch_phase_count[rid][phase] += 1
+
+    unmatched_dispatch = sum(len(q) for q in pending_dispatch_start.values())
+    if unmatched_dispatch > 0:
+        print(f"  [warn] 存在 {unmatched_dispatch} 个未闭合 dispatch 起点（可能是日志截断或进程中止）")
+
+    if req_dispatch_intervals_map:
+        print(f"共统计到 {len(req_dispatch_intervals_map)} 个请求的 dispatch 区间（prefill/decode）:")
+        for rid in sorted(
+            req_dispatch_intervals_map.keys(),
+            key=lambda x: req_dispatch_phase_ns[x].get("prefill", 0) + req_dispatch_phase_ns[x].get("decode", 0),
+            reverse=True
+        ):
+            prefill_ms = req_dispatch_phase_ns[rid].get("prefill", 0) / 1e6
+            decode_ms = req_dispatch_phase_ns[rid].get("decode", 0) / 1e6
+            unknown_ms = req_dispatch_phase_ns[rid].get("unknown", 0) / 1e6
+            print(
+                f"  - Request {rid}: prefill_exec={prefill_ms:.3f} ms "
+                f"(count={req_dispatch_phase_count[rid].get('prefill', 0)}), "
+                f"decode_exec={decode_ms:.3f} ms "
+                f"(count={req_dispatch_phase_count[rid].get('decode', 0)}), "
+                f"unknown_exec={unknown_ms:.3f} ms"
+            )
+    else:
+        print("  未统计到可配对的 dispatch 区间（prefill/decode）")
 
     # --- 4.5 generate->enqueue 阶段耗时拆分（统计 + 部分阶段可视化数据准备） ---
     print(f"Processing Request Stage Events ({len(req_stage_events)})...")
@@ -922,7 +1225,14 @@ def process_logs(input_file, output_file):
     REQUEST_PID = 11000
     trace_events.append({"name": "process_name", "ph": "M", "pid": REQUEST_PID, "args": {"name": "Request Interference"}})
 
-    all_req_ids = set(request_spans.keys()) | set(req_coro_sched_ns.keys()) | set(req_vllm_queue_ns.keys()) | set(req_latency_map.keys()) | set(req_stage_ns.keys())
+    all_req_ids = (
+        set(request_spans.keys())
+        | set(req_coro_sched_ns.keys())
+        | set(req_vllm_queue_ns.keys())
+        | set(req_latency_map.keys())
+        | set(req_stage_ns.keys())
+        | set(req_dispatch_intervals_map.keys())
+    )
     req_os_intervals_wall = defaultdict(list)
     if global_mono_to_wall_offset is not None:
         for rid, intervals in req_os_overlap_intervals.items():
@@ -969,6 +1279,9 @@ def process_logs(input_file, output_file):
         os_delay_ms = req_latency_map.get(rid, 0) / 1e6
         engine_input_queue_wait_ms = req_stage_ns.get(rid, {}).get(
             "engine_core.input_queue_wait_after_preprocess", 0) / 1e6
+        prefill_exec_ms = req_dispatch_phase_ns.get(rid, {}).get("prefill", 0) / 1e6
+        decode_exec_ms = req_dispatch_phase_ns.get(rid, {}).get("decode", 0) / 1e6
+        unknown_exec_ms = req_dispatch_phase_ns.get(rid, {}).get("unknown", 0) / 1e6
 
         span = request_spans.get(rid)
         if span and span.get("end_ns", 0) > span.get("start_ns", 0):
@@ -989,8 +1302,43 @@ def process_logs(input_file, output_file):
                     "vllm_queue_from_step_ready_ms": round(vllm_queue_from_step_ready_ms, 3),
                     "engine_input_queue_wait_ms": round(engine_input_queue_wait_ms, 3),
                     "os_sched_delay_ms": round(os_delay_ms, 3),
+                    "prefill_exec_ms": round(prefill_exec_ms, 3),
+                    "decode_exec_ms": round(decode_exec_ms, 3),
+                    "unknown_exec_ms": round(unknown_exec_ms, 3),
                 },
                 cname="good",
+            ))
+
+        for d in req_dispatch_intervals_map.get(rid, []):
+            if d["end_ns"] <= d["start_ns"]:
+                continue
+            phase = d.get("phase", "unknown")
+            if phase == "prefill":
+                d_name = "Prefill Dispatch"
+                d_cat = "request_dispatch_prefill"
+                d_color = "olive"
+            elif phase == "decode":
+                d_name = "Decode Dispatch"
+                d_cat = "request_dispatch_decode"
+                d_color = "rail_response"
+            else:
+                d_name = "Unknown Dispatch"
+                d_cat = "request_dispatch_unknown"
+                d_color = "background"
+            trace_events.append(create_perfetto_event(
+                name=d_name,
+                cat=d_cat,
+                ph="X",
+                ts=d["start_ns"],
+                dur=d["end_ns"] - d["start_ns"],
+                pid=REQUEST_PID,
+                tid=req_tid,
+                args={
+                    "request_id": rid,
+                    "phase": phase,
+                    "duration_ms": round((d["end_ns"] - d["start_ns"]) / 1e6, 3),
+                },
+                cname=d_color,
             ))
 
         for q0 in req_coro_sched_intervals.get(rid, []):
@@ -1014,7 +1362,7 @@ def process_logs(input_file, output_file):
                     q_name = "vLLM Queue Wait (scheduled-enqueue)"
                     q_cat = "request_queue_scheduled_enqueue"
                 elif scheduled_from == "step_ready":
-                    q_name = "vLLM Queue Wait (scheduled-step_ready)"
+                    q_name = "vLLM Scheduling Wait (step_ready->out_rpc)"
                     q_cat = "request_queue_scheduled_step_ready"
                 else:
                     q_name = "vLLM Queue Wait"
@@ -1080,8 +1428,22 @@ def process_logs(input_file, output_file):
             f"vllm_queue={req_vllm_queue_ns.get(rid, 0) / 1e6:.3f} ms "
             f"(scheduled-enqueue={req_vllm_queue_from_enqueue_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"scheduled-step_ready={req_vllm_queue_from_step_ready_ns.get(rid, 0) / 1e6:.3f} ms), "
-            f"os_delay={req_latency_map.get(rid, 0) / 1e6:.3f} ms"
+            f"os_delay={req_latency_map.get(rid, 0) / 1e6:.3f} ms, "
+            f"prefill_exec={req_dispatch_phase_ns.get(rid, {}).get('prefill', 0) / 1e6:.3f} ms, "
+            f"decode_exec={req_dispatch_phase_ns.get(rid, {}).get('decode', 0) / 1e6:.3f} ms"
         )
+
+    # 避免同轨道 end==start 的零缝边界导致 Perfetto 局部漏渲染。
+    # 只修正 queue/dispatch 这两类相邻阶段，避免影响 lifecycle/OS 等重叠语义事件。
+    nudged_count = nudge_equal_boundaries(
+        trace_events,
+        target_pid=REQUEST_PID,
+        epsilon_us=1.0,
+        cat_prefixes=("request_queue", "request_dispatch"),
+        snap_tolerance_us=1.0,
+    )
+    if nudged_count > 0:
+        print(f"Applied boundary nudge for request tracks: {nudged_count} events (epsilon=1.0us)")
 
     # --- 输出 ---
     print("✨ Sorting all trace events...")
