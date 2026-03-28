@@ -80,6 +80,9 @@ static CUpti_SubscriberHandle g_subscriber;
 static void *g_zmq_ctx = NULL;
 static void *g_zmq_push = NULL;
 static char g_zmq_addr[256] = {0};
+static int g_zmq_blocking_send = 1;
+static int g_zmq_sndtimeo_ms = -1;
+static int g_zmq_linger_ms = 30000;
 static int g_zmq_send_retry = 200;
 static int g_zmq_send_retry_us = 50;
 
@@ -125,6 +128,15 @@ static void init_zmq_from_env() {
     if (zmq_setsockopt(g_zmq_push, ZMQ_IMMEDIATE, &immediate, sizeof(immediate)) != 0) {
         tracer_log("zmq_setsockopt(ZMQ_IMMEDIATE=1) failed: %s", zmq_strerror(errno));
     }
+    g_zmq_blocking_send = read_env_int("TRACER_ZMQ_BLOCKING_SEND", 1, 0, 1);
+    g_zmq_sndtimeo_ms = read_env_int("TRACER_ZMQ_SNDTIMEO_MS", -1, -1, INT_MAX);
+    g_zmq_linger_ms = read_env_int("TRACER_ZMQ_LINGER_MS", 30000, 0, INT_MAX);
+    if (zmq_setsockopt(g_zmq_push, ZMQ_SNDTIMEO, &g_zmq_sndtimeo_ms, sizeof(g_zmq_sndtimeo_ms)) != 0) {
+        tracer_log("zmq_setsockopt(ZMQ_SNDTIMEO=%d) failed: %s", g_zmq_sndtimeo_ms, zmq_strerror(errno));
+    }
+    if (zmq_setsockopt(g_zmq_push, ZMQ_LINGER, &g_zmq_linger_ms, sizeof(g_zmq_linger_ms)) != 0) {
+        tracer_log("zmq_setsockopt(ZMQ_LINGER=%d) failed: %s", g_zmq_linger_ms, zmq_strerror(errno));
+    }
     g_zmq_send_retry = read_env_int("TRACER_ZMQ_SEND_RETRY", 200, 0, 100000);
     g_zmq_send_retry_us = read_env_int("TRACER_ZMQ_SEND_RETRY_US", 50, 0, 1000000);
     if (zmq_connect(g_zmq_push, g_zmq_addr) != 0) {
@@ -133,8 +145,9 @@ static void init_zmq_from_env() {
         g_zmq_push=NULL; g_zmq_ctx=NULL;
         return;
     }
-    tracer_log("ZMQ connected: %s (sndhwm=%d, retry=%d, retry_us=%d)",
-               g_zmq_addr, sndhwm, g_zmq_send_retry, g_zmq_send_retry_us);
+    tracer_log("ZMQ connected: %s (sndhwm=%d, blocking_send=%d, sndtimeo_ms=%d, linger_ms=%d, retry=%d, retry_us=%d)",
+               g_zmq_addr, sndhwm, g_zmq_blocking_send, g_zmq_sndtimeo_ms, g_zmq_linger_ms,
+               g_zmq_send_retry, g_zmq_send_retry_us);
 }
 
 static const char *record_type_str(uint32_t t) {
@@ -222,22 +235,29 @@ static void send_record_payload(const UnifiedTraceRecord *rec) {
     const char *js = metadata_to_bytes(meta);
     int rc = -1;
     int saved_errno = 0;
-    for (int attempt = 0; attempt <= g_zmq_send_retry; ++attempt) {
-        {
-            std::lock_guard<std::mutex> lock(g_zmq_send_mutex);
-            rc = zmq_send(g_zmq_push, js, strlen(js), ZMQ_DONTWAIT);
-            saved_errno = errno;
+    if (g_zmq_blocking_send) {
+        std::lock_guard<std::mutex> lock(g_zmq_send_mutex);
+        rc = zmq_send(g_zmq_push, js, strlen(js), 0);
+        saved_errno = errno;
+    } else {
+        for (int attempt = 0; attempt <= g_zmq_send_retry; ++attempt) {
+            {
+                std::lock_guard<std::mutex> lock(g_zmq_send_mutex);
+                rc = zmq_send(g_zmq_push, js, strlen(js), ZMQ_DONTWAIT);
+                saved_errno = errno;
+            }
+            if (rc >= 0) break;
+            if (saved_errno != EAGAIN || attempt == g_zmq_send_retry) break;
+            if (g_zmq_send_retry_us > 0) usleep((useconds_t)g_zmq_send_retry_us);
         }
-        if (rc >= 0) break;
-        if (saved_errno != EAGAIN || attempt == g_zmq_send_retry) break;
-        if (g_zmq_send_retry_us > 0) usleep((useconds_t)g_zmq_send_retry_us);
     }
     if (rc < 0) {
-        if (saved_errno == EAGAIN) {
+        if (!g_zmq_blocking_send && saved_errno == EAGAIN) {
             tracer_log("zmq_send failed after retries (%d): %s",
                        g_zmq_send_retry, zmq_strerror(saved_errno));
         } else {
-            tracer_log("zmq_send failed: %s", zmq_strerror(saved_errno));
+            tracer_log("zmq_send failed (blocking_send=%d): %s",
+                       g_zmq_blocking_send, zmq_strerror(saved_errno));
         }
     }
     json_object_put(meta);
@@ -500,9 +520,8 @@ void deinitCuptiTracer() {
     // --------------------------------------------------------------------
     if (g_zmq_push) {
         tracer_log("[DEINIT] Closing ZMQ socket...");
-        // linger设置为0，确保立即关闭，不等待未发送的消息
-        int linger = 0;
-        zmq_setsockopt(g_zmq_push, ZMQ_LINGER, &linger, sizeof(linger));
+        // 留出 linger 窗口，尽量把发送队列中的事件冲刷到 collector
+        zmq_setsockopt(g_zmq_push, ZMQ_LINGER, &g_zmq_linger_ms, sizeof(g_zmq_linger_ms));
         zmq_close(g_zmq_push);
         g_zmq_push = NULL;
         tracer_log("[DEINIT] ZMQ socket closed.");

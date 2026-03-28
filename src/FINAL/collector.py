@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 from pathlib import Path
 
 import zmq
@@ -15,7 +16,8 @@ def _env_int(name, default, min_value):
     return max(min_value, value)
 
 
-RCVHWM = _env_int("TRACER_ZMQ_RCVHWM", 200000, 1000)
+RCVHWM = _env_int("TRACER_ZMQ_RCVHWM", 2000000, 1000)
+RCVTIMEO_MS = _env_int("TRACER_ZMQ_RCVTIMEO_MS", 200, 1)
 LOG_FLUSH_EVERY = _env_int("TRACER_LOG_FLUSH_EVERY", 1000, 1)
 
 LOG_DIR = Path.cwd()
@@ -31,6 +33,13 @@ WORKER_PID_EVENTS = {
     "gpu_execute_model",
 }
 _known_worker_pids = set()
+_stop_requested = False
+
+
+def _handle_stop_signal(signum, _frame):
+    global _stop_requested
+    _stop_requested = True
+    print(f"[collector] stop requested by signal {signum}", flush=True)
 
 
 def _log(log_file, src, meta, payload):
@@ -43,6 +52,16 @@ def _log(log_file, src, meta, payload):
         ),
     }
     log_file.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _log_raw_json_line(log_file, raw_frame):
+    try:
+        line = raw_frame.decode("utf-8")
+    except UnicodeDecodeError:
+        line = raw_frame.decode("utf-8", errors="replace")
+    log_file.write(line)
+    if not line.endswith("\n"):
+        log_file.write("\n")
 
 
 def _get_src(meta):
@@ -120,31 +139,60 @@ def handle_frames(frames, log_file):
     _persist_worker_pid(_extract_worker_pid(src, meta, payload))
 
     if src == "ebpf" or src == "cupti" or src == "monkey_patch":
-        _log(log_file, src, meta, payload)
+        # CUPTI 是单帧 JSON，直接落盘原始行，避免 json.loads+json.dumps 的双重开销。
+        if src == "cupti" and len(frames) == 1:
+            _log_raw_json_line(log_file, frames[0])
+        else:
+            _log(log_file, src, meta, payload)
         return True
     return False
 
 
 def collector():
+    global _stop_requested
     ctx = zmq.Context()
     sock = ctx.socket(zmq.PULL)
     sock.setsockopt(zmq.RCVHWM, RCVHWM)
     sock.setsockopt(zmq.LINGER, 0)
+    sock.setsockopt(zmq.RCVTIMEO, RCVTIMEO_MS)
     sock.bind(SOCK_ADDR)
 
-    print("[collector] started, listening on", SOCK_ADDR, f"(rcvhwm={RCVHWM}, flush_every={LOG_FLUSH_EVERY})")
+    print("[collector] started, listening on", SOCK_ADDR, f"(rcvhwm={RCVHWM}, rcvtimeo_ms={RCVTIMEO_MS}, flush_every={LOG_FLUSH_EVERY})")
 
     written = 0
     with open(CUPTI_LOG, "a", encoding="utf-8") as log_file:
         while True:
-            frames = sock.recv_multipart()
+            try:
+                frames = sock.recv_multipart()
+            except zmq.Again:
+                # 收到停止信号后，等到 socket 至少空闲一个超时周期再退出，尽量排空队列。
+                if _stop_requested:
+                    break
+                continue
+            except KeyboardInterrupt:
+                if _stop_requested:
+                    break
+                _stop_requested = True
+                continue
+
             if handle_frames(frames, log_file):
                 written += 1
                 if written % LOG_FLUSH_EVERY == 0:
                     log_file.flush()
 
+            if _stop_requested:
+                # 进入 draining 状态后继续读，直到下一个 recv 超时才退出。
+                continue
+
+        log_file.flush()
+    sock.close(0)
+    ctx.term()
+    print(f"[collector] stopped, total_written={written}", flush=True)
+
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _handle_stop_signal)
+    signal.signal(signal.SIGINT, _handle_stop_signal)
     CUPTI_LOG.write_text("", encoding="utf-8")
     WORKER_PID_FILE.write_text("", encoding="utf-8")
     collector()
