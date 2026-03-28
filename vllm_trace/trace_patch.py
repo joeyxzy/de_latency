@@ -31,7 +31,7 @@ debug_counters = {
     "emit_hits": 0,
     "skip_no_ctx": 0,
 }
-SOCK_ADDR = "ipc:///tmp/tracer.sock"
+SOCK_ADDR = os.getenv("TRACER_ZMQ_ADDR", "ipc:///tmp/tracer.sock")
 
 ctx = zmq.Context()
 sock = ctx.socket(zmq.PUSH)

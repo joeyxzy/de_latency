@@ -19,11 +19,17 @@
 #include "sched_latency.skel.h"
 
 // ZMQ Configuration
-#define ZMQ_ADDR "ipc:///tmp/tracer.sock"
+#define DEFAULT_ZMQ_ADDR "ipc:///tmp/tracer.sock"
 static void *g_zmq_ctx = NULL;
 static void *g_zmq_sock = NULL;
 
 static volatile bool exiting = false;
+
+static const char *get_zmq_addr(void)
+{
+    const char *addr = getenv("TRACER_ZMQ_ADDR");
+    return (addr && addr[0]) ? addr : DEFAULT_ZMQ_ADDR;
+}
 
 static void sig_handler(int sig)
 {
@@ -302,12 +308,12 @@ static int init_zmq() {
     }
 
     // Since Python binds, we connect
-    if (zmq_connect(g_zmq_sock, ZMQ_ADDR) != 0) {
+    if (zmq_connect(g_zmq_sock, get_zmq_addr()) != 0) {
         fprintf(stderr, "zmq_connect failed: %s\n", zmq_strerror(errno));
         return -1;
     }
     
-    printf("ZMQ connected to %s\n", ZMQ_ADDR);
+    printf("ZMQ connected to %s\n", get_zmq_addr());
     return 0;
 }
 
@@ -481,7 +487,7 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    printf("\n--- eBPF Tracer Running (Sending to %s) ---\n", ZMQ_ADDR);
+    printf("\n--- eBPF Tracer Running (Sending to %s) ---\n", get_zmq_addr());
 
     while (!exiting) {
         int ret = ring_buffer__poll(rb, poll_ms);

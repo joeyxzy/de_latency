@@ -15,9 +15,10 @@ BUILD_DIR := ./build
 # --- Include paths ---
 CPPFLAGS := -I$(INCLUDE_DIR) -I$(LIBBPF_DIR)
 
-#自定义的库路径（给sched_latency服务）
-ZMQ_LIB_PATH := /home/joeyxzy/zeromq_install/lib
-JSONC_LIB_PATH := /home/joeyxzy/jsonc_install/lib
+# 自定义库目录可选；若安装在系统默认路径则无需设置。
+ZMQ_LIB_PATH ?=
+JSONC_LIB_PATH ?=
+EXTRA_LIB_DIRS := $(if $(ZMQ_LIB_PATH),-L$(ZMQ_LIB_PATH),) $(if $(JSONC_LIB_PATH),-L$(JSONC_LIB_PATH),)
 
 # --- Final Targets ---
 TARGET_CONTROLLER := $(BUILD_DIR)/controller
@@ -40,7 +41,7 @@ ENCODE_SRC := $(SRC_DIR)/encode.c
 ENCODE_OBJ := $(BUILD_DIR)/encode.o
 
 CFLAGS := -g -Wall
-CONTROLLER_LDFLAGS := -L$(LIB_DIR) -lzmq -ljson-c -lcupti
+CONTROLLER_LDFLAGS := -L$(LIB_DIR) $(EXTRA_LIB_DIRS) -lzmq -ljson-c -lcupti
 CONTROLLER_LDFLAGS += -Wl,-rpath,'$$ORIGIN/../lib'
 
 # ==============================================================================
@@ -52,8 +53,8 @@ EBPF_ENCODE_OBJ := $(BUILD_DIR)/encode_ebpf.o
 
 # CRITICAL FIX 1: Add libbpf include path for eBPF monitor
 EBPF_CPPFLAGS := $(CPPFLAGS) -I$(LIBBPF_DIR) -I$(BUILD_DIR)
-EBPF_LDFLAGS := -L$(LIB_DIR) -L$(ZMQ_LIB_PATH) -L$(JSONC_LIB_PATH) -lbpf -lelf -lz -lzmq -ljson-c
-EBPF_LDFLAGS += -Wl,-rpath,$(ZMQ_LIB_PATH):$(JSONC_LIB_PATH):'$$ORIGIN/../lib'
+EBPF_LDFLAGS := -L$(LIB_DIR) $(EXTRA_LIB_DIRS) -lbpf -lelf -lz -lzmq -ljson-c
+EBPF_LDFLAGS += -Wl,-rpath,'$$ORIGIN/../lib'
 
 # ==============================================================================
 # CUPTI Tracer
@@ -61,7 +62,7 @@ EBPF_LDFLAGS += -Wl,-rpath,$(ZMQ_LIB_PATH):$(JSONC_LIB_PATH):'$$ORIGIN/../lib'
 TRACER_SRC := $(SRC_DIR)/tracer.cu
 NVCC_CPPFLAGS := -I"$(CUDA_INSTALL_PATH)/include" -I"$(CUPTI_INSTALL_PATH)/include"
 NVCC_CFLAGS := -g -shared -Xcompiler -fPIC
-NVCC_LDFLAGS := -L"$(CUPTI_INSTALL_PATH)/lib64" -L"$(CUDA_INSTALL_PATH)/lib64" \
+NVCC_LDFLAGS := $(EXTRA_LIB_DIRS) -L"$(CUPTI_INSTALL_PATH)/lib64" -L"$(CUDA_INSTALL_PATH)/lib64" \
                 -lcupti -lcuda -lzmq -ljson-c
 
 # ==============================================================================

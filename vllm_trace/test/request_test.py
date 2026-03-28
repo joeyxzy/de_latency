@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import os
 from openai import OpenAI
 import time
 import concurrent.futures
@@ -11,8 +12,7 @@ import random
 # ================================
 BASE_URL = "http://localhost:8001/v1"
 API_KEY = "EMPTY"
-#MODEL = "Qwen/Qwen1.5-4B-Chat"
-MODEL = "/home/joeyxzy/models/Qwen1.5-4B-Chat"
+MODEL = os.getenv("DE_LATENCY_MODEL", "Qwen/Qwen1.5-4B-Chat")
 
 # 准备一组提示词，长度不一，模拟真实场景
 PROMPTS = [

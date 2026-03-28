@@ -27,7 +27,7 @@ class TraceSender:
     """
     _thread_local = threading.local()
     # ZMQ 地址，需与接收端保持一致
-    ZMQ_ADDR = "ipc:///tmp/tracer.sock"
+    ZMQ_ADDR = os.getenv("TRACER_ZMQ_ADDR", "ipc:///tmp/tracer.sock")
 
     @classmethod
     def get_socket(cls):

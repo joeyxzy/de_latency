@@ -9,6 +9,7 @@ Avoids runtime tokenization bottleneck.
 import time
 import asyncio
 import random
+import os
 import numpy as np
 from openai import AsyncOpenAI
 
@@ -17,7 +18,7 @@ from openai import AsyncOpenAI
 # ================================
 BASE_URL = "http://localhost:8001/v1"
 API_KEY = "EMPTY"
-MODEL_PATH = "/home/joeyxzy/models/Qwen1.5-4B-Chat"
+MODEL_PATH = os.getenv("DE_LATENCY_MODEL", "Qwen/Qwen1.5-4B-Chat")
 
 MAX_MODEL_LEN = 4096
 MIN_OUTPUT_LEN = 200

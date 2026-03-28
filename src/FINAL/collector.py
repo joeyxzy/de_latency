@@ -5,7 +5,9 @@ from pathlib import Path
 
 import zmq
 
-SOCK_ADDR = "ipc:///tmp/tracer.sock"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_LOG_PATH = REPO_ROOT / "perfetto" / "de_latency.log"
+SOCK_ADDR = os.getenv("TRACER_ZMQ_ADDR", "ipc:///tmp/tracer.sock")
 
 
 def _env_int(name, default, min_value):
@@ -22,8 +24,10 @@ LOG_FLUSH_EVERY = _env_int("TRACER_LOG_FLUSH_EVERY", 1000, 1)
 
 LOG_DIR = Path.cwd()
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-CUPTI_LOG = Path("/home/joeyxzy/de_latency/de_latency/perfetto/de_latency.log")
-WORKER_PID_FILE = Path("/tmp/tracer_worker_pids")
+CUPTI_LOG = Path(os.getenv("DE_LATENCY_LOG_PATH", str(DEFAULT_LOG_PATH)))
+WORKER_PID_FILE = Path(os.getenv("TRACER_WORKER_PID_FILE", "/tmp/tracer_worker_pids"))
+CUPTI_LOG.parent.mkdir(parents=True, exist_ok=True)
+WORKER_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
 WORKER_PID_EVENTS = {
     "worker_process_ready",
     "worker_preprocess_start",
