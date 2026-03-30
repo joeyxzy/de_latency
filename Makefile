@@ -1,6 +1,11 @@
 # === FIXED Makefile for STANDALONE eBPF Monitor ===
 CUDA_INSTALL_PATH ?= /usr/local/cuda-12.8
 CUPTI_INSTALL_PATH ?= $(CUDA_INSTALL_PATH)/extras/CUPTI
+CUDA_TARGET_DIR ?= $(firstword $(wildcard $(CUDA_INSTALL_PATH)/targets/x86_64-linux))
+CUDA_INCLUDE_DIR ?= $(firstword $(wildcard $(CUDA_TARGET_DIR)/include) $(wildcard $(CUDA_INSTALL_PATH)/include))
+CUDA_LIB_DIR ?= $(firstword $(wildcard $(CUDA_TARGET_DIR)/lib) $(wildcard $(CUDA_INSTALL_PATH)/lib64))
+CUPTI_INCLUDE_DIR ?= $(firstword $(wildcard $(CUPTI_INSTALL_PATH)/include) $(wildcard $(CUDA_INSTALL_PATH)/extras/CUPTI/include) $(wildcard $(CUDA_TARGET_DIR)/include))
+CUPTI_LIB_DIR ?= $(firstword $(wildcard $(CUPTI_INSTALL_PATH)/lib64) $(wildcard $(CUDA_INSTALL_PATH)/extras/CUPTI/lib64) $(wildcard $(CUDA_TARGET_DIR)/lib) $(wildcard $(CUDA_INSTALL_PATH)/lib64))
 
 CC = gcc
 NVCC := "$(CUDA_INSTALL_PATH)/bin/nvcc"
@@ -11,14 +16,31 @@ INCLUDE_DIR := ./include
 LIBBPF_DIR := ./include/libbpf  # MUST exist with libbpf headers
 LIB_DIR := ./lib
 BUILD_DIR := ./build
+comma := ,
+
+ZMQ_INCLUDE_DIR ?= $(firstword $(wildcard /home/joeyxzy/.local/include) \
+                               $(wildcard /usr/include))
 
 # --- Include paths ---
-CPPFLAGS := -I$(INCLUDE_DIR) -I$(LIBBPF_DIR)
+CPPFLAGS := -I$(INCLUDE_DIR) -I$(LIBBPF_DIR) $(if $(ZMQ_INCLUDE_DIR),-I$(ZMQ_INCLUDE_DIR),)
 
 # 自定义库目录可选；若安装在系统默认路径则无需设置。
-ZMQ_LIB_PATH ?=
+ZMQ_LIB_PATH ?= $(firstword $(wildcard /home/joeyxzy/.local/lib) \
+                            $(wildcard /usr/lib/x86_64-linux-gnu) \
+                            $(wildcard /lib/x86_64-linux-gnu))
 JSONC_LIB_PATH ?=
 EXTRA_LIB_DIRS := $(if $(ZMQ_LIB_PATH),-L$(ZMQ_LIB_PATH),) $(if $(JSONC_LIB_PATH),-L$(JSONC_LIB_PATH),)
+LIBBPF_LIB ?= $(firstword $(wildcard ./third_party/libbpf/src/libbpf.so) \
+                         $(wildcard ./tmp/libbpf/src/libbpf.so) \
+                         $(wildcard /usr/lib/x86_64-linux-gnu/libbpf.so) \
+                         $(wildcard /usr/lib/x86_64-linux-gnu/libbpf.so.0) \
+                         $(wildcard /lib/x86_64-linux-gnu/libbpf.so) \
+                         $(wildcard /lib/x86_64-linux-gnu/libbpf.so.0) \
+                         $(wildcard $(LIB_DIR)/libbpf.so))
+ELF_LIB ?= $(firstword $(wildcard /usr/lib/x86_64-linux-gnu/libelf.so) \
+                      $(wildcard /usr/lib/x86_64-linux-gnu/libelf.so.1) \
+                      $(wildcard /lib/x86_64-linux-gnu/libelf.so) \
+                      $(wildcard /lib/x86_64-linux-gnu/libelf.so.1))
 
 # --- Final Targets ---
 TARGET_CONTROLLER := $(BUILD_DIR)/controller
@@ -41,28 +63,31 @@ ENCODE_SRC := $(SRC_DIR)/encode.c
 ENCODE_OBJ := $(BUILD_DIR)/encode.o
 
 CFLAGS := -g -Wall
-CONTROLLER_LDFLAGS := -L$(LIB_DIR) $(EXTRA_LIB_DIRS) -lzmq -ljson-c -lcupti
+CONTROLLER_LDFLAGS := -L$(LIB_DIR) $(EXTRA_LIB_DIRS) -lzmq -ljson-c
 CONTROLLER_LDFLAGS += -Wl,-rpath,'$$ORIGIN/../lib'
+CONTROLLER_LDFLAGS += $(if $(ZMQ_LIB_PATH),-Wl$(comma)-rpath$(comma)$(ZMQ_LIB_PATH),)
 
 # ==============================================================================
 # eBPF Monitor Configuration (STANDALONE)
 # ==============================================================================
 EBPF_MONITOR_SRC := $(SRC_DIR)/sched_latency.c
 EBPF_MONITOR_OBJ := $(BUILD_DIR)/sched_latency.o
-EBPF_ENCODE_OBJ := $(BUILD_DIR)/encode_ebpf.o
-
 # CRITICAL FIX 1: Add libbpf include path for eBPF monitor
 EBPF_CPPFLAGS := $(CPPFLAGS) -I$(LIBBPF_DIR) -I$(BUILD_DIR)
-EBPF_LDFLAGS := -L$(LIB_DIR) $(EXTRA_LIB_DIRS) -lbpf -lelf -lz -lzmq -ljson-c
+EBPF_LDFLAGS := $(EXTRA_LIB_DIRS) $(if $(LIBBPF_LIB),$(LIBBPF_LIB),-L$(LIB_DIR) -lbpf) \
+                $(if $(ELF_LIB),$(ELF_LIB),-lelf) -lz -lzmq
 EBPF_LDFLAGS += -Wl,-rpath,'$$ORIGIN/../lib'
+EBPF_LDFLAGS += $(if $(ZMQ_LIB_PATH),-Wl$(comma)-rpath$(comma)$(ZMQ_LIB_PATH),)
 
 # ==============================================================================
 # CUPTI Tracer
 # ==============================================================================
 TRACER_SRC := $(SRC_DIR)/tracer.cu
-NVCC_CPPFLAGS := -I"$(CUDA_INSTALL_PATH)/include" -I"$(CUPTI_INSTALL_PATH)/include"
+NVCC_CPPFLAGS := -I"$(CUDA_INCLUDE_DIR)" -I"$(CUPTI_INCLUDE_DIR)"
 NVCC_CFLAGS := -g -shared -Xcompiler -fPIC
-NVCC_LDFLAGS := $(EXTRA_LIB_DIRS) -L"$(CUPTI_INSTALL_PATH)/lib64" -L"$(CUDA_INSTALL_PATH)/lib64" \
+NVCC_LDFLAGS := $(EXTRA_LIB_DIRS) -L"$(CUPTI_LIB_DIR)" -L"$(CUDA_LIB_DIR)" \
+                -Xlinker -rpath -Xlinker "$(CUPTI_LIB_DIR)" \
+                -Xlinker -rpath -Xlinker "$(CUDA_LIB_DIR)" \
                 -lcupti -lcuda -lzmq -ljson-c
 
 # ==============================================================================
@@ -78,11 +103,6 @@ $(BUILD_DIR):
 $(ENCODE_OBJ): $(ENCODE_SRC) | $(BUILD_DIR)
 	@echo "  CC       $@"
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-# --- encode module for ebpf_monitor ---
-$(EBPF_ENCODE_OBJ): $(ENCODE_SRC) | $(BUILD_DIR)
-	@echo "  CC (eBPF) $@"
-	$(CC) $(EBPF_CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 # --- CUPTI Tracer ---
 $(TARGET_TRACER): $(TRACER_SRC) $(INCLUDE_DIR)/tracer_comm.h $(ENCODE_OBJ) | $(BUILD_DIR)
@@ -104,7 +124,7 @@ $(CONTROLLER_OBJ): $(CONTROLLER_SRC) | $(BUILD_DIR)
 # eBPF Monitor Build (CRITICAL FIXES)
 # ==============================================================================
 # CRITICAL FIX 2: Remove $(BPF_SKELETON) from link dependencies!
-$(TARGET_EBPF_MONITOR): $(EBPF_MONITOR_OBJ) $(EBPF_ENCODE_OBJ) | $(BUILD_DIR)
+$(TARGET_EBPF_MONITOR): $(EBPF_MONITOR_OBJ) | $(BUILD_DIR)
 	@echo "  LINK (eBPF) $@"
 	$(CC) $(CFLAGS) -o $@ $^ $(EBPF_LDFLAGS)
 

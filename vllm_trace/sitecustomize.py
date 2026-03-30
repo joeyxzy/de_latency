@@ -71,6 +71,176 @@ class TraceSender:
             except Exception:
                 pass
 
+
+_GPU_EXEC_CONTEXT = threading.local()
+GPU_PHASE_SCOPE_NAMES = {
+    "Preprocess",
+    "Forward",
+    "Postprocess",
+    "Sample",
+    "Bookkeep",
+    "Draft",
+    "EPLB",
+}
+
+
+def _get_native_tid():
+    try:
+        return threading.get_native_id()
+    except AttributeError:
+        return threading.get_ident()
+
+
+def _normalize_req_ids(req_ids):
+    if req_ids is None:
+        return []
+    if isinstance(req_ids, (list, tuple, set)):
+        values = req_ids
+    else:
+        values = [req_ids]
+    normalized = []
+    for item in values:
+        if item is None:
+            continue
+        rid = getattr(item, "request_id", None) or getattr(item, "req_id", None) or item
+        rid = str(rid).strip()
+        if rid:
+            normalized.append(rid)
+    return normalized
+
+
+def _extract_req_ids_from_input_batch(input_batch):
+    if input_batch is None or not hasattr(input_batch, "req_ids"):
+        return []
+    try:
+        return _normalize_req_ids(list(input_batch.req_ids))
+    except Exception:
+        return []
+
+
+def _extract_req_ids_from_scheduler_output(scheduler_output):
+    if scheduler_output is None:
+        return []
+
+    req_ids = []
+    try:
+        if hasattr(scheduler_output, "scheduled_new_reqs"):
+            for req in scheduler_output.scheduled_new_reqs:
+                req_ids.extend(_normalize_req_ids(req))
+
+        if hasattr(scheduler_output, "scheduled_cached_reqs"):
+            cached = scheduler_output.scheduled_cached_reqs
+            if cached is not None and hasattr(cached, "req_ids"):
+                req_ids.extend(_normalize_req_ids(cached.req_ids))
+    except Exception:
+        return []
+    return req_ids
+
+
+def _summarize_scheduler_output(scheduler_output):
+    req_ids = _extract_req_ids_from_scheduler_output(scheduler_output)
+    batch_size = 0
+    input_type = "unknown"
+
+    try:
+        if hasattr(scheduler_output, "total_num_scheduled_tokens"):
+            batch_size = int(scheduler_output.total_num_scheduled_tokens)
+            input_type = "scheduler_output_v1"
+        elif hasattr(scheduler_output, "num_scheduled_tokens"):
+            val = scheduler_output.num_scheduled_tokens
+            if isinstance(val, dict):
+                batch_size = sum(int(x) for x in val.values())
+            elif isinstance(val, (list, tuple)):
+                batch_size = sum(int(x) for x in val)
+            else:
+                batch_size = int(val)
+            input_type = "scheduler_output_v2"
+    except Exception:
+        batch_size = 0
+        input_type = "unknown"
+
+    return {
+        "req_ids": req_ids,
+        "batch_size": batch_size,
+        "input_type": input_type,
+    }
+
+
+def _gpu_exec_stack():
+    stack = getattr(_GPU_EXEC_CONTEXT, "stack", None)
+    if stack is None:
+        stack = []
+        _GPU_EXEC_CONTEXT.stack = stack
+    return stack
+
+
+def _push_gpu_exec_context(ctx):
+    _gpu_exec_stack().append(ctx)
+
+
+def _pop_gpu_exec_context():
+    stack = _gpu_exec_stack()
+    if not stack:
+        return None
+    return stack.pop()
+
+
+def _current_gpu_exec_context():
+    stack = getattr(_GPU_EXEC_CONTEXT, "stack", None)
+    if not stack:
+        return None
+    return stack[-1]
+
+
+def _refresh_gpu_exec_context(ctx):
+    runner = ctx.get("runner")
+    req_ids = _extract_req_ids_from_input_batch(getattr(runner, "input_batch", None))
+    if req_ids:
+        ctx["req_ids"] = req_ids
+    return ctx
+
+
+def _emit_legacy_gpu_phase_events(phase_name, payload):
+    if phase_name == "Forward":
+        TraceSender.emit(
+            event_type="gpu_forward_start",
+            payload={
+                "pid": payload["pid"],
+                "tid": payload["tid"],
+                "timestamp_ns": payload["start_ns"],
+            },
+        )
+        TraceSender.emit(
+            event_type="gpu_forward_end",
+            payload={
+                "pid": payload["pid"],
+                "tid": payload["tid"],
+                "timestamp_ns": payload["end_ns"],
+            },
+        )
+    elif phase_name == "Sample":
+        TraceSender.emit(
+            event_type="gpu_sample",
+            payload={
+                "pid": payload["pid"],
+                "tid": payload["tid"],
+                "req_ids": payload.get("req_ids", []),
+                "start_ns": payload["start_ns"],
+                "end_ns": payload["end_ns"],
+            },
+        )
+    elif phase_name == "Bookkeep":
+        TraceSender.emit(
+            event_type="gpu_bookkeeping",
+            payload={
+                "pid": payload["pid"],
+                "tid": payload["tid"],
+                "req_ids": payload.get("req_ids", []),
+                "start_ns": payload["start_ns"],
+                "end_ns": payload["end_ns"],
+            },
+        )
+
 # --- Hook 注册表 ---
 HOOK_REGISTRY = {}
 _WORKER_READY_PIDS = set()
@@ -358,184 +528,128 @@ def patch_gpu_model_runner(module):
         return
 
     cls = module.GPUModelRunner
-    method_names = [m for m in dir(cls) ]
-    class ModelProxy:
-        def __init__(self, model):
-            self._model = model
 
-        def __call__(self, *args, **kwargs):
-            # [Timeline Point] Forward 开始
-            start_ns = time.time_ns()
-            TraceSender.emit(
-                event_type="gpu_forward_start",
-                payload={
-                    "pid": os.getpid(),
-                    "tid": getattr(threading, "get_native_id", threading.get_ident)(),
-                    "hooked_method": "model.__call__",
-                    "timestamp_ns": start_ns,
-                }
-            )
-            
-            try:
-                # 执行真正的模型 Forward
-                return self._model(*args, **kwargs)
-            finally:
-                # [Timeline Point] Forward 结束 (这也是 Postprocess 的开始)
-                end_ns = time.time_ns()
-                TraceSender.emit(
-                    event_type="gpu_forward_end",
-                    payload={
-                        "pid": os.getpid(),
-                        "tid": getattr(threading, "get_native_id", threading.get_ident)(),
-                        "timestamp_ns": end_ns,
-                        # 可选：如果你想直接看 forward 耗时，可以把 start_ns 也带上
-                        # "duration_ns": end_ns - start_ns 
-                    }
-                )
+    if getattr(module, "_de_latency_phase_scope_patch_installed", False):
+        logger.info(">>> [HOOK] GPUModelRunner phase scope patch already installed")
+    else:
+        original_record_function = module.record_function_or_nullcontext
 
-        def __getattr__(self, name):
-            return getattr(self._model, name)
-    #定义excute_model
-    def excute_model_wrapper(original_func):
+        def patched_record_function_or_nullcontext(name):
+            base_cm = original_record_function(name)
+            if name not in GPU_PHASE_SCOPE_NAMES:
+                return base_cm
+
+            class _TracePhaseScope:
+                def __init__(self, wrapped_cm, phase_name):
+                    self._wrapped_cm = wrapped_cm
+                    self._phase_name = phase_name
+                    self._start_ns = None
+
+                def __enter__(self):
+                    self._start_ns = time.time_ns()
+                    return self._wrapped_cm.__enter__()
+
+                def __exit__(self, exc_type, exc, tb):
+                    suppressed = False
+                    try:
+                        suppressed = self._wrapped_cm.__exit__(exc_type, exc, tb)
+                    finally:
+                        ctx = _current_gpu_exec_context()
+                        if ctx is not None and self._start_ns is not None:
+                            end_ns = time.time_ns()
+                            ctx = _refresh_gpu_exec_context(ctx)
+                            payload = {
+                                "phase": self._phase_name,
+                                "pid": ctx.get("pid", os.getpid()),
+                                "tid": ctx.get("tid", _get_native_tid()),
+                                "req_ids": list(ctx.get("req_ids", [])),
+                                "batch_size": ctx.get("batch_size", 0),
+                                "input_type": ctx.get("input_type", "unknown"),
+                                "ranks": dict(ctx.get("ranks", {})),
+                                "start_ns": self._start_ns,
+                                "end_ns": end_ns,
+                                "timestamp_ns": end_ns,
+                            }
+                            TraceSender.emit(
+                                event_type="gpu_phase_span",
+                                payload=payload,
+                            )
+                            _emit_legacy_gpu_phase_events(self._phase_name, payload)
+                    return suppressed
+
+            return _TracePhaseScope(base_cm, name)
+
+        module.record_function_or_nullcontext = patched_record_function_or_nullcontext
+        module._de_latency_phase_scope_patch_installed = True
+        logger.info(">>> [HOOK] Patched gpu_model_runner.record_function_or_nullcontext")
+
+    if getattr(cls, "_de_latency_execute_model_patch_installed", False):
+        logger.info(">>> [HOOK] GPUModelRunner.execute_model patch already installed")
+        return
+
+    def execute_model_wrapper(original_func):
+        sig = inspect.signature(original_func)
+
         def wrapper(self, *args, **kwargs):
-            if not hasattr(self, "_model_wrapped"):
-                if hasattr(self, "model") and self.model is not None:
-                    self.model = ModelProxy(self.model)
-                    self._model_wrapped = True
-                    logger.info(f">>> [HOOK] GPUModelRunner.model wrapped with ModelProxy")
-                else:
-                    # 安全兜底
-                    logger.warning("GPUModelRunner instance has no 'model' attribute yet")
-            # [Stage 1] 记录开始信息
             start_ns = time.time_ns()
             pid = os.getpid()
-            try:
-                tid = threading.get_native_id()
-            except AttributeError:
-                tid = threading.get_ident()
+            tid = _get_native_tid()
 
-            # [Stage 2] 执行原函数 (这是真正的 GPU 推理触发点)
-            res = original_func(self, *args, **kwargs)
-            
-            # [Stage 3] 采集数据 (放在 try 块中以防分析逻辑崩溃影响推理)
+            scheduler_output = None
+            summary = {
+                "req_ids": [],
+                "batch_size": 0,
+                "input_type": "unknown",
+            }
             try:
-                end_ns = time.time_ns()
-                
-                # --- 参数内省 (Introspection) ---
-                # 使用 inspect 绑定参数，无论用户是位置参数还是关键字参数调用都能拿到
-                sig = inspect.signature(original_func)
                 bound_args = sig.bind(self, *args, **kwargs)
                 bound_args.apply_defaults()
-                all_args = bound_args.arguments
+                scheduler_output = bound_args.arguments.get("scheduler_output")
+                summary = _summarize_scheduler_output(scheduler_output)
+            except Exception:
+                pass
 
-                actual_batch_size = 0
-                input_type = "unknown"
-                
-                # 尝试从 scheduler_output 解析 Batch Size
-                if "scheduler_output" in all_args:
-                    sched_out = all_args["scheduler_output"]
-                    # vLLM 不同版本属性名可能不同，做兼容处理
-                    if hasattr(sched_out, "total_num_scheduled_tokens"):
-                        actual_batch_size = sched_out.total_num_scheduled_tokens
-                        input_type = "scheduler_output_v1"
-                    elif hasattr(sched_out, "num_scheduled_tokens"):
-                        val = sched_out.num_scheduled_tokens
-                        if isinstance(val, dict):
-                            actual_batch_size = sum(val.values())
-                        elif isinstance(val, (list, tuple)):
-                            actual_batch_size = sum(val)
-                        else:
-                            actual_batch_size = int(val)
-                        input_type = "scheduler_output_v2"
+            ranks = {"dp": -1, "tp": -1}
+            p_cfg = getattr(self, "parallel_config", None)
+            if p_cfg:
+                ranks["dp"] = getattr(p_cfg, "data_parallel_rank", -1)
+                ranks["tp"] = getattr(p_cfg, "tensor_parallel_rank", -1)
 
-                # 兜底：尝试从 Tensor 解析
-                if actual_batch_size == 0:
-                    for key in ["input_ids", "intermediate_tensors"]:
-                        if key in all_args and all_args[key] is not None:
-                            # 假设第一维是 batch
-                            actual_batch_size = getattr(all_args[key], "shape", [0])[0]
-                            input_type = f"tensor_{key}"
-                            break
-
-                # 获取 Request IDs (上下文关联的关键)
-                req_ids = []
-                if hasattr(self, "input_batch") and self.input_batch:
-                    if hasattr(self.input_batch, "req_ids"):
-                        req_ids = list(self.input_batch.req_ids)
-
-                # 获取并行配置 (DP/TP Rank)
-                ranks = {"dp": -1, "tp": -1}
-                p_cfg = getattr(self, "parallel_config", None)
-                if p_cfg:
-                    ranks["dp"] = getattr(p_cfg, 'data_parallel_rank', -1)
-                    ranks["tp"] = getattr(p_cfg, 'tensor_parallel_rank', -1)
-
-                # 发送数据
+            ctx = {
+                "runner": self,
+                "pid": pid,
+                "tid": tid,
+                "req_ids": list(summary.get("req_ids", [])),
+                "batch_size": summary.get("batch_size", 0),
+                "input_type": summary.get("input_type", "unknown"),
+                "ranks": ranks,
+            }
+            _push_gpu_exec_context(ctx)
+            try:
+                return original_func(self, *args, **kwargs)
+            finally:
+                end_ns = time.time_ns()
+                ctx = _pop_gpu_exec_context() or ctx
+                ctx = _refresh_gpu_exec_context(ctx)
                 TraceSender.emit(
                     event_type="gpu_execute_model",
                     payload={
                         "pid": pid,
                         "tid": tid,
                         "ranks": ranks,
-                        "batch_size": actual_batch_size,
-                        "input_type": input_type,
+                        "batch_size": ctx.get("batch_size", 0),
+                        "input_type": ctx.get("input_type", "unknown"),
                         "hooked_method": original_func.__name__,
-                        "req_ids": req_ids,
+                        "req_ids": list(ctx.get("req_ids", [])),
                         "start_ns": start_ns,
-                        "end_ns": end_ns
-                    }
+                        "end_ns": end_ns,
+                    },
                 )
 
-            except Exception:
-                # 生产环境建议 pass，调试时可 logger.error
-                pass
-            
-            return res
         return wrapper
-    
-    def sample_wrapper(original_func):
-        def wrapper(self, *args, **kwargs):
-            start_ns = time.time_ns()
-            # 执行原有的 _sample
-            try:
-                return original_func(self, *args, **kwargs)
-            finally:
-                # 即使报错也要记录结束时间
-                end_ns = time.time_ns()
-                TraceSender.emit(
-                    event_type="gpu_sample",
-                    payload={
-                        "pid": os.getpid(),
-                        "tid": getattr(threading, "get_native_id", threading.get_ident)(),
-                        "start_ns": start_ns,
-                        "end_ns": end_ns
-                    }
-                )
-        return wrapper
-    
-    def bookkeeping_wrapper(original_func):
-        def wrapper(self, *args, **kwargs):
-            start_ns = time.time_ns()
-            # 执行原有的 _bookkeeping_sync
-            # 这里的耗时 = GPU计算剩余时间 + 数据拷贝时间
-            try:
-                return original_func(self, *args, **kwargs)
-            finally:
-                end_ns = time.time_ns()
-                TraceSender.emit(
-                    event_type="gpu_bookkeeping",
-                    payload={
-                        "pid": os.getpid(),
-                        "tid": getattr(threading, "get_native_id", threading.get_ident)(),
-                        "start_ns": start_ns,
-                        "end_ns": end_ns
-                    }
-                )
-        return wrapper
-    
-    apply_method_patch(cls, "execute_model", excute_model_wrapper)
-    apply_method_patch(cls, "_sample", sample_wrapper)
-    apply_method_patch(cls, "_bookkeeping_sync", bookkeeping_wrapper)
+
+    if apply_method_patch(cls, "execute_model", execute_model_wrapper):
+        cls._de_latency_execute_model_patch_installed = True
 
 @register_hook("vllm.v1.core.sched.scheduler") 
 def patch_v1_scheduler(module):

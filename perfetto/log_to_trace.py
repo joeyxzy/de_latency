@@ -40,6 +40,22 @@ def create_flow_event(ph, ts, pid, tid, corr_id):
         "pid": pid, "tid": tid, "id": corr_id
     }
 
+
+def describe_gpu_phase(phase_name):
+    styles = {
+        "Preprocess": ("Worker Preprocess", "python", "good"),
+        "Forward": ("Model Forward", "python", "olive"),
+        "Postprocess": ("Postprocess", "python", "rail_load"),
+        "Sample": ("Sampling", "python", "mauve"),
+        "Bookkeep": ("Bookkeeping/Sync", "python", "cyan"),
+        "Draft": ("Draft", "python", "yellow"),
+        "EPLB": ("EPLB", "python", "rail_idle"),
+    }
+    return styles.get(
+        phase_name,
+        (f"GPU Phase: {phase_name}", "python", "background"),
+    )
+
 def infer_trace_origin_ns(
     worker_events,
     scheduler_events,
@@ -490,11 +506,12 @@ def process_logs(input_file, output_file):
         if src == 'monkey_patch':
             # 新增事件类型支持
             if etype in ['worker_preprocess_start', 'gpu_forward_start', 'gpu_forward_end', 
-                         'gpu_sample', 'gpu_bookkeeping', 'gpu_execute_model']:
+                         'gpu_sample', 'gpu_bookkeeping', 'gpu_execute_model',
+                         'gpu_phase_span']:
                 worker_events.append({
                     "type": etype,
                     "payload": payload,
-                    "ts": payload.get('timestamp_ns', payload.get('start_ns', ts))
+                    "ts": payload.get('start_ns', payload.get('timestamp_ns', ts))
                 })
             elif etype in ['req_enqueue_scheduler', 'req_scheduler_out_rpc', 'req_step_ready']:
                 scheduler_events.append({"type": etype, "payload": payload})
@@ -555,6 +572,7 @@ def process_logs(input_file, output_file):
     print(f"Processing Worker Events ({len(worker_events)})...")
     
     worker_events.sort(key=lambda x: x['ts'])
+    has_precise_phase_spans = any(ev.get('type') == 'gpu_phase_span' for ev in worker_events)
 
     # 状态存储: Key=(pid, tid), Value={
     #   't_pre_start': ..., 
@@ -602,10 +620,43 @@ def process_logs(input_file, output_file):
                 ))
             continue  # 不进入状态机流转
 
+        if etype == 'gpu_phase_span':
+            phase_name = payload.get('phase')
+            t_start = payload.get('start_ns')
+            t_end = payload.get('end_ns')
+            if phase_name and t_start is not None and t_end is not None:
+                req_ids = payload.get('req_ids', [])
+                batch_size = payload.get('batch_size')
+                input_type = payload.get('input_type')
+                display_name, cat, cname = describe_gpu_phase(phase_name)
+                args = {
+                    "phase": phase_name,
+                    "req_ids": "\n".join(req_ids),
+                }
+                if batch_size is not None:
+                    args["batch_size"] = batch_size
+                if input_type:
+                    args["input_type"] = input_type
+                trace_events.append(create_perfetto_event(
+                    name=display_name,
+                    cat=cat, ph="X", ts=t_start, dur=t_end - t_start,
+                    pid=pid, tid=tid,
+                    args=args,
+                    cname=cname
+                ))
+                state = worker_states.setdefault(key, {})
+                if req_ids:
+                    state['req_ids'] = req_ids
+                if batch_size is not None:
+                    state['batch_size'] = batch_size
+                if input_type:
+                    state['input_type'] = input_type
+            continue
+
         # ----------------------------------------------------------------
         # [Step 1] Preprocess Start
         # ----------------------------------------------------------------
-        if etype == 'worker_preprocess_start':
+        if not has_precise_phase_spans and etype == 'worker_preprocess_start':
             worker_states[key] = {
                 't_pre_start': ts,
                 'req_ids': payload.get('req_ids', []),
@@ -616,7 +667,7 @@ def process_logs(input_file, output_file):
         # ----------------------------------------------------------------
         # [Step 2] Forward Start
         # ----------------------------------------------------------------
-        elif etype == 'gpu_forward_start':
+        elif not has_precise_phase_spans and etype == 'gpu_forward_start':
             state = worker_states.get(key)
             if state and 't_pre_start' in state:
                 t1 = state['t_pre_start']
@@ -633,7 +684,7 @@ def process_logs(input_file, output_file):
         # ----------------------------------------------------------------
         # [Step 3] Forward End
         # ----------------------------------------------------------------
-        elif etype == 'gpu_forward_end':
+        elif not has_precise_phase_spans and etype == 'gpu_forward_end':
             state = worker_states.get(key)
             if state and 't_fwd_start' in state:
                 t2 = state['t_fwd_start']
@@ -650,7 +701,7 @@ def process_logs(input_file, output_file):
         # ----------------------------------------------------------------
         # [Step 4] Sample (区间事件)
         # ----------------------------------------------------------------
-        elif etype == 'gpu_sample':
+        elif not has_precise_phase_spans and etype == 'gpu_sample':
             t_start = payload.get('start_ns')
             t_end = payload.get('end_ns')
             if t_start is not None and t_end is not None:
@@ -667,7 +718,7 @@ def process_logs(input_file, output_file):
         # ----------------------------------------------------------------
         # [Step 5] Bookkeeping / Sync (区间事件)
         # ----------------------------------------------------------------
-        elif etype == 'gpu_bookkeeping':
+        elif not has_precise_phase_spans and etype == 'gpu_bookkeeping':
             t_start = payload.get('start_ns')
             t_end = payload.get('end_ns')
             if t_start is not None and t_end is not None:

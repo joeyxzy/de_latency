@@ -13,10 +13,18 @@
 #include <sys/resource.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
-#include <zmq.h>
-#include <json-c/json.h>
 
 #include "sched_latency.skel.h"
+
+// Minimal libzmq declarations to avoid requiring zmq.h at build time.
+#define ZMQ_PUSH 8
+extern void *zmq_ctx_new(void);
+extern int zmq_ctx_term(void *context);
+extern void *zmq_socket(void *context, int type);
+extern int zmq_close(void *socket);
+extern int zmq_connect(void *socket, const char *endpoint);
+extern const char *zmq_strerror(int errnum);
+extern int zmq_send(void *socket, const void *buf, size_t len, int flags);
 
 // ZMQ Configuration
 #define DEFAULT_ZMQ_ADDR "ipc:///tmp/tracer.sock"
@@ -326,39 +334,35 @@ static void cleanup_zmq() {
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
     const struct event_data *e = data;
+    char msg[512];
+    const char *reason;
+    int len;
+
     if (data_sz != sizeof(*e)) {
         fprintf(stderr, "Invalid event size\n");
         return 1;
     }
 
-    // 1. 创建 Payload JSON 对象
-    struct json_object *payload_obj = json_object_new_object();
-    json_object_object_add(payload_obj, "tid", json_object_new_int((int)e->tid));
-    json_object_object_add(payload_obj, "start_ns", json_object_new_int64((int64_t)e->start_ns));
-    json_object_object_add(payload_obj, "end_ns", json_object_new_int64((int64_t)e->end_ns));
-    json_object_object_add(payload_obj, "dur_us", json_object_new_int64((int64_t)(e->end_ns - e->start_ns))); // 这里修正了单位转换逻辑，假设原本是ns差值
-    json_object_object_add(payload_obj, "reason", json_object_new_string((e->type == 0) ? "Wakeup" : "Preempt"));
-
-    // 2. 创建 Meta JSON 对象 (最外层)
-    struct json_object *meta_obj = json_object_new_object();
-    json_object_object_add(meta_obj, "source", json_object_new_string("ebpf"));
-    json_object_object_add(meta_obj, "event_type", json_object_new_string("sched_latency"));
-    json_object_object_add(meta_obj, "timestamp", json_object_new_int64(e->end_ns));
-    
-    // 关键点：将 payload 放入 meta 中
-    json_object_object_add(meta_obj, "payload", payload_obj);
-
-    // 3. 序列化并发送 (单帧)
-    const char *full_msg_str = json_object_to_json_string(meta_obj);
-    size_t full_msg_len = strlen(full_msg_str);
-
-    // 发送单帧 (无 SNDMORE)
-    zmq_send(g_zmq_sock, full_msg_str, full_msg_len, 0);
-
-    // 释放内存
-    // 注意：json_object_put(meta_obj) 会递归释放它包含的 payload_obj，
-    // 所以不需要单独释放 payload_obj
-    json_object_put(meta_obj);
+    reason = (e->type == 0) ? "Wakeup" : "Preempt";
+    len = snprintf(
+        msg,
+        sizeof(msg),
+        "{\"source\":\"ebpf\",\"event_type\":\"sched_latency\",\"timestamp\":%llu,"
+        "\"payload\":{\"tid\":%u,\"start_ns\":%llu,\"end_ns\":%llu,\"dur_us\":%llu,\"reason\":\"%s\"}}",
+        (unsigned long long)e->end_ns,
+        (unsigned int)e->tid,
+        (unsigned long long)e->start_ns,
+        (unsigned long long)e->end_ns,
+        (unsigned long long)(e->end_ns - e->start_ns),
+        reason
+    );
+    if (len < 0) {
+        return 1;
+    }
+    if ((size_t)len >= sizeof(msg)) {
+        len = (int)(sizeof(msg) - 1);
+    }
+    zmq_send(g_zmq_sock, msg, (size_t)len, 0);
 
     return 0;
 }
