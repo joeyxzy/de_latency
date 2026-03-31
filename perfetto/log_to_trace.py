@@ -41,6 +41,19 @@ def create_flow_event(ph, ts, pid, tid, corr_id):
     }
 
 
+def build_request_lane_tids(req_index):
+    base = req_index * 10
+    return {
+        "label": base + 1,
+        "lifecycle": base + 2,
+        "queue": base + 3,
+        "exec": base + 4,
+        "dispatch": base + 5,
+        "os": base + 6,
+        "stage": base + 7,
+    }
+
+
 def describe_gpu_phase(phase_name):
     styles = {
         "Preprocess": ("Worker Preprocess", "python", "good"),
@@ -60,6 +73,9 @@ def infer_trace_origin_ns(
     worker_events,
     scheduler_events,
     coroutine_events,
+    coroutine_exec_events,
+    output_handler_sched_events,
+    output_handler_exec_events,
     req_stage_events,
     enginecore_loop_events,
     execute_model_span,
@@ -92,6 +108,24 @@ def infer_trace_origin_ns(
         p = ev.get("payload", {})
         _update(p.get("timestamp_ns", ev.get("ts")))
 
+    for ev in coroutine_exec_events:
+        p = ev.get("payload", {})
+        _update(p.get("timestamp_ns", ev.get("ts")))
+        _update(p.get("start_ns"))
+        _update(p.get("end_ns"))
+
+    for ev in output_handler_sched_events:
+        p = ev.get("payload", {})
+        _update(p.get("timestamp_ns", ev.get("ts")))
+        _update(p.get("ready_ts_ns"))
+        _update(p.get("run_ts_ns"))
+
+    for ev in output_handler_exec_events:
+        p = ev.get("payload", {})
+        _update(p.get("timestamp_ns", ev.get("ts")))
+        _update(p.get("start_ns"))
+        _update(p.get("end_ns"))
+
     for ev in req_stage_events:
         p = ev.get("payload", {})
         _update(p.get("timestamp_ns", ev.get("ts")))
@@ -104,10 +138,12 @@ def infer_trace_origin_ns(
         _update(p.get("start_ns"))
         _update(p.get("end_ns"))
 
-    for p in execute_model_span:
-        _update(p.get("timestamp_ns"))
-        _update(p.get("start_ns"))
-        _update(p.get("end_ns"))
+    # NOTE:
+    # execute_model_span 当前来自 worker 侧 monotonic 时钟，
+    # 而绝大多数其余事件使用 wall clock (time.time_ns)。
+    # 这里不能把 mono 时间直接混进 trace origin 推断，
+    # 否则会导致 wall 时间事件整体被平移到一个极大的 us 位置，
+    # 看起来像“只剩下 worker overlap 可见”。
 
     return min_ns or 0
 
@@ -462,6 +498,9 @@ def process_logs(input_file, output_file):
     cupti_events = []
     req_metric_events = []
     coroutine_events = []
+    coroutine_exec_events = []
+    output_handler_sched_events = []
+    output_handler_exec_events = []
     req_stage_events = []
     enginecore_loop_events = []
     execute_model_span = []
@@ -477,7 +516,7 @@ def process_logs(input_file, output_file):
         if 'meta' in entry:
             # 如果是 ZeroMQ 发送的原始格式
             meta = entry.get('meta', {})
-            payload = meta.get('payload', {})
+            payload = meta.get('payload') or entry.get('payload', {})
             src = meta.get('source')
             etype = meta.get('event_type')
             ts = meta.get('timestamp_ns')
@@ -526,6 +565,24 @@ def process_logs(input_file, output_file):
                     "payload": payload,
                     "ts": payload.get('timestamp_ns', ts)
                 })
+            elif etype == "coroutine_exec_slice":
+                coroutine_exec_events.append({
+                    "type": etype,
+                    "payload": payload,
+                    "ts": payload.get('timestamp_ns', payload.get('end_ns', ts)),
+                })
+            elif etype == "output_handler_sched_latency":
+                output_handler_sched_events.append({
+                    "type": etype,
+                    "payload": payload,
+                    "ts": payload.get('timestamp_ns', payload.get('run_ts_ns', ts)),
+                })
+            elif etype == "output_handler_exec_slice":
+                output_handler_exec_events.append({
+                    "type": etype,
+                    "payload": payload,
+                    "ts": payload.get('timestamp_ns', payload.get('end_ns', ts)),
+                })
             elif etype == "req_generate_stage":
                 req_stage_events.append({
                     "type": etype,
@@ -561,6 +618,9 @@ def process_logs(input_file, output_file):
         worker_events=worker_events,
         scheduler_events=scheduler_events,
         coroutine_events=coroutine_events,
+        coroutine_exec_events=coroutine_exec_events,
+        output_handler_sched_events=output_handler_sched_events,
+        output_handler_exec_events=output_handler_exec_events,
         req_stage_events=req_stage_events,
         enginecore_loop_events=enginecore_loop_events,
         execute_model_span=execute_model_span,
@@ -741,6 +801,12 @@ def process_logs(input_file, output_file):
     req_generate_start_map = {}
     req_coro_sched_ns = defaultdict(int)
     req_coro_sched_intervals = defaultdict(list)
+    req_generate_exec_ns = defaultdict(int)
+    req_generate_exec_intervals = defaultdict(list)
+    req_output_handler_sched_ns = defaultdict(int)
+    req_output_handler_sched_intervals = defaultdict(list)
+    req_output_handler_exec_ns = defaultdict(int)
+    req_output_handler_exec_intervals = defaultdict(list)
 
     for ev in coroutine_events:
         etype = ev['type']
@@ -806,6 +872,94 @@ def process_logs(input_file, output_file):
             print(f"  - Request {rid} ({label}): {lat_ns / 1e6:.3f} ms (Coroutine Scheduler Queue)")
     else:
         print("  未统计到协程调度排队时间")
+
+    if coroutine_exec_events:
+        print(f"Processing Generate Coroutine Exec Events ({len(coroutine_exec_events)})...")
+    for ev in coroutine_exec_events:
+        payload = ev.get("payload", {})
+        rid = payload.get("request_id") or payload.get("req_id")
+        if not rid:
+            continue
+        start_ns = to_int(payload.get("start_ns"))
+        end_ns = to_int(payload.get("end_ns"))
+        dur_ns = to_int(payload.get("duration_ns"))
+        if dur_ns is None and start_ns is not None and end_ns is not None:
+            dur_ns = end_ns - start_ns
+        if dur_ns is None or dur_ns < 0:
+            continue
+        req_generate_exec_ns[rid] += dur_ns
+        if start_ns and end_ns and end_ns > start_ns:
+            req_generate_exec_intervals[rid].append({
+                "start_ns": start_ns,
+                "end_ns": end_ns,
+                "task_name": payload.get("task_name"),
+            })
+
+    if req_generate_exec_ns:
+        print(f"共统计到 {len(req_generate_exec_ns)} 个请求的 generate 协程执行时间：")
+        for rid, lat_ns in sorted(req_generate_exec_ns.items(), key=lambda x: x[1], reverse=True):
+            label = req_name_map.get(rid, rid)
+            print(f"  - Request {rid} ({label}): {lat_ns / 1e6:.3f} ms (Generate Coroutine Exec)")
+    elif coroutine_exec_events:
+        print("  generate 协程执行事件存在，但未找到可归因的 request_id")
+
+    if output_handler_sched_events:
+        print(f"Processing Output Handler Scheduler Events ({len(output_handler_sched_events)})...")
+    for ev in output_handler_sched_events:
+        payload = ev.get("payload", {})
+        ready_ts_ns = to_int(payload.get("ready_ts_ns"))
+        run_ts_ns = to_int(payload.get("run_ts_ns"))
+        queue_ns = to_int(payload.get("queue_ns"))
+        req_ids = normalize_request_ids(payload.get("req_ids"))
+        if not req_ids or queue_ns is None or queue_ns < 0:
+            continue
+        for rid in req_ids:
+            req_output_handler_sched_ns[rid] += queue_ns
+            if ready_ts_ns and run_ts_ns and run_ts_ns > ready_ts_ns:
+                req_output_handler_sched_intervals[rid].append({
+                    "start_ns": ready_ts_ns,
+                    "end_ns": run_ts_ns,
+                    "shared_req_count": len(req_ids),
+                    "round_seq": payload.get("round_seq"),
+                })
+
+    if req_output_handler_sched_ns:
+        print(f"共统计到 {len(req_output_handler_sched_ns)} 个请求的 output_handler 调度排队时间：")
+        for rid, lat_ns in sorted(req_output_handler_sched_ns.items(), key=lambda x: x[1], reverse=True):
+            label = req_name_map.get(rid, rid)
+            print(f"  - Request {rid} ({label}): {lat_ns / 1e6:.3f} ms (Output Handler Scheduler Queue)")
+    elif output_handler_sched_events:
+        print("  output_handler 调度事件存在，但未找到可归因的 req_ids")
+
+    if output_handler_exec_events:
+        print(f"Processing Output Handler Exec Events ({len(output_handler_exec_events)})...")
+    for ev in output_handler_exec_events:
+        payload = ev.get("payload", {})
+        start_ns = to_int(payload.get("start_ns"))
+        end_ns = to_int(payload.get("end_ns"))
+        dur_ns = to_int(payload.get("duration_ns"))
+        req_ids = normalize_request_ids(payload.get("req_ids"))
+        if dur_ns is None and start_ns is not None and end_ns is not None:
+            dur_ns = end_ns - start_ns
+        if not req_ids or dur_ns is None or dur_ns < 0:
+            continue
+        for rid in req_ids:
+            req_output_handler_exec_ns[rid] += dur_ns
+            if start_ns and end_ns and end_ns > start_ns:
+                req_output_handler_exec_intervals[rid].append({
+                    "start_ns": start_ns,
+                    "end_ns": end_ns,
+                    "shared_req_count": len(req_ids),
+                    "round_seq": payload.get("round_seq"),
+                })
+
+    if req_output_handler_exec_ns:
+        print(f"共统计到 {len(req_output_handler_exec_ns)} 个请求的 output_handler 执行时间：")
+        for rid, lat_ns in sorted(req_output_handler_exec_ns.items(), key=lambda x: x[1], reverse=True):
+            label = req_name_map.get(rid, rid)
+            print(f"  - Request {rid} ({label}): {lat_ns / 1e6:.3f} ms (Output Handler Exec)")
+    elif output_handler_exec_events:
+        print("  output_handler 执行事件存在，但未找到可归因的 req_ids")
 
     # 为 request dispatch phase 做回退兜底：
     # 从 req_metrics_events 中按时间提取每个请求的 "scheduled/dequeue" phase 顺序。
@@ -1378,6 +1532,9 @@ def process_logs(input_file, output_file):
     all_req_ids = (
         set(request_spans.keys())
         | set(req_coro_sched_ns.keys())
+        | set(req_generate_exec_ns.keys())
+        | set(req_output_handler_sched_ns.keys())
+        | set(req_output_handler_exec_ns.keys())
         | set(req_vllm_queue_ns.keys())
         | set(req_latency_map.keys())
         | set(req_stage_ns.keys())
@@ -1395,7 +1552,7 @@ def process_logs(input_file, output_file):
                         "end_ns": e_wall,
                         "worker_tid": it["worker_tid"],
                     })
-    elif req_os_overlap_intervals:
+    if global_mono_to_wall_offset is None and req_os_overlap_intervals:
         print("  [warn] 无法估计 mono->wall 偏移，OS overlap 仅做统计，不绘制到请求生命周期轨道")
 
     def req_sort_key(rid):
@@ -1411,18 +1568,41 @@ def process_logs(input_file, output_file):
         s = req_stage_intervals.get(rid)
         if s:
             return min(it["start_ns"] for it in s)
+        oh = req_output_handler_sched_intervals.get(rid)
+        if oh:
+            return oh[0]["start_ns"]
+        gx = req_generate_exec_intervals.get(rid)
+        if gx:
+            return gx[0]["start_ns"]
+        ox = req_output_handler_exec_intervals.get(rid)
+        if ox:
+            return ox[0]["start_ns"]
         return float("inf")
 
-    for req_tid, rid in enumerate(sorted(all_req_ids, key=req_sort_key), start=1):
-        trace_events.append({
-            "name": "thread_name",
-            "ph": "M",
-            "pid": REQUEST_PID,
-            "tid": req_tid,
-            "args": {"name": rid[:12]},
-        })
+    for req_index, rid in enumerate(sorted(all_req_ids, key=req_sort_key), start=1):
+        lane_tids = build_request_lane_tids(req_index)
+        lane_names = {
+            "label": f"{rid[:12]}",
+            "lifecycle": f"{rid[:12]} | lifecycle",
+            "queue": f"{rid[:12]} | queue",
+            "exec": f"{rid[:12]} | exec",
+            "dispatch": f"{rid[:12]} | dispatch",
+            "os": f"{rid[:12]} | os",
+            "stage": f"{rid[:12]} | stage",
+        }
+        for lane_key, lane_tid in lane_tids.items():
+            trace_events.append({
+                "name": "thread_name",
+                "ph": "M",
+                "pid": REQUEST_PID,
+                "tid": lane_tid,
+                "args": {"name": lane_names[lane_key]},
+            })
 
         coro_sched_queue_ms = req_coro_sched_ns.get(rid, 0) / 1e6
+        generate_exec_ms = req_generate_exec_ns.get(rid, 0) / 1e6
+        output_handler_sched_queue_ms = req_output_handler_sched_ns.get(rid, 0) / 1e6
+        output_handler_exec_ms = req_output_handler_exec_ns.get(rid, 0) / 1e6
         vllm_queue_ms = req_vllm_queue_ns.get(rid, 0) / 1e6
         vllm_queue_from_enqueue_ms = req_vllm_queue_from_enqueue_ns.get(rid, 0) / 1e6
         vllm_queue_from_step_ready_ms = req_vllm_queue_from_step_ready_ns.get(rid, 0) / 1e6
@@ -1442,11 +1622,14 @@ def process_logs(input_file, output_file):
                 ts=span["start_ns"],
                 dur=span["end_ns"] - span["start_ns"],
                 pid=REQUEST_PID,
-                tid=req_tid,
+                tid=lane_tids["lifecycle"],
                 args={
                     "request_id": rid,
                     "request_name": req_name_map.get(rid, rid),
                     "coro_sched_queue_ms": round(coro_sched_queue_ms, 3),
+                    "generate_exec_ms": round(generate_exec_ms, 3),
+                    "output_handler_sched_queue_ms": round(output_handler_sched_queue_ms, 3),
+                    "output_handler_exec_ms": round(output_handler_exec_ms, 3),
                     "vllm_queue_ms": round(vllm_queue_ms, 3),
                     "vllm_queue_from_enqueue_ms": round(vllm_queue_from_enqueue_ms, 3),
                     "vllm_queue_from_step_ready_ms": round(vllm_queue_from_step_ready_ms, 3),
@@ -1482,7 +1665,7 @@ def process_logs(input_file, output_file):
                 ts=d["start_ns"],
                 dur=d["end_ns"] - d["start_ns"],
                 pid=REQUEST_PID,
-                tid=req_tid,
+                tid=lane_tids["dispatch"],
                 args={
                     "request_id": rid,
                     "phase": phase,
@@ -1500,9 +1683,65 @@ def process_logs(input_file, output_file):
                     ts=q0["start_ns"],
                     dur=q0["end_ns"] - q0["start_ns"],
                     pid=REQUEST_PID,
-                    tid=req_tid,
+                    tid=lane_tids["queue"],
                     args={"request_id": rid, "request_name": req_name_map.get(rid, rid)},
                     cname="yellow",
+                ))
+
+        for gx in req_generate_exec_intervals.get(rid, []):
+            if gx["end_ns"] > gx["start_ns"]:
+                trace_events.append(create_perfetto_event(
+                    name="Generate Coroutine Exec",
+                    cat="request_generate_exec",
+                    ph="X",
+                    ts=gx["start_ns"],
+                    dur=gx["end_ns"] - gx["start_ns"],
+                    pid=REQUEST_PID,
+                    tid=lane_tids["exec"],
+                    args={
+                        "request_id": rid,
+                        "request_name": req_name_map.get(rid, rid),
+                        "task_name": gx.get("task_name"),
+                    },
+                    cname="rail_idle",
+                ))
+
+        for qh in req_output_handler_sched_intervals.get(rid, []):
+            if qh["end_ns"] > qh["start_ns"]:
+                trace_events.append(create_perfetto_event(
+                    name="Output Handler Scheduler Queue Wait",
+                    cat="request_output_handler_sched_queue",
+                    ph="X",
+                    ts=qh["start_ns"],
+                    dur=qh["end_ns"] - qh["start_ns"],
+                    pid=REQUEST_PID,
+                    tid=lane_tids["queue"],
+                    args={
+                        "request_id": rid,
+                        "request_name": req_name_map.get(rid, rid),
+                        "shared_req_count": qh.get("shared_req_count"),
+                        "round_seq": qh.get("round_seq"),
+                    },
+                    cname="yellow",
+                ))
+
+        for ox in req_output_handler_exec_intervals.get(rid, []):
+            if ox["end_ns"] > ox["start_ns"]:
+                trace_events.append(create_perfetto_event(
+                    name="Output Handler Exec (Attributed)",
+                    cat="request_output_handler_exec",
+                    ph="X",
+                    ts=ox["start_ns"],
+                    dur=ox["end_ns"] - ox["start_ns"],
+                    pid=REQUEST_PID,
+                    tid=lane_tids["exec"],
+                    args={
+                        "request_id": rid,
+                        "request_name": req_name_map.get(rid, rid),
+                        "shared_req_count": ox.get("shared_req_count"),
+                        "round_seq": ox.get("round_seq"),
+                    },
+                    cname="cyan",
                 ))
 
         for q in queue_intervals_map.get(rid, []):
@@ -1524,7 +1763,7 @@ def process_logs(input_file, output_file):
                     ts=q["start_ns"],
                     dur=q["end_ns"] - q["start_ns"],
                     pid=REQUEST_PID,
-                    tid=req_tid,
+                    tid=lane_tids["queue"],
                     args={
                         "request_id": rid,
                         "reason": q["reason"],
@@ -1542,7 +1781,7 @@ def process_logs(input_file, output_file):
                     ts=o["start_ns"],
                     dur=o["end_ns"] - o["start_ns"],
                     pid=REQUEST_PID,
-                    tid=req_tid,
+                    tid=lane_tids["os"],
                     args={"request_id": rid, "worker_tid": o["worker_tid"]},
                     cname="terrible",
                 ))
@@ -1557,7 +1796,7 @@ def process_logs(input_file, output_file):
                 ts=s["start_ns"],
                 dur=s["end_ns"] - s["start_ns"],
                 pid=REQUEST_PID,
-                tid=req_tid,
+                tid=lane_tids["stage"],
                 args={
                     "request_id": rid,
                     "stage": s["stage"],
@@ -1567,7 +1806,18 @@ def process_logs(input_file, output_file):
             ))
 
     print("=== Request Interference Summary ===")
-    for rid in sorted(all_req_ids, key=lambda x: (req_coro_sched_ns.get(x, 0) + req_vllm_queue_ns.get(x, 0) + req_latency_map.get(x, 0)), reverse=True):
+    for rid in sorted(
+        all_req_ids,
+        key=lambda x: (
+            req_coro_sched_ns.get(x, 0)
+            + req_generate_exec_ns.get(x, 0)
+            + req_output_handler_sched_ns.get(x, 0)
+            + req_output_handler_exec_ns.get(x, 0)
+            + req_vllm_queue_ns.get(x, 0)
+            + req_latency_map.get(x, 0)
+        ),
+        reverse=True,
+    ):
         lifecycle_ms = None
         if rid in request_spans:
             lifecycle_ms = (request_spans[rid]["end_ns"] - request_spans[rid]["start_ns"]) / 1e6
@@ -1575,6 +1825,9 @@ def process_logs(input_file, output_file):
             f"  - {rid}: "
             f"lifecycle={f'{lifecycle_ms:.3f} ms' if lifecycle_ms is not None else 'N/A'}, "
             f"coro_sched_queue={req_coro_sched_ns.get(rid, 0) / 1e6:.3f} ms, "
+            f"generate_exec={req_generate_exec_ns.get(rid, 0) / 1e6:.3f} ms, "
+            f"output_handler_sched_queue={req_output_handler_sched_ns.get(rid, 0) / 1e6:.3f} ms, "
+            f"output_handler_exec={req_output_handler_exec_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"vllm_queue={req_vllm_queue_ns.get(rid, 0) / 1e6:.3f} ms "
             f"(scheduled-enqueue={req_vllm_queue_from_enqueue_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"scheduled-step_ready={req_vllm_queue_from_step_ready_ns.get(rid, 0) / 1e6:.3f} ms), "
@@ -1589,7 +1842,14 @@ def process_logs(input_file, output_file):
         trace_events,
         target_pid=REQUEST_PID,
         epsilon_us=1.0,
-        cat_prefixes=("request_queue", "request_dispatch"),
+        cat_prefixes=(
+            "request_queue",
+            "request_dispatch",
+            "request_coro_sched_queue",
+            "request_output_handler_sched_queue",
+            "request_generate_exec",
+            "request_output_handler_exec",
+        ),
         snap_tolerance_us=1.0,
     )
     if nudged_count > 0:
