@@ -51,6 +51,7 @@ def build_request_lane_tids(req_index):
         "dispatch": base + 5,
         "os": base + 6,
         "stage": base + 7,
+        "task": base + 8,
     }
 
 
@@ -801,6 +802,8 @@ def process_logs(input_file, output_file):
     req_generate_start_map = {}
     req_coro_sched_ns = defaultdict(int)
     req_coro_sched_intervals = defaultdict(list)
+    req_generate_task_sched_ns = defaultdict(int)
+    req_generate_task_sched_intervals = defaultdict(list)
     req_generate_exec_ns = defaultdict(int)
     req_generate_exec_intervals = defaultdict(list)
     req_output_handler_sched_ns = defaultdict(int)
@@ -819,13 +822,23 @@ def process_logs(input_file, output_file):
             ready_ts_ns = to_int(payload.get('ready_ts_ns'))
             run_ts_ns = to_int(payload.get('run_ts_ns'))
             queue_ns = to_int(payload.get('queue_ns'))
-            if rid and queue_ns is not None and queue_ns >= 0:
-                req_coro_sched_ns[rid] += queue_ns
-            if rid and ready_ts_ns and run_ts_ns and run_ts_ns > ready_ts_ns:
-                req_coro_sched_intervals[rid].append({
-                    "start_ns": ready_ts_ns,
-                    "end_ns": run_ts_ns,
-                })
+            task_kind = payload.get("task_kind")
+            if task_kind == "generate_task":
+                if rid and queue_ns is not None and queue_ns >= 0:
+                    req_generate_task_sched_ns[rid] += queue_ns
+                if rid and ready_ts_ns and run_ts_ns and run_ts_ns > ready_ts_ns:
+                    req_generate_task_sched_intervals[rid].append({
+                        "start_ns": ready_ts_ns,
+                        "end_ns": run_ts_ns,
+                    })
+            else:
+                if rid and queue_ns is not None and queue_ns >= 0:
+                    req_coro_sched_ns[rid] += queue_ns
+                if rid and ready_ts_ns and run_ts_ns and run_ts_ns > ready_ts_ns:
+                    req_coro_sched_intervals[rid].append({
+                        "start_ns": ready_ts_ns,
+                        "end_ns": run_ts_ns,
+                    })
             continue
 
         if etype == 'coroutine_start' and rid and cid and ts_ns:
@@ -872,6 +885,14 @@ def process_logs(input_file, output_file):
             print(f"  - Request {rid} ({label}): {lat_ns / 1e6:.3f} ms (Coroutine Scheduler Queue)")
     else:
         print("  未统计到协程调度排队时间")
+
+    if req_generate_task_sched_ns:
+        print(f"共统计到 {len(req_generate_task_sched_ns)} 个请求的 generate task 运行队列时间：")
+        for rid, lat_ns in sorted(req_generate_task_sched_ns.items(), key=lambda x: x[1], reverse=True):
+            label = req_name_map.get(rid, rid)
+            print(f"  - Request {rid} ({label}): {lat_ns / 1e6:.3f} ms (Generate Task Runnable Queue)")
+    else:
+        print("  未统计到 generate task 运行队列时间")
 
     if coroutine_exec_events:
         print(f"Processing Generate Coroutine Exec Events ({len(coroutine_exec_events)})...")
@@ -1532,6 +1553,7 @@ def process_logs(input_file, output_file):
     all_req_ids = (
         set(request_spans.keys())
         | set(req_coro_sched_ns.keys())
+        | set(req_generate_task_sched_ns.keys())
         | set(req_generate_exec_ns.keys())
         | set(req_output_handler_sched_ns.keys())
         | set(req_output_handler_exec_ns.keys())
@@ -1562,6 +1584,9 @@ def process_logs(input_file, output_file):
         q = queue_intervals_map.get(rid)
         if q:
             return q[0]["start_ns"]
+        tq = req_generate_task_sched_intervals.get(rid)
+        if tq:
+            return tq[0]["start_ns"]
         o = req_os_intervals_wall.get(rid)
         if o:
             return o[0]["start_ns"]
@@ -1589,6 +1614,7 @@ def process_logs(input_file, output_file):
             "dispatch": f"{rid[:12]} | dispatch",
             "os": f"{rid[:12]} | os",
             "stage": f"{rid[:12]} | stage",
+            "task": f"{rid[:12]} | task",
         }
         for lane_key, lane_tid in lane_tids.items():
             trace_events.append({
@@ -1600,6 +1626,7 @@ def process_logs(input_file, output_file):
             })
 
         coro_sched_queue_ms = req_coro_sched_ns.get(rid, 0) / 1e6
+        generate_task_sched_queue_ms = req_generate_task_sched_ns.get(rid, 0) / 1e6
         generate_exec_ms = req_generate_exec_ns.get(rid, 0) / 1e6
         output_handler_sched_queue_ms = req_output_handler_sched_ns.get(rid, 0) / 1e6
         output_handler_exec_ms = req_output_handler_exec_ns.get(rid, 0) / 1e6
@@ -1627,6 +1654,7 @@ def process_logs(input_file, output_file):
                     "request_id": rid,
                     "request_name": req_name_map.get(rid, rid),
                     "coro_sched_queue_ms": round(coro_sched_queue_ms, 3),
+                    "generate_task_sched_queue_ms": round(generate_task_sched_queue_ms, 3),
                     "generate_exec_ms": round(generate_exec_ms, 3),
                     "output_handler_sched_queue_ms": round(output_handler_sched_queue_ms, 3),
                     "output_handler_exec_ms": round(output_handler_exec_ms, 3),
@@ -1684,6 +1712,20 @@ def process_logs(input_file, output_file):
                     dur=q0["end_ns"] - q0["start_ns"],
                     pid=REQUEST_PID,
                     tid=lane_tids["queue"],
+                    args={"request_id": rid, "request_name": req_name_map.get(rid, rid)},
+                    cname="yellow",
+                ))
+
+        for tq in req_generate_task_sched_intervals.get(rid, []):
+            if tq["end_ns"] > tq["start_ns"]:
+                trace_events.append(create_perfetto_event(
+                    name="Generate Task Runnable Queue",
+                    cat="request_generate_task_queue",
+                    ph="X",
+                    ts=tq["start_ns"],
+                    dur=tq["end_ns"] - tq["start_ns"],
+                    pid=REQUEST_PID,
+                    tid=lane_tids["task"],
                     args={"request_id": rid, "request_name": req_name_map.get(rid, rid)},
                     cname="yellow",
                 ))
@@ -1810,6 +1852,7 @@ def process_logs(input_file, output_file):
         all_req_ids,
         key=lambda x: (
             req_coro_sched_ns.get(x, 0)
+            + req_generate_task_sched_ns.get(x, 0)
             + req_generate_exec_ns.get(x, 0)
             + req_output_handler_sched_ns.get(x, 0)
             + req_output_handler_exec_ns.get(x, 0)
@@ -1825,6 +1868,7 @@ def process_logs(input_file, output_file):
             f"  - {rid}: "
             f"lifecycle={f'{lifecycle_ms:.3f} ms' if lifecycle_ms is not None else 'N/A'}, "
             f"coro_sched_queue={req_coro_sched_ns.get(rid, 0) / 1e6:.3f} ms, "
+            f"generate_task_queue={req_generate_task_sched_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"generate_exec={req_generate_exec_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"output_handler_sched_queue={req_output_handler_sched_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"output_handler_exec={req_output_handler_exec_ns.get(rid, 0) / 1e6:.3f} ms, "
@@ -1846,6 +1890,7 @@ def process_logs(input_file, output_file):
             "request_queue",
             "request_dispatch",
             "request_coro_sched_queue",
+            "request_generate_task_queue",
             "request_output_handler_sched_queue",
             "request_generate_exec",
             "request_output_handler_exec",

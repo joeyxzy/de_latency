@@ -263,12 +263,12 @@ def _extract_task_from_callback(callback):
     return None
 
 
-def _register_current_task(request_id, request_name):
+def _register_current_task(request_id, request_name, task_kind="request"):
     return _register_task_context(
         asyncio.current_task(),
         request_id=request_id,
         request_name=request_name,
-        task_kind="request",
+        task_kind=task_kind,
     )
 
 
@@ -323,8 +323,13 @@ def _resolve_schedule_context(task_obj, context_obj):
 
 
 def _extract_req_ids_from_engine_core_outputs(engine_core_outputs):
-    if not engine_core_outputs:
+    if engine_core_outputs is None:
         return []
+    try:
+        if len(engine_core_outputs) == 0:
+            return []
+    except TypeError:
+        pass
     req_ids = []
     seen = set()
     for output in engine_core_outputs:
@@ -456,7 +461,8 @@ def _make_scheduled_callback(original_callback, ready_ts_ns, task_id, request_id
         finally:
             end_ts_ns = time.time_ns()
             if ctx_info and end_ts_ns > run_ts_ns:
-                if ctx_info.get("task_kind") != "output_handler":
+                task_kind = ctx_info.get("task_kind")
+                if task_kind not in ("output_handler", "generate_task"):
                     emit_coroutine_exec_slice(
                         start_ns=run_ts_ns,
                         end_ns=end_ts_ns,
@@ -846,6 +852,11 @@ def patch_vllm():
         start_t = time.monotonic()
         ts_ns = time.time_ns()
         coroutine_timers[coro_id] = (request_id, start_t)
+        _register_current_task(
+            request_id=request_id,
+            request_name=request_name,
+            task_kind="generate_task",
+        )
         emit_stage_duration(
             stage="async_llm.generate_wrapper_setup",
             start_ns=wrapper_start_ns,
