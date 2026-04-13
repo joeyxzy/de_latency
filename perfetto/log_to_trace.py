@@ -42,16 +42,23 @@ def create_flow_event(ph, ts, pid, tid, corr_id):
 
 
 def build_request_lane_tids(req_index):
-    base = req_index * 10
+    # Keep queue/exec producers on dedicated lanes to avoid Perfetto hiding
+    # overlapping slices on the same request track.
+    base = req_index * 20
     return {
         "label": base + 1,
         "lifecycle": base + 2,
-        "queue": base + 3,
-        "exec": base + 4,
-        "dispatch": base + 5,
-        "os": base + 6,
-        "stage": base + 7,
-        "task": base + 8,
+        "vllm_queue": base + 3,
+        "coro_queue": base + 4,
+        "output_socket_queue": base + 5,
+        "output_queue": base + 6,
+        "dispatch": base + 7,
+        "generate_exec": base + 8,
+        "output_socket_exec": base + 9,
+        "output_exec": base + 10,
+        "os": base + 11,
+        "stage": base + 12,
+        "task": base + 13,
     }
 
 
@@ -75,11 +82,14 @@ def infer_trace_origin_ns(
     scheduler_events,
     coroutine_events,
     coroutine_exec_events,
+    output_socket_sched_events,
+    output_socket_exec_events,
     output_handler_sched_events,
     output_handler_exec_events,
     req_stage_events,
     enginecore_loop_events,
     execute_model_span,
+    cupti_events,
 ):
     """
     推断 wall 时间轴的最小 ns 作为 trace 原点。
@@ -115,6 +125,18 @@ def infer_trace_origin_ns(
         _update(p.get("start_ns"))
         _update(p.get("end_ns"))
 
+    for ev in output_socket_sched_events:
+        p = ev.get("payload", {})
+        _update(p.get("timestamp_ns", ev.get("ts")))
+        _update(p.get("ready_ts_ns"))
+        _update(p.get("run_ts_ns"))
+
+    for ev in output_socket_exec_events:
+        p = ev.get("payload", {})
+        _update(p.get("timestamp_ns", ev.get("ts")))
+        _update(p.get("start_ns"))
+        _update(p.get("end_ns"))
+
     for ev in output_handler_sched_events:
         p = ev.get("payload", {})
         _update(p.get("timestamp_ns", ev.get("ts")))
@@ -138,6 +160,13 @@ def infer_trace_origin_ns(
         _update(p.get("timestamp_ns", ev.get("ts")))
         _update(p.get("start_ns"))
         _update(p.get("end_ns"))
+
+    # CUPTI 当前日志里的 start_ns/end_ns 也是 wall-clock 对齐的 epoch ns。
+    # 如果不纳入 trace origin 推断，trace 一开头的 CUDA init/runtime/kernel
+    # 会被整体平移到负时间戳，导入 Perfetto 时被 trace_sorter 丢弃。
+    for ev in cupti_events:
+        _update(ev.get("start_ns"))
+        _update(ev.get("end_ns"))
 
     # NOTE:
     # execute_model_span 当前来自 worker 侧 monotonic 时钟，
@@ -415,6 +444,399 @@ def median_int(values):
         return vals[mid]
     return (vals[mid - 1] + vals[mid]) // 2
 
+
+def clip_interval(start_ns, end_ns, window_start_ns=None, window_end_ns=None):
+    start = to_ns(start_ns)
+    end = to_ns(end_ns)
+    if start is None or end is None or end <= start:
+        return None
+    if window_start_ns is not None:
+        start = max(start, window_start_ns)
+    if window_end_ns is not None:
+        end = min(end, window_end_ns)
+    if end <= start:
+        return None
+    return start, end
+
+
+def merge_intervals(intervals):
+    merged = []
+    for item in sorted(intervals, key=lambda x: (x[0], x[1])):
+        start, end = item
+        if end <= start:
+            continue
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return [(start, end) for start, end in merged]
+
+
+def sum_interval_pairs(intervals):
+    return sum(max(0, end - start) for start, end in intervals)
+
+
+def uncovered_interval_ns(window_start_ns, window_end_ns, covered_intervals):
+    clipped = []
+    for start_ns, end_ns in covered_intervals:
+        span = clip_interval(start_ns, end_ns, window_start_ns, window_end_ns)
+        if span:
+            clipped.append(span)
+    total_window = max(0, int(window_end_ns) - int(window_start_ns))
+    return max(0, total_window - sum_interval_pairs(merge_intervals(clipped)))
+
+
+def sum_clipped_interval_items(intervals, window_start_ns=None, window_end_ns=None):
+    total_ns = 0
+    clipped = []
+    for item in intervals:
+        span = clip_interval(item.get("start_ns"), item.get("end_ns"), window_start_ns, window_end_ns)
+        if not span:
+            continue
+        total_ns += span[1] - span[0]
+        clipped.append(span)
+    return total_ns, clipped
+
+
+def sum_intersections(intervals_a, intervals_b):
+    total_ns = 0
+    intersections = []
+    for item_a in intervals_a:
+        start_a = to_ns(item_a.get("start_ns"))
+        end_a = to_ns(item_a.get("end_ns"))
+        if start_a is None or end_a is None or end_a <= start_a:
+            continue
+        for item_b in intervals_b:
+            start_b = to_ns(item_b.get("start_ns"))
+            end_b = to_ns(item_b.get("end_ns"))
+            if start_b is None or end_b is None or end_b <= start_b:
+                continue
+            start = max(start_a, start_b)
+            end = min(end_a, end_b)
+            if end > start:
+                total_ns += end - start
+                intersections.append((start, end))
+    return total_ns, intersections
+
+
+def ns_to_ms(value_ns):
+    if value_ns is None:
+        return None
+    return round(value_ns / 1e6, 6)
+
+
+def normalize_component_map_ms(component_map_ns):
+    return {key: ns_to_ms(val) for key, val in component_map_ns.items()}
+
+
+def to_plain_data(value):
+    if isinstance(value, defaultdict):
+        value = dict(value)
+    if isinstance(value, dict):
+        return {str(k): to_plain_data(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [to_plain_data(v) for v in value]
+    if isinstance(value, tuple):
+        return [to_plain_data(v) for v in value]
+    return value
+
+
+def derive_sidecar_path(output_file, suffix):
+    root, ext = os.path.splitext(output_file)
+    if ext == ".gz":
+        root, _ = os.path.splitext(root)
+    return f"{root}{suffix}"
+
+
+def _svg_escape(text):
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def render_compute_breakdown_svg(svg_path, ttft_components_ms, tpot_components_ms, meta):
+    ttft_order = [
+        ("preprocess", "#4E79A7", "Preprocess"),
+        ("enginecore_queue", "#F28E2B", "EngineCore Queue"),
+        ("vllm_queue", "#E15759", "vLLM Queue"),
+        ("prefill_exec", "#76B7B2", "Prefill Exec"),
+        ("postprocess_transport", "#59A14F", "Postprocess / Transport"),
+        ("other_gap", "#BAB0AC", "Other Gap"),
+    ]
+    tpot_order = [
+        ("preempt_queue", "#D37295", "Preempt Queue"),
+        ("decode_normal_queue_gap", "#F28E2B", "Decode Normal Queue Gap"),
+        ("post_ttft_prefill_queue", "#E15759", "Post-TTFT Prefill Queue"),
+        ("worker_preprocess", "#59A14F", "Worker Preprocess"),
+        ("model_forward", "#4E79A7", "Model Forward"),
+        ("postprocess", "#9C755F", "Postprocess"),
+        ("sampling", "#B07AA1", "Sampling"),
+        ("bookkeeping_sync", "#76B7B2", "Bookkeeping / Sync"),
+        ("other_exec", "#EDC948", "Other Exec"),
+        ("unknown_gap", "#BAB0AC", "Unknown Gap"),
+    ]
+
+    width = 1280
+    height = 760
+    chart_x = 260
+    chart_w = 900
+    bar_h = 42
+    row_gap = 94
+    top = 120
+    legend_top = 360
+    legend_row_h = 28
+    legend_col_gap = 300
+
+    ttft_total = sum(max(0.0, float(ttft_components_ms.get(key, 0.0) or 0.0)) for key, _, _ in ttft_order)
+    tpot_total = sum(max(0.0, float(tpot_components_ms.get(key, 0.0) or 0.0)) for key, _, _ in tpot_order)
+    max_total = max(ttft_total, tpot_total, 1.0)
+
+    svg_lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#FAF7F2"/>',
+        '<text x="60" y="62" font-size="30" font-family="Helvetica, Arial, sans-serif" font-weight="700" fill="#1F2937">Compute-Side Breakdown</text>',
+        f'<text x="60" y="92" font-size="16" font-family="Helvetica, Arial, sans-serif" fill="#4B5563">TTFT and TPOT are split from the compute path only. TPOT uses decode dispatch count as the denominator ({_svg_escape(meta.get("tpot_denominator_label", "decode dispatch count"))}).</text>',
+    ]
+
+    def _draw_row(y, title, total_ms, components, order, subtitle):
+        lines = [
+            f'<text x="60" y="{y + 14}" font-size="22" font-family="Helvetica, Arial, sans-serif" font-weight="700" fill="#111827">{_svg_escape(title)}</text>',
+            f'<text x="60" y="{y + 42}" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#6B7280">{_svg_escape(subtitle)}</text>',
+            f'<rect x="{chart_x}" y="{y}" width="{chart_w}" height="{bar_h}" rx="10" fill="#E5E7EB"/>',
+        ]
+        cursor_x = chart_x
+        for key, color, _label in order:
+            value = max(0.0, float(components.get(key, 0.0) or 0.0))
+            if total_ms <= 0 or value <= 0:
+                continue
+            seg_w = chart_w * (value / max_total)
+            seg_w = max(seg_w, 1.0)
+            lines.append(
+                f'<rect x="{cursor_x:.2f}" y="{y}" width="{seg_w:.2f}" height="{bar_h}" rx="10" fill="{color}"/>'
+            )
+            cursor_x += seg_w
+        lines.append(
+            f'<text x="{chart_x + chart_w + 18}" y="{y + 28}" font-size="18" font-family="Helvetica, Arial, sans-serif" font-weight="700" fill="#111827">{total_ms:.3f} ms</text>'
+        )
+        return lines
+
+    svg_lines.extend(_draw_row(
+        top,
+        "TTFT Avg (compute-side)",
+        ttft_total,
+        ttft_components_ms,
+        ttft_order,
+        meta.get("ttft_subtitle", "Average across requests with a closed prefill window."),
+    ))
+    svg_lines.extend(_draw_row(
+        top + row_gap,
+        "TPOT Avg (compute-side, ms/token)",
+        tpot_total,
+        tpot_components_ms,
+        tpot_order,
+        meta.get("tpot_subtitle", "Token-weighted average using decode dispatch count."),
+    ))
+
+    legend_items = []
+    for key, color, label in ttft_order + [item for item in tpot_order if item[0] not in {key for key, _, _ in ttft_order}]:
+        legend_items.append((color, label))
+
+    legend_x = 60
+    legend_y = legend_top
+    for idx, (color, label) in enumerate(legend_items):
+        col = idx // 6
+        row = idx % 6
+        x = legend_x + col * legend_col_gap
+        y = legend_y + row * legend_row_h
+        svg_lines.append(f'<rect x="{x}" y="{y - 12}" width="16" height="16" rx="3" fill="{color}"/>')
+        svg_lines.append(
+            f'<text x="{x + 26}" y="{y + 1}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#374151">{_svg_escape(label)}</text>'
+        )
+
+    footer_y = height - 52
+    svg_lines.append(
+        f'<text x="60" y="{footer_y}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#6B7280">Requests used: TTFT={meta.get("ttft_req_count", 0)}, TPOT={meta.get("tpot_req_count", 0)}; total decode steps={meta.get("tpot_total_decode_steps", 0)}.</text>'
+    )
+    svg_lines.append("</svg>")
+
+    with open(svg_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(svg_lines))
+
+
+def sanitize_filename(name):
+    safe = []
+    for ch in str(name):
+        if ch.isalnum() or ch in ("-", "_", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    result = "".join(safe).strip("._")
+    return result or "request"
+
+
+def _component_rows_svg(x, y, width, rows, total_ms):
+    row_h = 26
+    lines = []
+    for idx, row in enumerate(rows):
+        label = row["label"]
+        value_ms = float(row["value_ms"])
+        color = row["color"]
+        pct = (value_ms / total_ms * 100.0) if total_ms > 0 else 0.0
+        ry = y + idx * row_h
+        lines.append(f'<rect x="{x}" y="{ry + 6}" width="{width}" height="10" rx="5" fill="#E5E7EB"/>')
+        if value_ms > 0 and total_ms > 0:
+            bar_w = max(10.0, width * (value_ms / total_ms))
+            bar_w = min(bar_w, width)
+            lines.append(f'<rect x="{x}" y="{ry + 6}" width="{bar_w:.2f}" height="10" rx="5" fill="{color}"/>')
+        lines.append(f'<rect x="{x - 18}" y="{ry + 4}" width="10" height="10" rx="2" fill="{color}"/>')
+        lines.append(
+            f'<text x="{x + width + 12}" y="{ry + 15}" font-size="13" font-family="Helvetica, Arial, sans-serif" fill="#111827">{_svg_escape(label)}: {value_ms:.3f} ms ({pct:.1f}%)</text>'
+        )
+    return lines, y + len(rows) * row_h
+
+
+def render_request_breakdown_svg(svg_path, rid, request_name, ttft_entry, tpot_entry):
+    ttft_rows = []
+    if ttft_entry:
+        ttft_colors = {
+            "preprocess": "#4E79A7",
+            "enginecore_queue": "#F28E2B",
+            "vllm_queue": "#E15759",
+            "prefill_exec": "#76B7B2",
+            "postprocess_transport": "#59A14F",
+            "other_gap": "#BAB0AC",
+        }
+        ttft_labels = {
+            "preprocess": "Preprocess",
+            "enginecore_queue": "EngineCore Queue",
+            "vllm_queue": "vLLM Queue",
+            "prefill_exec": "Prefill Exec",
+            "postprocess_transport": "Postprocess / Transport",
+            "other_gap": "Other Gap",
+        }
+        for key in ["preprocess", "enginecore_queue", "vllm_queue", "prefill_exec", "postprocess_transport", "other_gap"]:
+            ttft_rows.append({
+                "label": ttft_labels[key],
+                "value_ms": ttft_entry["components_ms"].get(key, 0.0),
+                "color": ttft_colors[key],
+            })
+
+    tpot_rows = []
+    if tpot_entry:
+        tpot_colors = {
+            "vllm_scheduling_wait": "#E15759",
+            "worker_preprocess": "#59A14F",
+            "model_forward": "#4E79A7",
+            "postprocess": "#9C755F",
+            "sampling": "#B07AA1",
+            "bookkeeping_sync": "#76B7B2",
+            "other_exec": "#EDC948",
+            "tail_transport": "#86BCB6",
+            "other_gap": "#BAB0AC",
+        }
+        tpot_labels = {
+            "vllm_scheduling_wait": "vLLM Scheduling Wait",
+            "worker_preprocess": "Worker Preprocess",
+            "model_forward": "Model Forward",
+            "postprocess": "Postprocess",
+            "sampling": "Sampling",
+            "bookkeeping_sync": "Bookkeeping / Sync",
+            "other_exec": "Other Exec",
+            "tail_transport": "Tail Transport",
+            "other_gap": "Other Gap",
+        }
+        for key in ["vllm_scheduling_wait", "worker_preprocess", "model_forward", "postprocess", "sampling", "bookkeeping_sync", "other_exec", "tail_transport", "other_gap"]:
+            tpot_rows.append({
+                "label": tpot_labels[key],
+                "value_ms": tpot_entry["components_ms_per_token"].get(key, 0.0),
+                "color": tpot_colors[key],
+            })
+
+    width = 1500
+    base_height = 210
+    ttft_extra = len(ttft_rows) * 26 + 80 if ttft_rows else 0
+    tpot_extra = len(tpot_rows) * 26 + 100 if tpot_rows else 0
+    height = base_height + ttft_extra + tpot_extra
+    chart_x = 110
+    chart_w = 520
+    cursor_y = 90
+
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#FAF7F2"/>',
+        f'<text x="48" y="50" font-size="28" font-family="Helvetica, Arial, sans-serif" font-weight="700" fill="#111827">{_svg_escape(request_name or rid)}</text>',
+        f'<text x="48" y="76" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#4B5563">request_id={_svg_escape(rid)}</text>',
+    ]
+
+    if ttft_entry:
+        lines.append(f'<text x="48" y="{cursor_y}" font-size="22" font-family="Helvetica, Arial, sans-serif" font-weight="700" fill="#111827">TTFT</text>')
+        lines.append(
+            f'<text x="48" y="{cursor_y + 24}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#4B5563">total={ttft_entry["window_ms"]:.3f} ms, start_rule={_svg_escape(ttft_entry.get("ttft_start_rule"))}, end_rule={_svg_escape(ttft_entry.get("ttft_end_rule"))}</text>'
+        )
+        lines.append(
+            f'<text x="48" y="{cursor_y + 46}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#4B5563">prefill_dispatch_count={ttft_entry.get("prefill_dispatch_count", 0)}, phase_reentry_after_decode={_svg_escape(ttft_entry.get("phase_reentry_after_decode", False))}</text>'
+        )
+        row_lines, end_y = _component_rows_svg(chart_x, cursor_y + 62, chart_w, ttft_rows, max(ttft_entry["window_ms"], 1e-9))
+        lines.extend(row_lines)
+        breakdown = ttft_entry.get("vllm_queue_breakdown_ms", {})
+        lines.append(
+            f'<text x="{chart_x}" y="{end_y + 18}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#374151">vLLM queue breakdown: before_first_prefill={float(breakdown.get("before_first_prefill", 0.0)):.3f} ms, between_prefills={float(breakdown.get("between_prefills", 0.0)):.3f} ms</text>'
+        )
+        cursor_y = end_y + 56
+
+    if tpot_entry:
+        lines.append(f'<text x="48" y="{cursor_y}" font-size="22" font-family="Helvetica, Arial, sans-serif" font-weight="700" fill="#111827">TPOT</text>')
+        lines.append(
+            f'<text x="48" y="{cursor_y + 24}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#4B5563">avg={tpot_entry["avg_ms_per_token"]:.3f} ms/token, decode_dispatch_count={tpot_entry.get("decode_dispatch_count", 0)}, start_rule={_svg_escape(tpot_entry.get("tpot_start_rule"))}, end_rule={_svg_escape(tpot_entry.get("tpot_end_rule"))}</text>'
+        )
+        lines.append(
+            f'<text x="48" y="{cursor_y + 46}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#4B5563">scheduling_wait_total={float(tpot_entry.get("scheduling_wait_total_ms", 0.0)):.3f} ms, exec_total={float(tpot_entry.get("exec_total_ms", 0.0)):.3f} ms, tail_transport={float(tpot_entry.get("tail_transport_ms", 0.0)):.3f} ms</text>'
+        )
+        row_lines, end_y = _component_rows_svg(chart_x, cursor_y + 62, chart_w, tpot_rows, max(tpot_entry["avg_ms_per_token"], 1e-9))
+        lines.extend(row_lines)
+        sched = tpot_entry.get("scheduling_wait_breakdown_ms", {})
+        sched_ratio = tpot_entry.get("scheduling_wait_breakdown_ratio", {})
+        lines.append(
+            f'<text x="{chart_x}" y="{end_y + 18}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#374151">scheduling wait breakdown: normal_gap={float(sched.get("normal_gap", 0.0)):.3f} ms ({float(sched_ratio.get("normal_gap_pct", 0.0)):.1f}%), preempt_gap={float(sched.get("preempt_gap", 0.0)):.3f} ms ({float(sched_ratio.get("preempt_gap_pct", 0.0)):.1f}%)</text>'
+        )
+        cursor_y = end_y + 40
+
+    if not ttft_entry and not tpot_entry:
+        lines.append('<text x="48" y="118" font-size="18" font-family="Helvetica, Arial, sans-serif" fill="#6B7280">No compute-side TTFT/TPOT breakdown available for this request.</text>')
+
+    lines.append("</svg>")
+    with open(svg_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def render_request_breakdown_index(index_path, request_rows):
+    lines = [
+        "<!doctype html>",
+        "<html><head><meta charset='utf-8'><title>Per-Request Compute Breakdown</title>",
+        "<style>body{font-family:Helvetica,Arial,sans-serif;background:#faf7f2;color:#111827;margin:24px;}table{border-collapse:collapse;width:100%;background:#fff;}th,td{padding:10px 12px;border-bottom:1px solid #e5e7eb;text-align:left;}th{background:#f3f4f6;}a{color:#1d4ed8;text-decoration:none;}a:hover{text-decoration:underline;}</style>",
+        "</head><body>",
+        "<h1>Per-Request Compute Breakdown</h1>",
+        "<table>",
+        "<thead><tr><th>Request</th><th>TTFT (ms)</th><th>TPOT (ms/token)</th><th>Prefill Re-entry</th><th>Chart</th></tr></thead><tbody>",
+    ]
+    for row in request_rows:
+        lines.append(
+            "<tr>"
+            f"<td>{_svg_escape(row['request_name'])}</td>"
+            f"<td>{row['ttft_ms']}</td>"
+            f"<td>{row['tpot_ms']}</td>"
+            f"<td>{_svg_escape(row['reentry'])}</td>"
+            f"<td><a href='{_svg_escape(row['file_name'])}'>open</a></td>"
+            "</tr>"
+        )
+    lines.extend(["</tbody></table>", "</body></html>"])
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
 #DEBUG: 调试OS调度层的时间对齐问题（将ebpf和execute_model_span的区间在perfetto上画出来）
 def export_alignment_debug_trace(worker_spans, ebpf_events, output_filename="debug_align.json"):
     """
@@ -500,10 +922,13 @@ def process_logs(input_file, output_file):
     req_metric_events = []
     coroutine_events = []
     coroutine_exec_events = []
+    output_socket_sched_events = []
+    output_socket_exec_events = []
     output_handler_sched_events = []
     output_handler_exec_events = []
     req_stage_events = []
     enginecore_loop_events = []
+    thread_role_events = []
     execute_model_span = []
     ebpf_sched_latency_events = []
     req_name_map = {}
@@ -572,6 +997,18 @@ def process_logs(input_file, output_file):
                     "payload": payload,
                     "ts": payload.get('timestamp_ns', payload.get('end_ns', ts)),
                 })
+            elif etype == "output_socket_sched_latency":
+                output_socket_sched_events.append({
+                    "type": etype,
+                    "payload": payload,
+                    "ts": payload.get('timestamp_ns', payload.get('run_ts_ns', ts)),
+                })
+            elif etype == "output_socket_exec_slice":
+                output_socket_exec_events.append({
+                    "type": etype,
+                    "payload": payload,
+                    "ts": payload.get('timestamp_ns', payload.get('end_ns', ts)),
+                })
             elif etype == "output_handler_sched_latency":
                 output_handler_sched_events.append({
                     "type": etype,
@@ -595,6 +1032,12 @@ def process_logs(input_file, output_file):
                     "type": etype,
                     "payload": payload,
                     "ts": payload.get('timestamp_ns', payload.get('end_ns', ts)),
+                })
+            elif etype == "thread_role":
+                thread_role_events.append({
+                    "type": etype,
+                    "payload": payload,
+                    "ts": payload.get("timestamp_ns", ts),
                 })
             elif etype=="worker_model_execute_span":
                 execute_model_span.append(payload)
@@ -620,20 +1063,58 @@ def process_logs(input_file, output_file):
         scheduler_events=scheduler_events,
         coroutine_events=coroutine_events,
         coroutine_exec_events=coroutine_exec_events,
+        output_socket_sched_events=output_socket_sched_events,
+        output_socket_exec_events=output_socket_exec_events,
         output_handler_sched_events=output_handler_sched_events,
         output_handler_exec_events=output_handler_exec_events,
         req_stage_events=req_stage_events,
         enginecore_loop_events=enginecore_loop_events,
         execute_model_span=execute_model_span,
+        cupti_events=cupti_events,
     )
     if TRACE_TS_ORIGIN_NS:
         print(f"Trace time origin (wall ns): {TRACE_TS_ORIGIN_NS}")
+
+    thread_roles_by_tid = {}
+    thread_mono_to_wall_offsets = defaultdict(list)
+    eventloop_thread_tids = set()
+    for item in thread_role_events:
+        payload = item.get("payload", {})
+        tid = to_int(payload.get("tid"))
+        pid = to_int(payload.get("pid"))
+        role = payload.get("role")
+        wall_ts_ns = to_ns(payload.get("timestamp_ns", item.get("ts")))
+        mono_ts_ns = to_ns(payload.get("mono_timestamp_ns"))
+        if tid is None or not role:
+            continue
+
+        info = thread_roles_by_tid.setdefault(
+            tid,
+            {
+                "pid": pid,
+                "roles": set(),
+            },
+        )
+        if info.get("pid") is None and pid is not None:
+            info["pid"] = pid
+        info["roles"].add(role)
+        if role == "asyncio_eventloop":
+            eventloop_thread_tids.add(tid)
+        if wall_ts_ns is not None and mono_ts_ns is not None and wall_ts_ns > mono_ts_ns:
+            thread_mono_to_wall_offsets[tid].append(wall_ts_ns - mono_ts_ns)
+
+    thread_mono_to_wall_offset_by_tid = {
+        tid: median_int(offsets)
+        for tid, offsets in thread_mono_to_wall_offsets.items()
+        if offsets
+    }
 
     # --- 2. Worker 状态机 (支持细粒度阶段) ---
     print(f"Processing Worker Events ({len(worker_events)})...")
     
     worker_events.sort(key=lambda x: x['ts'])
     has_precise_phase_spans = any(ev.get('type') == 'gpu_phase_span' for ev in worker_events)
+    req_worker_phase_intervals = defaultdict(lambda: defaultdict(list))
 
     # 状态存储: Key=(pid, tid), Value={
     #   't_pre_start': ..., 
@@ -689,6 +1170,11 @@ def process_logs(input_file, output_file):
                 req_ids = payload.get('req_ids', [])
                 batch_size = payload.get('batch_size')
                 input_type = payload.get('input_type')
+                for rid in normalize_request_ids(req_ids):
+                    req_worker_phase_intervals[rid][phase_name].append({
+                        "start_ns": t_start,
+                        "end_ns": t_end,
+                    })
                 display_name, cat, cname = describe_gpu_phase(phase_name)
                 args = {
                     "phase": phase_name,
@@ -733,6 +1219,11 @@ def process_logs(input_file, output_file):
             if state and 't_pre_start' in state:
                 t1 = state['t_pre_start']
                 dur = max(0, ts - t1 - 1000)  # 留白
+                for rid in normalize_request_ids(state.get('req_ids', [])):
+                    req_worker_phase_intervals[rid]["Preprocess"].append({
+                        "start_ns": t1,
+                        "end_ns": t1 + dur,
+                    })
                 trace_events.append(create_perfetto_event(
                     name="Worker Preprocess",
                     cat="python", ph="X", ts=t1, dur=dur,
@@ -750,6 +1241,11 @@ def process_logs(input_file, output_file):
             if state and 't_fwd_start' in state:
                 t2 = state['t_fwd_start']
                 dur = max(0, ts - t2)
+                for rid in normalize_request_ids(state.get('req_ids', [])):
+                    req_worker_phase_intervals[rid]["Forward"].append({
+                        "start_ns": t2,
+                        "end_ns": t2 + dur,
+                    })
                 trace_events.append(create_perfetto_event(
                     name="Model Forward",
                     cat="python", ph="X", ts=t2, dur=dur,
@@ -768,6 +1264,11 @@ def process_logs(input_file, output_file):
             if t_start is not None and t_end is not None:
                 state = worker_states.get(key)
                 req_ids = state['req_ids'] if state else payload.get('req_ids', [])
+                for rid in normalize_request_ids(req_ids):
+                    req_worker_phase_intervals[rid]["Sample"].append({
+                        "start_ns": t_start,
+                        "end_ns": t_end,
+                    })
                 trace_events.append(create_perfetto_event(
                     name="Sampling",
                     cat="python", ph="X", ts=t_start, dur=t_end - t_start,
@@ -785,6 +1286,11 @@ def process_logs(input_file, output_file):
             if t_start is not None and t_end is not None:
                 state = worker_states.get(key)
                 req_ids = state['req_ids'] if state else payload.get('req_ids', [])
+                for rid in normalize_request_ids(req_ids):
+                    req_worker_phase_intervals[rid]["Bookkeep"].append({
+                        "start_ns": t_start,
+                        "end_ns": t_end,
+                    })
                 trace_events.append(create_perfetto_event(
                     name="Bookkeeping/Sync",
                     cat="python", ph="X", ts=t_start, dur=t_end - t_start,
@@ -806,6 +1312,10 @@ def process_logs(input_file, output_file):
     req_generate_task_sched_intervals = defaultdict(list)
     req_generate_exec_ns = defaultdict(int)
     req_generate_exec_intervals = defaultdict(list)
+    req_output_socket_sched_ns = defaultdict(int)
+    req_output_socket_sched_intervals = defaultdict(list)
+    req_output_socket_exec_ns = defaultdict(int)
+    req_output_socket_exec_intervals = defaultdict(list)
     req_output_handler_sched_ns = defaultdict(int)
     req_output_handler_sched_intervals = defaultdict(list)
     req_output_handler_exec_ns = defaultdict(int)
@@ -914,6 +1424,7 @@ def process_logs(input_file, output_file):
                 "start_ns": start_ns,
                 "end_ns": end_ns,
                 "task_name": payload.get("task_name"),
+                "task_kind": payload.get("task_kind"),
             })
 
     if req_generate_exec_ns:
@@ -923,6 +1434,64 @@ def process_logs(input_file, output_file):
             print(f"  - Request {rid} ({label}): {lat_ns / 1e6:.3f} ms (Generate Coroutine Exec)")
     elif coroutine_exec_events:
         print("  generate 协程执行事件存在，但未找到可归因的 request_id")
+
+    if output_socket_sched_events:
+        print(f"Processing Output Socket Scheduler Events ({len(output_socket_sched_events)})...")
+    for ev in output_socket_sched_events:
+        payload = ev.get("payload", {})
+        ready_ts_ns = to_int(payload.get("ready_ts_ns"))
+        run_ts_ns = to_int(payload.get("run_ts_ns"))
+        queue_ns = to_int(payload.get("queue_ns"))
+        req_ids = normalize_request_ids(payload.get("req_ids"))
+        if not req_ids or queue_ns is None or queue_ns < 0:
+            continue
+        for rid in req_ids:
+            req_output_socket_sched_ns[rid] += queue_ns
+            if ready_ts_ns and run_ts_ns and run_ts_ns > ready_ts_ns:
+                req_output_socket_sched_intervals[rid].append({
+                    "start_ns": ready_ts_ns,
+                    "end_ns": run_ts_ns,
+                    "shared_req_count": len(req_ids),
+                    "round_seq": payload.get("round_seq"),
+                })
+
+    if req_output_socket_sched_ns:
+        print(f"共统计到 {len(req_output_socket_sched_ns)} 个请求的 output_socket 调度排队时间：")
+        for rid, lat_ns in sorted(req_output_socket_sched_ns.items(), key=lambda x: x[1], reverse=True):
+            label = req_name_map.get(rid, rid)
+            print(f"  - Request {rid} ({label}): {lat_ns / 1e6:.3f} ms (Output Socket Scheduler Queue)")
+    elif output_socket_sched_events:
+        print("  output_socket 调度事件存在，但未找到可归因的 req_ids")
+
+    if output_socket_exec_events:
+        print(f"Processing Output Socket Exec Events ({len(output_socket_exec_events)})...")
+    for ev in output_socket_exec_events:
+        payload = ev.get("payload", {})
+        start_ns = to_int(payload.get("start_ns"))
+        end_ns = to_int(payload.get("end_ns"))
+        dur_ns = to_int(payload.get("duration_ns"))
+        req_ids = normalize_request_ids(payload.get("req_ids"))
+        if dur_ns is None and start_ns is not None and end_ns is not None:
+            dur_ns = end_ns - start_ns
+        if not req_ids or dur_ns is None or dur_ns < 0:
+            continue
+        for rid in req_ids:
+            req_output_socket_exec_ns[rid] += dur_ns
+            if start_ns and end_ns and end_ns > start_ns:
+                req_output_socket_exec_intervals[rid].append({
+                    "start_ns": start_ns,
+                    "end_ns": end_ns,
+                    "shared_req_count": len(req_ids),
+                    "round_seq": payload.get("round_seq"),
+                })
+
+    if req_output_socket_exec_ns:
+        print(f"共统计到 {len(req_output_socket_exec_ns)} 个请求的 output_socket 执行时间：")
+        for rid, lat_ns in sorted(req_output_socket_exec_ns.items(), key=lambda x: x[1], reverse=True):
+            label = req_name_map.get(rid, rid)
+            print(f"  - Request {rid} ({label}): {lat_ns / 1e6:.3f} ms (Output Socket Exec)")
+    elif output_socket_exec_events:
+        print("  output_socket 执行事件存在，但未找到可归因的 req_ids")
 
     if output_handler_sched_events:
         print(f"Processing Output Handler Scheduler Events ({len(output_handler_sched_events)})...")
@@ -985,6 +1554,7 @@ def process_logs(input_file, output_file):
     # 为 request dispatch phase 做回退兜底：
     # 从 req_metrics_events 中按时间提取每个请求的 "scheduled/dequeue" phase 顺序。
     phase_hint_queue_by_req = defaultdict(deque)
+    req_preempt_ts_by_req = defaultdict(list)
     req_metric_events_sorted = sorted(
         req_metric_events,
         key=lambda x: to_ns(x.get("batch_ts_ns")) or 0,
@@ -998,6 +1568,9 @@ def process_logs(input_file, output_file):
                 continue
             for ev in update.get("events", []):
                 ev_type = normalize_req_event_type(ev.get("type"))
+                ev_ts_ns = to_ns(ev.get("ts") or ev.get("timestamp_ns"))
+                if ev_type == "preempt" and ev_ts_ns is not None:
+                    req_preempt_ts_by_req[rid].append(ev_ts_ns)
                 if ev_type != "dequeue":
                     continue
                 phase = ev.get("phase")
@@ -1465,17 +2038,69 @@ def process_logs(input_file, output_file):
         tid = payload.get('tid')
         start = payload.get('start_ns')
         end = payload.get('end_ns')
+        reason = payload.get('reason')
         
         if tid and start and end:
             ebpf_map[tid].append({
                 'start': start,
                 'end': end,
-                'dur': end - start
+                'dur': end - start,
+                'reason': reason,
             })
 
     # 对每个 TID 的事件按开始时间排序
     for tid in ebpf_map:
         ebpf_map[tid].sort(key=lambda x: x['start'])
+
+    EVENTLOOP_OS_PID = 12000
+    if eventloop_thread_tids:
+        trace_events.append({
+            "name": "process_name",
+            "ph": "M",
+            "pid": EVENTLOOP_OS_PID,
+            "args": {"name": "EventLoop OS Scheduling"},
+        })
+    for tid in sorted(eventloop_thread_tids):
+        os_events = ebpf_map.get(tid, [])
+        if not os_events:
+            continue
+        mono_to_wall_offset = thread_mono_to_wall_offset_by_tid.get(tid, global_mono_to_wall_offset)
+        if mono_to_wall_offset is None:
+            print(f"  [warn] eventloop tid={tid} 缺少 mono->wall offset，跳过 OS 轨道绘制")
+            continue
+
+        role_info = thread_roles_by_tid.get(tid, {})
+        source_pid = role_info.get("pid")
+        role_names = sorted(role_info.get("roles", []))
+        track_name = f"eventloop tid={tid}"
+        trace_events.append({
+            "name": "thread_name",
+            "ph": "M",
+            "pid": EVENTLOOP_OS_PID,
+            "tid": tid,
+            "args": {"name": track_name},
+        })
+        for os_ev in os_events:
+            start_wall = os_ev["start"] + mono_to_wall_offset
+            end_wall = os_ev["end"] + mono_to_wall_offset
+            if end_wall <= start_wall:
+                continue
+            trace_events.append(create_perfetto_event(
+                name="OS Runnable Wait",
+                cat="eventloop_os",
+                ph="X",
+                ts=start_wall,
+                dur=end_wall - start_wall,
+                pid=EVENTLOOP_OS_PID,
+                tid=tid,
+                args={
+                    "source_tid": tid,
+                    "source_pid": source_pid,
+                    "reason": os_ev.get("reason"),
+                    "roles": ",".join(role_names),
+                },
+                cname="terrible",
+            ))
 
     # 2. 结果容器：Key=req_id, Value=total_os_delay_ns
     req_latency_map = defaultdict(int)
@@ -1555,6 +2180,8 @@ def process_logs(input_file, output_file):
         | set(req_coro_sched_ns.keys())
         | set(req_generate_task_sched_ns.keys())
         | set(req_generate_exec_ns.keys())
+        | set(req_output_socket_sched_ns.keys())
+        | set(req_output_socket_exec_ns.keys())
         | set(req_output_handler_sched_ns.keys())
         | set(req_output_handler_exec_ns.keys())
         | set(req_vllm_queue_ns.keys())
@@ -1577,6 +2204,474 @@ def process_logs(input_file, output_file):
     if global_mono_to_wall_offset is None and req_os_overlap_intervals:
         print("  [warn] 无法估计 mono->wall 偏移，OS overlap 仅做统计，不绘制到请求生命周期轨道")
 
+    phase_exec_name_map = {
+        "Preprocess": "worker_preprocess",
+        "Forward": "model_forward",
+        "Postprocess": "postprocess",
+        "Sample": "sampling",
+        "Bookkeep": "bookkeeping_sync",
+    }
+    compute_breakdown = {
+        "version": 1,
+        "tpot_denominator": "decode_dispatch_count",
+        "requests": {},
+        "summary": {},
+        "skipped_requests": {
+            "ttft_missing": [],
+            "tpot_missing": [],
+        },
+        "phase_reentry_after_decode_requests": [],
+    }
+    ttft_component_totals_ns = defaultdict(int)
+    ttft_vllm_queue_breakdown_totals_ns = defaultdict(int)
+    ttft_req_count = 0
+    tpot_component_totals_ns = defaultdict(int)
+    tpot_req_count = 0
+    tpot_total_decode_steps = 0
+    tpot_per_req_values_ns = []
+    step_execution_intervals = [
+        {
+            "start_ns": to_ns(item.get("start")),
+            "end_ns": to_ns(item.get("end")),
+        }
+        for item in generated_dispatch_slices
+        if to_ns(item.get("start")) is not None and to_ns(item.get("end")) is not None and to_ns(item.get("end")) > to_ns(item.get("start"))
+    ]
+
+    for rid in sorted(all_req_ids):
+        dispatches = sorted(req_dispatch_intervals_map.get(rid, []), key=lambda x: (x["start_ns"], x["end_ns"]))
+        prefill_dispatches = [d for d in dispatches if d.get("phase") == "prefill"]
+        decode_dispatches = [d for d in dispatches if d.get("phase") == "decode"]
+        first_decode_index = next((idx for idx, d in enumerate(dispatches) if d.get("phase") == "decode"), None)
+        if first_decode_index is None:
+            initial_prefill_dispatches = prefill_dispatches
+            phase_reentry_after_decode = False
+        else:
+            initial_prefill_dispatches = [d for d in dispatches[:first_decode_index] if d.get("phase") == "prefill"]
+            phase_reentry_after_decode = any(d.get("phase") == "prefill" for d in dispatches[first_decode_index + 1:])
+        if phase_reentry_after_decode:
+            compute_breakdown["phase_reentry_after_decode_requests"].append(rid)
+
+        dispatch_phase_by_start = {}
+        for d in dispatches:
+            dispatch_phase_by_start.setdefault(d["start_ns"], d.get("phase", "unknown"))
+
+        queue_intervals = []
+        for q in sorted(queue_intervals_map.get(rid, []), key=lambda x: (x["start_ns"], x["end_ns"])):
+            q_copy = dict(q)
+            q_copy["phase"] = dispatch_phase_by_start.get(q_copy.get("end_ns"))
+            queue_intervals.append(q_copy)
+
+        ttft_entry = None
+        generate_setup_intervals = [
+            s for s in req_stage_intervals.get(rid, [])
+            if s.get("stage") == "async_llm.generate_wrapper_setup"
+        ]
+        generate_setup_start_ns = None
+        if generate_setup_intervals:
+            generate_setup_start_ns = min(to_ns(s.get("start_ns")) for s in generate_setup_intervals if to_ns(s.get("start_ns")) is not None)
+        ttft_start_ns = generate_setup_start_ns or to_ns(req_generate_start_map.get(rid))
+        generate_consume_intervals = sorted(
+            [
+                it for it in req_generate_exec_intervals.get(rid, [])
+                if it.get("task_kind") == "generate_consume"
+            ],
+            key=lambda x: (x["start_ns"], x["end_ns"]),
+        )
+        first_generate_consume_end_ns = None
+        if generate_consume_intervals:
+            first_generate_consume_end_ns = to_ns(generate_consume_intervals[0].get("end_ns"))
+
+        if ttft_start_ns is not None and initial_prefill_dispatches and first_generate_consume_end_ns is not None:
+            ttft_end_ns = first_generate_consume_end_ns
+            if ttft_end_ns > ttft_start_ns:
+                enginecore_queue_intervals = [
+                    s for s in req_stage_intervals.get(rid, [])
+                    if s.get("stage") == "engine_core.input_queue_wait_after_preprocess"
+                ]
+                enginecore_queue_ns, _enginecore_queue_pairs = sum_clipped_interval_items(
+                    enginecore_queue_intervals,
+                    ttft_start_ns,
+                    ttft_end_ns,
+                )
+                enginecore_queue_start_ns = None
+                enginecore_queue_end_ns = None
+                for s in sorted(enginecore_queue_intervals, key=lambda x: (x["start_ns"], x["end_ns"])):
+                    span = clip_interval(s.get("start_ns"), s.get("end_ns"), ttft_start_ns, ttft_end_ns)
+                    if not span:
+                        continue
+                    if enginecore_queue_start_ns is None:
+                        enginecore_queue_start_ns = span[0]
+                    enginecore_queue_end_ns = span[1]
+
+                initial_prefill_dispatches_sorted = sorted(
+                    initial_prefill_dispatches,
+                    key=lambda x: (x["start_ns"], x["end_ns"]),
+                )
+                first_initial_prefill_start_ns = to_ns(initial_prefill_dispatches_sorted[0]["start_ns"])
+                last_initial_prefill_end_ns = max(d["end_ns"] for d in initial_prefill_dispatches_sorted)
+                if first_initial_prefill_start_ns is None or last_initial_prefill_end_ns is None:
+                    compute_breakdown["skipped_requests"]["ttft_missing"].append(rid)
+                else:
+                    preprocess_boundary_ns = enginecore_queue_start_ns
+                    if preprocess_boundary_ns is None:
+                        enqueue_ns = to_ns(req_enqueue_map.get(rid))
+                        candidates = [val for val in [enqueue_ns, first_initial_prefill_start_ns, ttft_end_ns] if val is not None]
+                        preprocess_boundary_ns = min(candidates) if candidates else ttft_start_ns
+                    preprocess_boundary_ns = max(ttft_start_ns, min(preprocess_boundary_ns, ttft_end_ns))
+                    preprocess_ns = max(0, preprocess_boundary_ns - ttft_start_ns)
+
+                    if enginecore_queue_end_ns is None:
+                        enginecore_queue_end_ns = preprocess_boundary_ns
+                    enginecore_queue_end_ns = max(preprocess_boundary_ns, min(enginecore_queue_end_ns, first_initial_prefill_start_ns))
+
+                    vllm_queue_before_first_prefill_ns = max(0, first_initial_prefill_start_ns - enginecore_queue_end_ns)
+                    prefill_schedule_gap_ns = 0
+                    for prev_dispatch, next_dispatch in zip(initial_prefill_dispatches_sorted, initial_prefill_dispatches_sorted[1:]):
+                        prev_end_ns = to_ns(prev_dispatch.get("end_ns"))
+                        next_start_ns = to_ns(next_dispatch.get("start_ns"))
+                        if prev_end_ns is None or next_start_ns is None:
+                            continue
+                        prefill_schedule_gap_ns += max(0, next_start_ns - prev_end_ns)
+                    vllm_queue_ns = vllm_queue_before_first_prefill_ns + prefill_schedule_gap_ns
+
+                    prefill_exec_ns, prefill_exec_pairs = sum_clipped_interval_items(
+                        initial_prefill_dispatches_sorted,
+                        first_initial_prefill_start_ns,
+                        last_initial_prefill_end_ns,
+                    )
+
+                    ttft_total_ns = ttft_end_ns - ttft_start_ns
+                    postprocess_transport_ns = max(0, ttft_end_ns - last_initial_prefill_end_ns)
+                    ttft_other_gap_ns = max(
+                        0,
+                        ttft_total_ns - preprocess_ns - enginecore_queue_ns - vllm_queue_ns - prefill_exec_ns - postprocess_transport_ns,
+                    )
+
+                    prefill_exec_phase_ns = defaultdict(int)
+                    for phase_name, component_key in phase_exec_name_map.items():
+                        total_ns, _ = sum_intersections(
+                            req_worker_phase_intervals.get(rid, {}).get(phase_name, []),
+                            initial_prefill_dispatches_sorted,
+                        )
+                        if total_ns > 0:
+                            prefill_exec_phase_ns[component_key] = total_ns
+                    prefill_exec_phase_ns["other_prefill_exec"] = max(
+                        0,
+                        prefill_exec_ns - sum(prefill_exec_phase_ns.values()),
+                    )
+
+                    ttft_components_ns = {
+                        "preprocess": preprocess_ns,
+                        "enginecore_queue": enginecore_queue_ns,
+                        "vllm_queue": vllm_queue_ns,
+                        "prefill_exec": prefill_exec_ns,
+                        "postprocess_transport": postprocess_transport_ns,
+                        "other_gap": ttft_other_gap_ns,
+                    }
+                    ttft_entry = {
+                        "window_ns": ttft_total_ns,
+                        "window_ms": ns_to_ms(ttft_total_ns),
+                        "start_ns": ttft_start_ns,
+                        "end_ns": ttft_end_ns,
+                        "initial_prefill_end_ns": last_initial_prefill_end_ns,
+                        "initial_prefill_end_ms": ns_to_ms(last_initial_prefill_end_ns),
+                        "ttft_start_rule": "generate_wrapper_setup_start" if generate_setup_start_ns is not None else "coroutine_start",
+                        "prefill_dispatch_count": len(initial_prefill_dispatches_sorted),
+                        "ttft_end_rule": "first_generate_consume_end",
+                        "phase_reentry_after_decode": phase_reentry_after_decode,
+                        "components_ns": ttft_components_ns,
+                        "components_ms": normalize_component_map_ms(ttft_components_ns),
+                        "vllm_queue_breakdown_ns": {
+                            "before_first_prefill": vllm_queue_before_first_prefill_ns,
+                            "between_prefills": prefill_schedule_gap_ns,
+                        },
+                        "vllm_queue_breakdown_ms": {
+                            "before_first_prefill": ns_to_ms(vllm_queue_before_first_prefill_ns),
+                            "between_prefills": ns_to_ms(prefill_schedule_gap_ns),
+                        },
+                        "prefill_exec_phase_ns": dict(prefill_exec_phase_ns),
+                        "prefill_exec_phase_ms": normalize_component_map_ms(prefill_exec_phase_ns),
+                    }
+                    ttft_req_count += 1
+                    for key, val in ttft_components_ns.items():
+                        ttft_component_totals_ns[key] += val
+                    ttft_vllm_queue_breakdown_totals_ns["before_first_prefill"] += vllm_queue_before_first_prefill_ns
+                    ttft_vllm_queue_breakdown_totals_ns["between_prefills"] += prefill_schedule_gap_ns
+            else:
+                compute_breakdown["skipped_requests"]["ttft_missing"].append(rid)
+        else:
+            compute_breakdown["skipped_requests"]["ttft_missing"].append(rid)
+
+        tpot_entry = None
+        if ttft_entry and decode_dispatches:
+            tpot_window_start_ns = to_ns(ttft_entry.get("initial_prefill_end_ns"))
+            last_generate_consume_end_ns = None
+            if generate_consume_intervals:
+                last_generate_consume_end_ns = max(
+                    to_ns(it.get("end_ns"))
+                    for it in generate_consume_intervals
+                    if to_ns(it.get("end_ns")) is not None
+                )
+
+            post_start_dispatches = [d for d in dispatches if d["end_ns"] > tpot_window_start_ns]
+            post_start_prefill_dispatches = [d for d in post_start_dispatches if d.get("phase") == "prefill"]
+            post_start_decode_dispatches = [d for d in post_start_dispatches if d.get("phase") == "decode"]
+            decode_steps = len(post_start_decode_dispatches)
+            last_decode_end_ns = max((d["end_ns"] for d in post_start_decode_dispatches), default=None)
+            tpot_window_end_ns = last_generate_consume_end_ns
+            if (
+                tpot_window_start_ns is not None
+                and decode_steps > 0
+                and last_decode_end_ns is not None
+                and tpot_window_end_ns is not None
+                and last_decode_end_ns > tpot_window_start_ns
+                and tpot_window_end_ns >= last_decode_end_ns
+            ):
+                tpot_exec_end_ns = last_decode_end_ns
+                tpot_exec_dispatches = []
+                for d in post_start_dispatches:
+                    span = clip_interval(d.get("start_ns"), d.get("end_ns"), tpot_window_start_ns, tpot_exec_end_ns)
+                    if not span:
+                        continue
+                    d_copy = dict(d)
+                    d_copy["start_ns"], d_copy["end_ns"] = span
+                    tpot_exec_dispatches.append(d_copy)
+                tpot_exec_ns, tpot_exec_pairs = sum_clipped_interval_items(
+                    tpot_exec_dispatches,
+                    tpot_window_start_ns,
+                    tpot_exec_end_ns,
+                )
+                tpot_recompute_prefill_exec_ns, _ = sum_clipped_interval_items(
+                    [d for d in tpot_exec_dispatches if d.get("phase") == "prefill"],
+                    tpot_window_start_ns,
+                    tpot_exec_end_ns,
+                )
+                tpot_decode_exec_ns, _ = sum_clipped_interval_items(
+                    [d for d in tpot_exec_dispatches if d.get("phase") == "decode"],
+                    tpot_window_start_ns,
+                    tpot_exec_end_ns,
+                )
+
+                post_start_queue_intervals = [
+                    q for q in queue_intervals
+                    if q.get("phase") in ("prefill", "decode")
+                ]
+                scheduling_wait_normal_ns = 0
+                scheduling_wait_preempt_ns = 0
+                tpot_queue_pairs = []
+                for q in post_start_queue_intervals:
+                    span = clip_interval(q.get("start_ns"), q.get("end_ns"), tpot_window_start_ns, tpot_exec_end_ns)
+                    if not span:
+                        continue
+                    start_ns, end_ns = span
+                    tpot_queue_pairs.append(span)
+                    overlapped_step_exec_count = 0
+                    for step_it in step_execution_intervals:
+                        if step_it["end_ns"] <= start_ns:
+                            continue
+                        if step_it["start_ns"] >= end_ns:
+                            continue
+                        overlapped_step_exec_count += 1
+                        if overlapped_step_exec_count >= 1:
+                            break
+                    if overlapped_step_exec_count >= 1:
+                        scheduling_wait_preempt_ns += end_ns - start_ns
+                    else:
+                        scheduling_wait_normal_ns += end_ns - start_ns
+
+                tpot_exec_phase_ns = defaultdict(int)
+                for phase_name, component_key in phase_exec_name_map.items():
+                    total_ns, _ = sum_intersections(
+                        req_worker_phase_intervals.get(rid, {}).get(phase_name, []),
+                        tpot_exec_dispatches,
+                    )
+                    if total_ns > 0:
+                        tpot_exec_phase_ns[component_key] = total_ns
+                tpot_exec_phase_ns["other_exec"] = max(
+                    0,
+                    tpot_exec_ns - sum(tpot_exec_phase_ns.values()),
+                )
+
+                tail_transport_ns = max(0, tpot_window_end_ns - last_decode_end_ns)
+                tpot_total_ns = tpot_window_end_ns - tpot_window_start_ns
+                tpot_other_gap_ns = uncovered_interval_ns(
+                    tpot_window_start_ns,
+                    tpot_window_end_ns,
+                    tpot_queue_pairs + tpot_exec_pairs + [(last_decode_end_ns, tpot_window_end_ns)],
+                )
+                scheduling_wait_total_ns = scheduling_wait_normal_ns + scheduling_wait_preempt_ns
+                scheduling_wait_normal_pct = (
+                    scheduling_wait_normal_ns * 100.0 / scheduling_wait_total_ns
+                    if scheduling_wait_total_ns > 0 else 0.0
+                )
+                scheduling_wait_preempt_pct = (
+                    scheduling_wait_preempt_ns * 100.0 / scheduling_wait_total_ns
+                    if scheduling_wait_total_ns > 0 else 0.0
+                )
+                tpot_components_ns = {
+                    "vllm_scheduling_wait": scheduling_wait_total_ns,
+                    "worker_preprocess": tpot_exec_phase_ns.get("worker_preprocess", 0),
+                    "model_forward": tpot_exec_phase_ns.get("model_forward", 0),
+                    "postprocess": tpot_exec_phase_ns.get("postprocess", 0),
+                    "sampling": tpot_exec_phase_ns.get("sampling", 0),
+                    "bookkeeping_sync": tpot_exec_phase_ns.get("bookkeeping_sync", 0),
+                    "other_exec": tpot_exec_phase_ns.get("other_exec", 0),
+                    "tail_transport": tail_transport_ns,
+                    "other_gap": tpot_other_gap_ns,
+                }
+                tpot_components_ms_per_token = {
+                    key: round(val / decode_steps / 1e6, 6)
+                    for key, val in tpot_components_ns.items()
+                }
+                tpot_entry = {
+                    "window_ns": tpot_total_ns,
+                    "window_ms": ns_to_ms(tpot_total_ns),
+                    "start_ns": tpot_window_start_ns,
+                    "end_ns": tpot_window_end_ns,
+                    "decode_dispatch_count": decode_steps,
+                    "tpot_start_rule": "initial_prefill_end",
+                    "tpot_end_rule": "last_generate_consume_end",
+                    "last_decode_end_ns": last_decode_end_ns,
+                    "last_decode_end_ms": ns_to_ms(last_decode_end_ns),
+                    "exec_total_ns": tpot_exec_ns,
+                    "exec_total_ms": ns_to_ms(tpot_exec_ns),
+                    "recompute_prefill_exec_ns": tpot_recompute_prefill_exec_ns,
+                    "recompute_prefill_exec_ms": ns_to_ms(tpot_recompute_prefill_exec_ns),
+                    "decode_exec_ns": tpot_decode_exec_ns,
+                    "decode_exec_ms": ns_to_ms(tpot_decode_exec_ns),
+                    "scheduling_wait_total_ns": scheduling_wait_total_ns,
+                    "scheduling_wait_total_ms": ns_to_ms(scheduling_wait_total_ns),
+                    "tail_transport_ns": tail_transport_ns,
+                    "tail_transport_ms": ns_to_ms(tail_transport_ns),
+                    "components_ns_total": tpot_components_ns,
+                    "components_ms_total": normalize_component_map_ms(tpot_components_ns),
+                    "components_ms_per_token": tpot_components_ms_per_token,
+                    "exec_phase_ns": dict(tpot_exec_phase_ns),
+                    "exec_phase_ms": normalize_component_map_ms(tpot_exec_phase_ns),
+                    "scheduling_wait_breakdown_ns": {
+                        "normal_gap": scheduling_wait_normal_ns,
+                        "preempt_gap": scheduling_wait_preempt_ns,
+                        "total": scheduling_wait_total_ns,
+                    },
+                    "scheduling_wait_breakdown_ms": {
+                        "normal_gap": ns_to_ms(scheduling_wait_normal_ns),
+                        "preempt_gap": ns_to_ms(scheduling_wait_preempt_ns),
+                        "total": ns_to_ms(scheduling_wait_total_ns),
+                    },
+                    "scheduling_wait_breakdown_ratio": {
+                        "normal_gap_pct": round(scheduling_wait_normal_pct, 6),
+                        "preempt_gap_pct": round(scheduling_wait_preempt_pct, 6),
+                    },
+                    "avg_ms_per_token": round(tpot_total_ns / decode_steps / 1e6, 6),
+                    "denominator_kind": "decode_dispatch_count",
+                    "phase_reentry_after_decode": phase_reentry_after_decode,
+                }
+                tpot_req_count += 1
+                tpot_total_decode_steps += decode_steps
+                tpot_per_req_values_ns.append(tpot_total_ns / decode_steps)
+                for key, val in tpot_components_ns.items():
+                    tpot_component_totals_ns[key] += val
+            else:
+                compute_breakdown["skipped_requests"]["tpot_missing"].append(rid)
+        else:
+            compute_breakdown["skipped_requests"]["tpot_missing"].append(rid)
+
+        compute_breakdown["requests"][rid] = {
+            "request_name": req_name_map.get(rid, rid),
+            "ttft": ttft_entry,
+            "tpot": tpot_entry,
+        }
+
+    ttft_avg_components_ms = {}
+    ttft_vllm_queue_breakdown_avg_ms = {}
+    if ttft_req_count > 0:
+        ttft_avg_components_ms = {
+            key: round(ttft_component_totals_ns.get(key, 0) / ttft_req_count / 1e6, 6)
+            for key in ["preprocess", "enginecore_queue", "vllm_queue", "prefill_exec", "postprocess_transport", "other_gap"]
+        }
+        ttft_vllm_queue_breakdown_avg_ms = {
+            key: round(ttft_vllm_queue_breakdown_totals_ns.get(key, 0) / ttft_req_count / 1e6, 6)
+            for key in ["before_first_prefill", "between_prefills"]
+        }
+    tpot_avg_components_ms = {}
+    if tpot_total_decode_steps > 0:
+        tpot_avg_components_ms = {
+            key: round(tpot_component_totals_ns.get(key, 0) / tpot_total_decode_steps / 1e6, 6)
+            for key in [
+                "vllm_scheduling_wait",
+                "worker_preprocess",
+                "model_forward",
+                "postprocess",
+                "sampling",
+                "bookkeeping_sync",
+                "other_exec",
+                "tail_transport",
+                "other_gap",
+            ]
+        }
+
+    compute_breakdown["summary"] = {
+        "ttft_request_count": ttft_req_count,
+        "ttft_avg_components_ms": ttft_avg_components_ms,
+        "ttft_vllm_queue_breakdown_avg_ms": ttft_vllm_queue_breakdown_avg_ms,
+        "ttft_avg_ms": round(sum(ttft_avg_components_ms.values()), 6) if ttft_avg_components_ms else None,
+        "tpot_request_count": tpot_req_count,
+        "tpot_total_decode_steps": tpot_total_decode_steps,
+        "tpot_avg_components_ms_per_token": tpot_avg_components_ms,
+        "tpot_avg_ms_per_token": round(sum(tpot_avg_components_ms.values()), 6) if tpot_avg_components_ms else None,
+        "tpot_mean_request_ms_per_token": round(sum(tpot_per_req_values_ns) / len(tpot_per_req_values_ns) / 1e6, 6) if tpot_per_req_values_ns else None,
+        "phase_reentry_after_decode_request_count": len(compute_breakdown["phase_reentry_after_decode_requests"]),
+    }
+
+    compute_json_path = derive_sidecar_path(output_file, ".compute_breakdown.json")
+    with open(compute_json_path, "w", encoding="utf-8") as f:
+        json.dump(to_plain_data(compute_breakdown), f, ensure_ascii=False, indent=2)
+
+    print("=== Compute-Side Breakdown Summary ===")
+    if ttft_avg_components_ms:
+        print(
+            f"TTFT Avg ({ttft_req_count} reqs, compute-side): "
+            f"{compute_breakdown['summary']['ttft_avg_ms']:.3f} ms"
+        )
+        for key in ["preprocess", "enginecore_queue", "vllm_queue", "prefill_exec", "postprocess_transport", "other_gap"]:
+            print(f"  - {key}: {ttft_avg_components_ms.get(key, 0.0):.3f} ms")
+        print(
+            "  - vllm_queue_breakdown: "
+            f"before_first_prefill={ttft_vllm_queue_breakdown_avg_ms.get('before_first_prefill', 0.0):.3f} ms, "
+            f"between_prefills={ttft_vllm_queue_breakdown_avg_ms.get('between_prefills', 0.0):.3f} ms"
+        )
+    else:
+        print("TTFT Avg (compute-side): 无可用请求")
+
+    if tpot_avg_components_ms:
+        print(
+            f"TPOT Avg ({tpot_req_count} reqs, {tpot_total_decode_steps} decode steps, compute-side): "
+            f"{compute_breakdown['summary']['tpot_avg_ms_per_token']:.3f} ms/token "
+            f"(denominator=decode_dispatch_count)"
+        )
+        for key in [
+            "vllm_scheduling_wait",
+            "worker_preprocess",
+            "model_forward",
+            "postprocess",
+            "sampling",
+            "bookkeeping_sync",
+            "other_exec",
+            "tail_transport",
+            "other_gap",
+        ]:
+            print(f"  - {key}: {tpot_avg_components_ms.get(key, 0.0):.3f} ms/token")
+    else:
+        print("TPOT Avg (compute-side): 无可用 decode 请求")
+
+    if compute_breakdown["phase_reentry_after_decode_requests"]:
+        print(
+            f"[warn] observed {len(compute_breakdown['phase_reentry_after_decode_requests'])} requests with prefill re-entry after decode; "
+            "TTFT keeps only the initial prefill segment, and the later recompute-prefill cost is attributed to TPOT."
+        )
+    print(f"Saved compute breakdown JSON: {compute_json_path}")
+
     def req_sort_key(rid):
         span = request_spans.get(rid)
         if span and span.get("start_ns"):
@@ -1587,6 +2682,9 @@ def process_logs(input_file, output_file):
         tq = req_generate_task_sched_intervals.get(rid)
         if tq:
             return tq[0]["start_ns"]
+        osq = req_output_socket_sched_intervals.get(rid)
+        if osq:
+            return osq[0]["start_ns"]
         o = req_os_intervals_wall.get(rid)
         if o:
             return o[0]["start_ns"]
@@ -1599,19 +2697,53 @@ def process_logs(input_file, output_file):
         gx = req_generate_exec_intervals.get(rid)
         if gx:
             return gx[0]["start_ns"]
+        sx = req_output_socket_exec_intervals.get(rid)
+        if sx:
+            return sx[0]["start_ns"]
         ox = req_output_handler_exec_intervals.get(rid)
         if ox:
             return ox[0]["start_ns"]
         return float("inf")
 
-    for req_index, rid in enumerate(sorted(all_req_ids, key=req_sort_key), start=1):
+    sorted_req_ids = sorted(all_req_ids, key=req_sort_key)
+
+    per_request_dir = derive_sidecar_path(output_file, ".compute_breakdown_requests")
+    os.makedirs(per_request_dir, exist_ok=True)
+    request_rows = []
+    for req_index, rid in enumerate(sorted_req_ids, start=1):
+        req_entry = compute_breakdown["requests"].get(rid, {})
+        ttft_entry = req_entry.get("ttft")
+        tpot_entry = req_entry.get("tpot")
+        request_name = req_entry.get("request_name", rid)
+        file_name = f"{req_index:04d}_{sanitize_filename(request_name)[:80] or sanitize_filename(rid)[:80]}.svg"
+        svg_path = os.path.join(per_request_dir, file_name)
+        render_request_breakdown_svg(svg_path, rid, request_name, ttft_entry, tpot_entry)
+        request_rows.append({
+            "request_name": request_name,
+            "ttft_ms": f"{float(ttft_entry['window_ms']):.3f}" if ttft_entry else "-",
+            "tpot_ms": f"{float(tpot_entry['avg_ms_per_token']):.3f}" if tpot_entry else "-",
+            "reentry": str(bool((ttft_entry and ttft_entry.get('phase_reentry_after_decode')) or (tpot_entry and tpot_entry.get('phase_reentry_after_decode')))),
+            "file_name": file_name,
+        })
+
+    per_request_index_path = os.path.join(per_request_dir, "index.html")
+    render_request_breakdown_index(per_request_index_path, request_rows)
+    print(f"Saved per-request compute charts: {per_request_dir}")
+    print(f"Saved per-request chart index:  {per_request_index_path}")
+
+    for req_index, rid in enumerate(sorted_req_ids, start=1):
         lane_tids = build_request_lane_tids(req_index)
         lane_names = {
             "label": f"{rid[:12]}",
             "lifecycle": f"{rid[:12]} | lifecycle",
-            "queue": f"{rid[:12]} | queue",
-            "exec": f"{rid[:12]} | exec",
+            "vllm_queue": f"{rid[:12]} | vllm queue",
+            "coro_queue": f"{rid[:12]} | coroutine queue",
+            "output_socket_queue": f"{rid[:12]} | output socket queue",
+            "output_queue": f"{rid[:12]} | output queue",
             "dispatch": f"{rid[:12]} | dispatch",
+            "generate_exec": f"{rid[:12]} | generate exec",
+            "output_socket_exec": f"{rid[:12]} | output socket exec",
+            "output_exec": f"{rid[:12]} | output exec",
             "os": f"{rid[:12]} | os",
             "stage": f"{rid[:12]} | stage",
             "task": f"{rid[:12]} | task",
@@ -1628,6 +2760,8 @@ def process_logs(input_file, output_file):
         coro_sched_queue_ms = req_coro_sched_ns.get(rid, 0) / 1e6
         generate_task_sched_queue_ms = req_generate_task_sched_ns.get(rid, 0) / 1e6
         generate_exec_ms = req_generate_exec_ns.get(rid, 0) / 1e6
+        output_socket_sched_queue_ms = req_output_socket_sched_ns.get(rid, 0) / 1e6
+        output_socket_exec_ms = req_output_socket_exec_ns.get(rid, 0) / 1e6
         output_handler_sched_queue_ms = req_output_handler_sched_ns.get(rid, 0) / 1e6
         output_handler_exec_ms = req_output_handler_exec_ns.get(rid, 0) / 1e6
         vllm_queue_ms = req_vllm_queue_ns.get(rid, 0) / 1e6
@@ -1656,6 +2790,8 @@ def process_logs(input_file, output_file):
                     "coro_sched_queue_ms": round(coro_sched_queue_ms, 3),
                     "generate_task_sched_queue_ms": round(generate_task_sched_queue_ms, 3),
                     "generate_exec_ms": round(generate_exec_ms, 3),
+                    "output_socket_sched_queue_ms": round(output_socket_sched_queue_ms, 3),
+                    "output_socket_exec_ms": round(output_socket_exec_ms, 3),
                     "output_handler_sched_queue_ms": round(output_handler_sched_queue_ms, 3),
                     "output_handler_exec_ms": round(output_handler_exec_ms, 3),
                     "vllm_queue_ms": round(vllm_queue_ms, 3),
@@ -1711,7 +2847,7 @@ def process_logs(input_file, output_file):
                     ts=q0["start_ns"],
                     dur=q0["end_ns"] - q0["start_ns"],
                     pid=REQUEST_PID,
-                    tid=lane_tids["queue"],
+                    tid=lane_tids["coro_queue"],
                     args={"request_id": rid, "request_name": req_name_map.get(rid, rid)},
                     cname="yellow",
                 ))
@@ -1739,13 +2875,51 @@ def process_logs(input_file, output_file):
                     ts=gx["start_ns"],
                     dur=gx["end_ns"] - gx["start_ns"],
                     pid=REQUEST_PID,
-                    tid=lane_tids["exec"],
+                    tid=lane_tids["generate_exec"],
                     args={
                         "request_id": rid,
                         "request_name": req_name_map.get(rid, rid),
                         "task_name": gx.get("task_name"),
                     },
                     cname="rail_idle",
+                ))
+
+        for sq in req_output_socket_sched_intervals.get(rid, []):
+            if sq["end_ns"] > sq["start_ns"]:
+                trace_events.append(create_perfetto_event(
+                    name="Output Socket Scheduler Queue Wait",
+                    cat="request_output_socket_sched_queue",
+                    ph="X",
+                    ts=sq["start_ns"],
+                    dur=sq["end_ns"] - sq["start_ns"],
+                    pid=REQUEST_PID,
+                    tid=lane_tids["output_socket_queue"],
+                    args={
+                        "request_id": rid,
+                        "request_name": req_name_map.get(rid, rid),
+                        "shared_req_count": sq.get("shared_req_count"),
+                        "round_seq": sq.get("round_seq"),
+                    },
+                    cname="yellow",
+                ))
+
+        for sx in req_output_socket_exec_intervals.get(rid, []):
+            if sx["end_ns"] > sx["start_ns"]:
+                trace_events.append(create_perfetto_event(
+                    name="Output Socket Exec (Attributed)",
+                    cat="request_output_socket_exec",
+                    ph="X",
+                    ts=sx["start_ns"],
+                    dur=sx["end_ns"] - sx["start_ns"],
+                    pid=REQUEST_PID,
+                    tid=lane_tids["output_socket_exec"],
+                    args={
+                        "request_id": rid,
+                        "request_name": req_name_map.get(rid, rid),
+                        "shared_req_count": sx.get("shared_req_count"),
+                        "round_seq": sx.get("round_seq"),
+                    },
+                    cname="cyan",
                 ))
 
         for qh in req_output_handler_sched_intervals.get(rid, []):
@@ -1757,7 +2931,7 @@ def process_logs(input_file, output_file):
                     ts=qh["start_ns"],
                     dur=qh["end_ns"] - qh["start_ns"],
                     pid=REQUEST_PID,
-                    tid=lane_tids["queue"],
+                    tid=lane_tids["output_queue"],
                     args={
                         "request_id": rid,
                         "request_name": req_name_map.get(rid, rid),
@@ -1776,7 +2950,7 @@ def process_logs(input_file, output_file):
                     ts=ox["start_ns"],
                     dur=ox["end_ns"] - ox["start_ns"],
                     pid=REQUEST_PID,
-                    tid=lane_tids["exec"],
+                    tid=lane_tids["output_exec"],
                     args={
                         "request_id": rid,
                         "request_name": req_name_map.get(rid, rid),
@@ -1805,7 +2979,7 @@ def process_logs(input_file, output_file):
                     ts=q["start_ns"],
                     dur=q["end_ns"] - q["start_ns"],
                     pid=REQUEST_PID,
-                    tid=lane_tids["queue"],
+                    tid=lane_tids["vllm_queue"],
                     args={
                         "request_id": rid,
                         "reason": q["reason"],
@@ -1854,6 +3028,8 @@ def process_logs(input_file, output_file):
             req_coro_sched_ns.get(x, 0)
             + req_generate_task_sched_ns.get(x, 0)
             + req_generate_exec_ns.get(x, 0)
+            + req_output_socket_sched_ns.get(x, 0)
+            + req_output_socket_exec_ns.get(x, 0)
             + req_output_handler_sched_ns.get(x, 0)
             + req_output_handler_exec_ns.get(x, 0)
             + req_vllm_queue_ns.get(x, 0)
@@ -1870,6 +3046,8 @@ def process_logs(input_file, output_file):
             f"coro_sched_queue={req_coro_sched_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"generate_task_queue={req_generate_task_sched_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"generate_exec={req_generate_exec_ns.get(rid, 0) / 1e6:.3f} ms, "
+            f"output_socket_sched_queue={req_output_socket_sched_ns.get(rid, 0) / 1e6:.3f} ms, "
+            f"output_socket_exec={req_output_socket_exec_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"output_handler_sched_queue={req_output_handler_sched_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"output_handler_exec={req_output_handler_exec_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"vllm_queue={req_vllm_queue_ns.get(rid, 0) / 1e6:.3f} ms "
@@ -1891,14 +3069,30 @@ def process_logs(input_file, output_file):
             "request_dispatch",
             "request_coro_sched_queue",
             "request_generate_task_queue",
+            "request_output_socket_sched_queue",
             "request_output_handler_sched_queue",
             "request_generate_exec",
+            "request_output_socket_exec",
             "request_output_handler_exec",
         ),
         snap_tolerance_us=1.0,
     )
     if nudged_count > 0:
         print(f"Applied boundary nudge for request tracks: {nudged_count} events (epsilon=1.0us)")
+
+    # GPU 同一 stream 上理论上应串行；这里观测到的 overlap 普遍只有几百 ns，
+    # 更像 CUPTI 记录边界/量化误差。对小重叠做最小修正，避免 Perfetto 丢 slice。
+    gpu_nudged_count = nudge_equal_boundaries(
+        trace_events,
+        epsilon_us=0.001,
+        cat_prefixes=("gpu_kernel",),
+        snap_tolerance_us=1.0,
+    )
+    if gpu_nudged_count > 0:
+        print(
+            "Applied boundary nudge for GPU kernel tracks: "
+            f"{gpu_nudged_count} events (epsilon=0.001us, tolerance=1.0us)"
+        )
 
     # --- 输出 ---
     print("✨ Sorting all trace events...")

@@ -7,6 +7,7 @@ import inspect
 import logging
 import os
 import threading
+import weakref
 import zmq
 from encode import make_metadata, metadata_to_bytes 
 from request_context import (
@@ -32,10 +33,18 @@ debug_counters = {
     "skip_no_ctx": 0,
 }
 SOCK_ADDR = os.getenv("TRACER_ZMQ_ADDR", "ipc:///tmp/tracer.sock")
+thread_role_announced = set()
 
 ctx = zmq.Context()
 sock = ctx.socket(zmq.PUSH)
 sock.connect(SOCK_ADDR)
+
+
+def _get_native_tid():
+    try:
+        return threading.get_native_id()
+    except AttributeError:
+        return threading.get_ident()
 
 def send_event(source, event_type, payload=None, extra=None):
     meta = make_metadata(source, event_type, extra=extra)
@@ -60,6 +69,32 @@ def send_event(source, event_type, payload=None, extra=None):
     except Exception:
         # 防御性兜底：trace 不得打断推理
         pass
+
+
+def emit_thread_role(role, extra=None):
+    pid = os.getpid()
+    tid = _get_native_tid()
+    key = (pid, tid, role)
+    with ctx_lock:
+        if key in thread_role_announced:
+            return
+        thread_role_announced.add(key)
+
+    payload = {
+        "role": role,
+        "pid": pid,
+        "tid": tid,
+        "thread_ident": threading.get_ident(),
+        "mono_timestamp_ns": time.clock_gettime_ns(time.CLOCK_MONOTONIC),
+        "timestamp_ns": time.time_ns(),
+    }
+    if extra and isinstance(extra, dict):
+        payload.update(extra)
+    send_event(
+        source="monkey_patch",
+        event_type="thread_role",
+        payload=payload,
+    )
 
 def get_arg_value(func, arg_name, args, kwargs):
     """从 args/kwargs 自动解析参数"""
@@ -111,7 +146,7 @@ def emit_stage_duration(stage, start_ns, end_ns, request_id=None, request_name=N
         "end_ns": end_ns,
         "duration_ns": dur_ns,
         "pid": os.getpid(),
-        "tid": threading.get_ident(),
+        "tid": _get_native_tid(),
         "timestamp_ns": end_ns if end_ns is not None else time.time_ns(),
     }
     if extra and isinstance(extra, dict):
@@ -147,7 +182,7 @@ def emit_output_handler_sched_latency(
             "task_name": task_name,
             "round_seq": round_seq,
             "pid": os.getpid(),
-            "tid": threading.get_ident(),
+            "tid": _get_native_tid(),
             "timestamp_ns": run_ts_ns if run_ts_ns is not None else time.time_ns(),
         },
     )
@@ -180,7 +215,7 @@ def emit_coroutine_sched_latency(
             "run_ts_ns": run_ts_ns,
             "queue_ns": queue_ns,
             "pid": os.getpid(),
-            "tid": threading.get_ident(),
+            "tid": _get_native_tid(),
             "timestamp_ns": run_ts_ns if run_ts_ns is not None else time.time_ns(),
         },
     )
@@ -212,7 +247,7 @@ def emit_coroutine_exec_slice(
             "end_ns": end_ns,
             "duration_ns": end_ns - start_ns,
             "pid": os.getpid(),
-            "tid": threading.get_ident(),
+            "tid": _get_native_tid(),
             "timestamp_ns": end_ns,
         },
     )
@@ -241,7 +276,66 @@ def emit_output_handler_exec_slice(
             "task_name": task_name,
             "round_seq": round_seq,
             "pid": os.getpid(),
-            "tid": threading.get_ident(),
+            "tid": _get_native_tid(),
+            "timestamp_ns": end_ns,
+        },
+    )
+
+
+def emit_output_socket_sched_latency(
+    ready_ts_ns,
+    run_ts_ns,
+    queue_ns,
+    req_ids,
+    task_id=None,
+    task_name=None,
+    round_seq=None,
+):
+    if queue_ns is None or queue_ns < 0 or not req_ids:
+        return
+    send_event(
+        source="monkey_patch",
+        event_type="output_socket_sched_latency",
+        payload={
+            "ready_ts_ns": ready_ts_ns,
+            "run_ts_ns": run_ts_ns,
+            "queue_ns": queue_ns,
+            "req_ids": list(req_ids),
+            "batch_size": len(req_ids),
+            "task_id": task_id,
+            "task_name": task_name,
+            "round_seq": round_seq,
+            "pid": os.getpid(),
+            "tid": _get_native_tid(),
+            "timestamp_ns": run_ts_ns if run_ts_ns is not None else time.time_ns(),
+        },
+    )
+
+
+def emit_output_socket_exec_slice(
+    start_ns,
+    end_ns,
+    req_ids,
+    task_id=None,
+    task_name=None,
+    round_seq=None,
+):
+    if start_ns is None or end_ns is None or end_ns <= start_ns or not req_ids:
+        return
+    send_event(
+        source="monkey_patch",
+        event_type="output_socket_exec_slice",
+        payload={
+            "start_ns": start_ns,
+            "end_ns": end_ns,
+            "duration_ns": end_ns - start_ns,
+            "req_ids": list(req_ids),
+            "batch_size": len(req_ids),
+            "task_id": task_id,
+            "task_name": task_name,
+            "round_seq": round_seq,
+            "pid": os.getpid(),
+            "tid": _get_native_tid(),
             "timestamp_ns": end_ns,
         },
     )
@@ -346,6 +440,15 @@ def _extract_req_ids_from_engine_core_outputs(engine_core_outputs):
     return req_ids
 
 
+def _extract_req_ids_from_engine_core_output_batch(engine_core_outputs):
+    if engine_core_outputs is None:
+        return []
+    outputs = getattr(engine_core_outputs, "outputs", None)
+    if outputs is None:
+        return []
+    return _extract_req_ids_from_engine_core_outputs(outputs)
+
+
 def _flush_pending_output_handler_sched_events(task=None, req_ids=None):
     task = task or asyncio.current_task()
     if task is None:
@@ -382,6 +485,42 @@ def _flush_pending_output_handler_sched_events(task=None, req_ids=None):
     return len(pending)
 
 
+def _flush_pending_output_socket_sched_events(task=None, req_ids=None):
+    task = task or asyncio.current_task()
+    if task is None:
+        return 0
+    task_id = id(task)
+    with ctx_lock:
+        info = task_request_ctx.get(task_id)
+        if not info or info.get("task_kind") != "output_socket":
+            return 0
+        target_req_ids = list(req_ids if req_ids is not None else info.get("current_process_req_ids") or [])
+        pending = list(info.get("pending_sched_events") or [])
+        if not pending:
+            return 0
+        info["pending_sched_events"] = []
+        if req_ids is not None:
+            info["current_process_req_ids"] = list(target_req_ids)
+            info["current_process_size"] = len(target_req_ids)
+        task_name = info.get("task_name")
+        round_seq = info.get("process_seq")
+    if not target_req_ids:
+        return 0
+    for rid in target_req_ids:
+        remember_request_name(rid, None)
+    for item in pending:
+        emit_output_socket_sched_latency(
+            ready_ts_ns=item.get("ready_ts_ns"),
+            run_ts_ns=item.get("run_ts_ns"),
+            queue_ns=item.get("queue_ns"),
+            req_ids=target_req_ids,
+            task_id=task_id,
+            task_name=task_name,
+            round_seq=round_seq,
+        )
+    return len(pending)
+
+
 def _begin_output_handler_process_outputs(engine_core_outputs):
     task = asyncio.current_task()
     if task is None:
@@ -405,8 +544,32 @@ def _begin_output_handler_process_outputs(engine_core_outputs):
     return req_ids, process_seq
 
 
+def _begin_output_socket_process_outputs(engine_core_outputs):
+    task = asyncio.current_task()
+    if task is None:
+        return [], None
+    task_id = id(task)
+    req_ids = _extract_req_ids_from_engine_core_output_batch(engine_core_outputs)
+    process_seq = None
+    with ctx_lock:
+        info = task_request_ctx.get(task_id)
+        if not info or info.get("task_kind") != "output_socket":
+            return [], None
+        if req_ids:
+            info["current_process_req_ids"] = list(req_ids)
+            info["current_process_size"] = len(req_ids)
+            info["process_seq"] = int(info.get("process_seq") or 0) + 1
+            process_seq = info["process_seq"]
+        else:
+            info["current_process_req_ids"] = []
+            info["current_process_size"] = 0
+    _flush_pending_output_socket_sched_events(task=task, req_ids=req_ids)
+    return req_ids, process_seq
+
+
 def _make_scheduled_callback(original_callback, ready_ts_ns, task_id, request_id, request_name):
     def wrapped_callback(*cb_args):
+        emit_thread_role("asyncio_eventloop")
         ctx_info = None
         if task_id is not None:
             with ctx_lock:
@@ -423,7 +586,7 @@ def _make_scheduled_callback(original_callback, ready_ts_ns, task_id, request_id
             queue_ns = run_ts_ns - ready_ts_ns
             if queue_ns >= 0:
                 debug_counters["emit_hits"] += 1
-                if ctx_info.get("task_kind") == "output_handler" and task_id is not None:
+                if ctx_info.get("task_kind") in ("output_handler", "output_socket") and task_id is not None:
                     with ctx_lock:
                         info = task_request_ctx.get(task_id)
                         if info is not None:
@@ -462,7 +625,7 @@ def _make_scheduled_callback(original_callback, ready_ts_ns, task_id, request_id
             end_ts_ns = time.time_ns()
             if ctx_info and end_ts_ns > run_ts_ns:
                 task_kind = ctx_info.get("task_kind")
-                if task_kind not in ("output_handler", "generate_task"):
+                if task_kind not in ("output_handler", "output_socket", "generate_task"):
                     emit_coroutine_exec_slice(
                         start_ns=run_ts_ns,
                         end_ns=end_ts_ns,
@@ -587,6 +750,7 @@ def patch_vllm():
         from vllm.v1.engine.processor import Processor
         from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
         from vllm.v1.engine import core_client as core_client_module
+        _process_utility_output = core_client_module._process_utility_output
         from vllm.entrypoints.utils import _validate_truncation_size
         from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
         patch_logger.info("[VLLM_PATCH] Successfully imported AsyncLLM.")
@@ -776,6 +940,92 @@ def patch_vllm():
     if patched_core_classes:
         patch_logger.info(f"[VLLM_PATCH] Patched EngineCore add_request_async on {patched_core_classes}.")
 
+    # 4.5) Patch AsyncMPClient-like output socket consumer task.
+    output_socket_patched = []
+    for cls_name in ["AsyncMPClient", "DPAsyncMPClient", "DPLBAsyncMPClient"]:
+        cls = getattr(core_client_module, cls_name, None)
+        if cls is None or not hasattr(cls, "_ensure_output_queue_task"):
+            continue
+        original_ensure_output_queue_task = getattr(cls, "_ensure_output_queue_task")
+        if _is_patched(original_ensure_output_queue_task):
+            continue
+
+        @wraps(original_ensure_output_queue_task)
+        def patched_ensure_output_queue_task(self, *args, __orig=original_ensure_output_queue_task, **kwargs):
+            resources = self.resources
+            if getattr(resources, "output_queue_task", None) is not None:
+                return __orig(self, *args, **kwargs)
+
+            decoder = self.decoder
+            utility_results = self.utility_results
+            outputs_queue = self.outputs_queue
+            output_handler = getattr(self.__class__, "process_engine_outputs", None)
+            _self_ref = weakref.ref(self) if output_handler else None
+            output_socket = resources.output_socket
+            assert output_socket is not None
+
+            async def process_outputs_socket():
+                try:
+                    while True:
+                        frames = await output_socket.recv_multipart(copy=False)
+                        exec_start_ns = time.time_ns()
+                        resources.validate_alive(frames)
+                        outputs = decoder.decode(frames)
+                        if outputs.utility_output:
+                            _process_utility_output(outputs.utility_output, utility_results)
+                            continue
+
+                        req_ids, process_seq = _begin_output_socket_process_outputs(outputs)
+                        if output_handler is not None:
+                            assert _self_ref is not None
+                            _self = _self_ref()
+                            if not _self:
+                                return
+                            await output_handler(_self, outputs)
+
+                        if outputs.outputs or outputs.scheduler_stats:
+                            outputs_queue.put_nowait(outputs)
+
+                        exec_end_ns = time.time_ns()
+                        if req_ids and exec_end_ns > exec_start_ns:
+                            for rid in req_ids:
+                                remember_request_name(rid, None)
+                            task = asyncio.current_task()
+                            task_id = id(task) if task is not None else None
+                            task_name = task.get_name() if (task is not None and hasattr(task, "get_name")) else None
+                            emit_output_socket_exec_slice(
+                                start_ns=exec_start_ns,
+                                end_ns=exec_end_ns,
+                                req_ids=req_ids,
+                                task_id=task_id,
+                                task_name=task_name,
+                                round_seq=process_seq,
+                            )
+                except Exception as e:
+                    outputs_queue.put_nowait(e)
+                except asyncio.CancelledError:
+                    outputs_queue.put_nowait(EngineDeadError())
+
+            resources.output_queue_task = asyncio.create_task(
+                process_outputs_socket(), name="EngineCoreOutputQueueTask")
+            _register_task_context(
+                resources.output_queue_task,
+                request_id=None,
+                request_name="process_outputs_socket",
+                task_kind="output_socket",
+                extra={
+                    "pending_sched_events": [],
+                    "current_process_req_ids": [],
+                    "current_process_size": 0,
+                    "process_seq": 0,
+                },
+            )
+
+        setattr(cls, "_ensure_output_queue_task", _mark_patched(patched_ensure_output_queue_task))
+        output_socket_patched.append(cls_name)
+    if output_socket_patched:
+        patch_logger.info(f"[VLLM_PATCH] Patched process_outputs_socket on {output_socket_patched}.")
+
     # 5) Patch AsyncLLM.add_request: 总请求注册阶段
     if hasattr(AsyncLLM, "add_request"):
         original_add_request = AsyncLLM.add_request
@@ -844,7 +1094,8 @@ def patch_vllm():
             request_name = request_id
         request_name = remember_request_name(request_id, request_name)
         process_id = os.getpid()
-        thread_id = threading.get_ident()
+        thread_id = _get_native_tid()
+        emit_thread_role("asyncio_eventloop", extra={"component": "async_llm.generate"})
         current_task = asyncio.current_task()
         current_task_id = id(current_task) if current_task is not None else None
         current_task_name = current_task.get_name() if (current_task is not None and hasattr(current_task, "get_name")) else None
@@ -987,7 +1238,7 @@ def patch_vllm():
                     "request_id": request_id,
                     "request_name": request_name,
                     "pid": process_id, #直接复用
-                    "tid": threading.get_ident(), #没有直接复用
+                    "tid": _get_native_tid(),
                     "coroutine_id": coro_id,
                     "duration_ms": duration_ms,
                     "timestamp_ns": ts_ns_end,

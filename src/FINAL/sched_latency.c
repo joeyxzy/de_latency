@@ -92,6 +92,28 @@ static int parse_int_str(const char *s, int *out)
     return 0;
 }
 
+static int parse_target_spec(const char *s, __u32 *id_out, bool *exact_tid_out)
+{
+    const char *value = s;
+
+    if (!s || !*s || !id_out || !exact_tid_out) return -1;
+
+    *exact_tid_out = false;
+    if (strncasecmp(s, "tid:", 4) == 0) {
+        value = s + 4;
+        *exact_tid_out = true;
+    } else if (strncasecmp(s, "thread:", 7) == 0) {
+        value = s + 7;
+        *exact_tid_out = true;
+    } else if (strncasecmp(s, "pid:", 4) == 0) {
+        value = s + 4;
+    } else if (strncasecmp(s, "process:", 8) == 0) {
+        value = s + 8;
+    }
+
+    return parse_u32_str(value, id_out);
+}
+
 static int read_first_line(const char *path, char *buf, size_t size)
 {
     FILE *fp = NULL;
@@ -236,13 +258,20 @@ static int auto_scan_worker_pid_file(const struct config *cfg, int tid_map_fd, i
     }
 
     while (fgets(line, sizeof(line), fp)) {
-        __u32 pid_u32;
+        __u32 target_u32;
         pid_t pid;
+        bool exact_tid = false;
 
         line[strcspn(line, "\r\n")] = '\0';
-        if (parse_u32_str(line, &pid_u32) != 0) continue;
+        if (parse_target_spec(line, &target_u32, &exact_tid) != 0) continue;
 
-        pid = (pid_t)pid_u32;
+        pid = (pid_t)target_u32;
+        if (exact_tid) {
+            workers++;
+            added_tids += add_tid_to_bpf_map(tid_map_fd, target_u32, true) > 0 ? 1 : 0;
+            continue;
+        }
+
         if (cfg->root_pid > 0 && !is_descendant_or_self(pid, cfg->root_pid)) continue;
 
         workers++;

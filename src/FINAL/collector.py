@@ -8,6 +8,7 @@ import zmq
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOG_PATH = REPO_ROOT / "perfetto" / "de_latency.log"
 SOCK_ADDR = os.getenv("TRACER_ZMQ_ADDR", "ipc:///tmp/tracer.sock")
+DEFAULT_TARGET_FILE = "/tmp/tracer_worker_pids"
 
 
 def _env_int(name, default, min_value):
@@ -25,9 +26,14 @@ LOG_FLUSH_EVERY = _env_int("TRACER_LOG_FLUSH_EVERY", 1000, 1)
 LOG_DIR = Path.cwd()
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 CUPTI_LOG = Path(os.getenv("DE_LATENCY_LOG_PATH", str(DEFAULT_LOG_PATH)))
-WORKER_PID_FILE = Path(os.getenv("TRACER_WORKER_PID_FILE", "/tmp/tracer_worker_pids"))
+TARGET_FILE = Path(
+    os.getenv(
+        "TRACER_TARGET_FILE",
+        os.getenv("TRACER_WORKER_PID_FILE", DEFAULT_TARGET_FILE),
+    )
+)
 CUPTI_LOG.parent.mkdir(parents=True, exist_ok=True)
-WORKER_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+TARGET_FILE.parent.mkdir(parents=True, exist_ok=True)
 WORKER_PID_EVENTS = {
     "worker_process_ready",
     "worker_preprocess_start",
@@ -36,7 +42,14 @@ WORKER_PID_EVENTS = {
     "gpu_forward_end",
     "gpu_execute_model",
 }
+THREAD_TARGET_EVENTS = {
+    "thread_role",
+}
+THREAD_TARGET_ROLES = {
+    "asyncio_eventloop",
+}
 _known_worker_pids = set()
+_known_exact_tids = set()
 _stop_requested = False
 
 
@@ -104,16 +117,45 @@ def _extract_worker_pid(src, meta, payload):
     return _coerce_pid(p.get("pid"))
 
 
+def _persist_target_file():
+    lines = [str(x) for x in sorted(_known_worker_pids)]
+    lines.extend(f"tid:{x}" for x in sorted(_known_exact_tids))
+    content = ("\n".join(lines) + "\n") if lines else ""
+    TARGET_FILE.write_text(content, encoding="utf-8")
+
+
 def _persist_worker_pid(pid):
     if pid is None or pid in _known_worker_pids:
         return
 
     _known_worker_pids.add(pid)
-    WORKER_PID_FILE.write_text(
-        "\n".join(str(x) for x in sorted(_known_worker_pids)) + "\n",
-        encoding="utf-8",
-    )
+    _persist_target_file()
     print(f"[collector] discovered worker pid={pid}", flush=True)
+
+
+def _extract_exact_tid(src, meta, payload):
+    if src != "monkey_patch":
+        return None
+
+    event_type = meta.get("event_type")
+    if event_type not in THREAD_TARGET_EVENTS:
+        return None
+
+    p = _extract_dict_payload(meta, payload)
+    if not p:
+        return None
+    if p.get("role") not in THREAD_TARGET_ROLES:
+        return None
+    return _coerce_pid(p.get("tid"))
+
+
+def _persist_exact_tid(tid):
+    if tid is None or tid in _known_exact_tids:
+        return
+
+    _known_exact_tids.add(tid)
+    _persist_target_file()
+    print(f"[collector] discovered exact tid={tid}", flush=True)
 
 
 def handle_frames(frames, log_file):
@@ -141,6 +183,7 @@ def handle_frames(frames, log_file):
 
     src = _get_src(meta)
     _persist_worker_pid(_extract_worker_pid(src, meta, payload))
+    _persist_exact_tid(_extract_exact_tid(src, meta, payload))
 
     if src == "ebpf" or src == "cupti" or src == "monkey_patch":
         # CUPTI 是单帧 JSON，直接落盘原始行，避免 json.loads+json.dumps 的双重开销。
@@ -198,5 +241,5 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, _handle_stop_signal)
     signal.signal(signal.SIGINT, _handle_stop_signal)
     CUPTI_LOG.write_text("", encoding="utf-8")
-    WORKER_PID_FILE.write_text("", encoding="utf-8")
+    TARGET_FILE.write_text("", encoding="utf-8")
     collector()

@@ -45,7 +45,7 @@ de_latency/
   - 通过 `LD_PRELOAD` 注入
   - 采集 CUDA / CUPTI 事件
 - `build/ebpf_monitor`
-  - 采集 worker 线程的调度信息
+  - 采集 worker 线程以及显式注册线程的调度信息
 - `src/FINAL/collector.py`
   - 将三路事件写入统一日志
 - `perfetto/log_to_trace.py`
@@ -198,7 +198,7 @@ export JSONC_LIB_PATH=/path/to/json-c/lib
 - `TRACER_ZMQ_ADDR`
   - Python / CUPTI / eBPF 三路事件的 ZMQ 地址
 - `TRACER_WORKER_PID_FILE`
-  - worker pid 自动发现文件
+  - eBPF 自动发现目标文件；支持 worker pid，以及 `tid:<native_tid>` 形式的精确线程
 - `DE_LATENCY_LOG_PATH`
   - 汇总日志输出文件
 - `ZMQ_LIB_PATH` / `JSONC_LIB_PATH`
