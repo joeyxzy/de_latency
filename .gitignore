@@ -7,3 +7,6 @@
 *.dSYM
 *.json
 *.pyc
+*.svg
+*.html
+.codex

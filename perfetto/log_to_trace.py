@@ -930,6 +930,7 @@ def process_logs(input_file, output_file):
     enginecore_loop_events = []
     thread_role_events = []
     execute_model_span = []
+    worker_span_mono_to_wall_offsets = []
     ebpf_sched_latency_events = []
     req_name_map = {}
     
@@ -1040,7 +1041,21 @@ def process_logs(input_file, output_file):
                     "ts": payload.get("timestamp_ns", ts),
                 })
             elif etype=="worker_model_execute_span":
-                execute_model_span.append(payload)
+                execute_model_span.append({
+                    "type": etype,
+                    "payload": payload,
+                    "ts": ts,
+                })
+                end_mono_ns = to_ns(payload.get("end_ns"))
+                emit_wall_ns = to_ns(ts)
+                if (
+                    end_mono_ns is not None
+                    and emit_wall_ns is not None
+                    and emit_wall_ns > end_mono_ns
+                ):
+                    # 该事件在记录完 monotonic end_ns 后立刻用 wall clock 发出，
+                    # 可作为稳定的 mono->wall 对齐样本。
+                    worker_span_mono_to_wall_offsets.append(emit_wall_ns - end_mono_ns)
 
         elif src == 'CUPTI':
             corr_id = payload.get('correlationId')
@@ -2004,7 +2019,7 @@ def process_logs(input_file, output_file):
             trace_events.append(create_flow_event("f", start, gpu_pid, stream, corr_id))
 
     print(f"Processing Request Metric Events ({len(req_metric_events)})...")
-    mono_to_wall_offsets = []
+    req_metric_mono_to_wall_offsets = []
 
     for item in req_metric_events:
         payload = item.get('payload', item)
@@ -2020,11 +2035,40 @@ def process_logs(input_file, output_file):
                     batch_mono_ns.append(ev_ns)
 
         if batch_ts_ns and batch_mono_ns:
-            mono_to_wall_offsets.append(batch_ts_ns - max(batch_mono_ns))
+            # 注意：req_metrics_events 的 wall 时间发生在一批事件被整理并发出之后，
+            # 这里会混入 Python 处理与发送延迟，因此只能作为最后兜底。
+            req_metric_mono_to_wall_offsets.append(batch_ts_ns - max(batch_mono_ns))
 
-    global_mono_to_wall_offset = median_int(mono_to_wall_offsets)
+    explicit_mono_to_wall_offsets = []
+    explicit_mono_to_wall_offsets.extend(thread_mono_to_wall_offset_by_tid.values())
+    explicit_mono_to_wall_offsets.extend(worker_span_mono_to_wall_offsets)
+
+    global_mono_to_wall_offset = None
+    global_mono_to_wall_offset_source = None
+
+    if explicit_mono_to_wall_offsets:
+        global_mono_to_wall_offset = median_int(explicit_mono_to_wall_offsets)
+        global_mono_to_wall_offset_source = "explicit_thread_or_worker_span"
+    elif req_metric_mono_to_wall_offsets:
+        global_mono_to_wall_offset = median_int(req_metric_mono_to_wall_offsets)
+        global_mono_to_wall_offset_source = "req_metrics_fallback"
+
     if global_mono_to_wall_offset is not None:
-        print(f"Estimated mono->wall offset: {global_mono_to_wall_offset} ns")
+        print(
+            f"Estimated mono->wall offset: {global_mono_to_wall_offset} ns "
+            f"(source={global_mono_to_wall_offset_source})"
+        )
+
+    if explicit_mono_to_wall_offsets and req_metric_mono_to_wall_offsets:
+        explicit_offset = median_int(explicit_mono_to_wall_offsets)
+        req_metric_offset = median_int(req_metric_mono_to_wall_offsets)
+        drift_ns = req_metric_offset - explicit_offset
+        if abs(drift_ns) > 1_000_000:
+            print(
+                "  [warn] req_metrics 推断的 mono->wall offset 与显式样本偏差较大: "
+                f"{drift_ns / 1e6:.3f} ms "
+                f"(explicit={explicit_offset}, req_metrics={req_metric_offset})"
+            )
 
 
     print("\n=== 正在计算 OS 调度/抢占延迟 (eBPF) ===")
