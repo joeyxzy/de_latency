@@ -449,6 +449,135 @@ def _extract_req_ids_from_engine_core_output_batch(engine_core_outputs):
     return _extract_req_ids_from_engine_core_outputs(outputs)
 
 
+def _dedupe_req_ids(req_ids):
+    if not req_ids:
+        return []
+    deduped = []
+    seen = set()
+    for rid in req_ids:
+        if rid is None:
+            continue
+        key = str(rid)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(rid)
+    return deduped
+
+
+def _same_req_id_list(left, right):
+    left = _dedupe_req_ids(left)
+    right = _dedupe_req_ids(right)
+    if len(left) != len(right):
+        return False
+    return all(str(lv) == str(rv) for lv, rv in zip(left, right))
+
+
+def _build_output_handler_suffix_req_ids(output_slices):
+    slice_req_ids = [
+        _dedupe_req_ids(_extract_req_ids_from_engine_core_outputs(outputs_slice))
+        for outputs_slice in output_slices
+    ]
+    suffix_req_ids = [[] for _ in slice_req_ids]
+    carry = []
+    for idx in range(len(slice_req_ids) - 1, -1, -1):
+        merged = list(slice_req_ids[idx])
+        seen = {str(rid) for rid in merged}
+        for rid in carry:
+            key = str(rid)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(rid)
+        suffix_req_ids[idx] = merged
+        carry = merged
+    return slice_req_ids, suffix_req_ids
+
+
+def _set_output_handler_round_slices(output_slices, task=None):
+    task = task or asyncio.current_task()
+    if task is None:
+        return None
+    task_id = id(task)
+    slice_req_ids, suffix_req_ids = _build_output_handler_suffix_req_ids(output_slices)
+    round_seq = None
+    with ctx_lock:
+        info = task_request_ctx.get(task_id)
+        if not info or info.get("task_kind") != "output_handler":
+            return None
+        info["round_slice_req_ids"] = slice_req_ids
+        info["round_suffix_req_ids"] = suffix_req_ids
+        info["round_next_slice_idx"] = 0
+        info["current_process_req_ids"] = []
+        info["current_process_size"] = 0
+        if any(slice_req_ids):
+            info["process_seq"] = int(info.get("process_seq") or 0) + 1
+            round_seq = info["process_seq"]
+        info["active_round_seq"] = round_seq
+    return round_seq
+
+
+def _clear_output_handler_round_state(task=None):
+    task = task or asyncio.current_task()
+    if task is None:
+        return
+    task_id = id(task)
+    with ctx_lock:
+        info = task_request_ctx.get(task_id)
+        if not info or info.get("task_kind") != "output_handler":
+            return
+        info["round_slice_req_ids"] = []
+        info["round_suffix_req_ids"] = []
+        info["round_next_slice_idx"] = 0
+        info["active_round_seq"] = None
+        info["current_process_req_ids"] = []
+        info["current_process_size"] = 0
+
+
+def _chunk_output_handler_slices(engine_outputs, chunk_size):
+    outputs = getattr(engine_outputs, "outputs", None)
+    if outputs is None:
+        return ()
+    try:
+        num_outputs = len(outputs)
+    except TypeError:
+        num_outputs = 0
+    if num_outputs <= 0:
+        return (outputs,)
+    if not chunk_size or num_outputs <= chunk_size:
+        return (outputs,)
+    slices = []
+    for start_idx in range(0, num_outputs, chunk_size):
+        slices.append(outputs[start_idx:start_idx + chunk_size])
+    return tuple(slices)
+
+
+def _record_output_handler_iteration_stats(logger_manager, outputs, iteration_stats):
+    if logger_manager is None:
+        return
+    scheduler_stats = getattr(outputs, "scheduler_stats", None)
+    mm_cache_stats = getattr(outputs, "mm_cache_stats", None)
+
+    if hasattr(logger_manager, "record"):
+        try:
+            logger_manager.record(
+                scheduler_stats,
+                iteration_stats,
+                mm_cache_stats=mm_cache_stats,
+            )
+            return
+        except TypeError:
+            # Older/newer vLLM variants may expose a narrower record() signature.
+            try:
+                logger_manager.record(scheduler_stats, iteration_stats)
+                return
+            except TypeError:
+                pass
+
+    if hasattr(logger_manager, "record_iteration_stats"):
+        logger_manager.record_iteration_stats(iteration_stats)
+
+
 def _flush_pending_output_handler_sched_events(task=None, req_ids=None):
     task = task or asyncio.current_task()
     if task is None:
@@ -463,11 +592,8 @@ def _flush_pending_output_handler_sched_events(task=None, req_ids=None):
         if not pending:
             return 0
         info["pending_sched_events"] = []
-        if req_ids is not None:
-            info["current_process_req_ids"] = list(target_req_ids)
-            info["current_process_size"] = len(target_req_ids)
         task_name = info.get("task_name")
-        round_seq = info.get("process_seq")
+        round_seq = info.get("active_round_seq") or info.get("process_seq")
     if not target_req_ids:
         return 0
     for rid in target_req_ids:
@@ -526,21 +652,51 @@ def _begin_output_handler_process_outputs(engine_core_outputs):
     if task is None:
         return [], None
     task_id = id(task)
-    req_ids = _extract_req_ids_from_engine_core_outputs(engine_core_outputs)
+    actual_req_ids = _dedupe_req_ids(
+        _extract_req_ids_from_engine_core_outputs(engine_core_outputs)
+    )
+    req_ids = list(actual_req_ids)
+    sched_req_ids = list(actual_req_ids)
     process_seq = None
     with ctx_lock:
         info = task_request_ctx.get(task_id)
         if not info or info.get("task_kind") != "output_handler":
-            return [], None
-        if req_ids:
-            info["current_process_req_ids"] = list(req_ids)
-            info["current_process_size"] = len(req_ids)
-            info["process_seq"] = int(info.get("process_seq") or 0) + 1
-            process_seq = info["process_seq"]
+            return actual_req_ids, None
+        round_slice_req_ids = info.get("round_slice_req_ids") or []
+        round_suffix_req_ids = info.get("round_suffix_req_ids") or []
+        next_slice_idx = int(info.get("round_next_slice_idx") or 0)
+        process_seq = info.get("active_round_seq")
+        if next_slice_idx < len(round_slice_req_ids):
+            expected_req_ids = _dedupe_req_ids(round_slice_req_ids[next_slice_idx])
+            if expected_req_ids and actual_req_ids and not _same_req_id_list(expected_req_ids, actual_req_ids):
+                req_ids = list(actual_req_ids)
+            else:
+                req_ids = list(expected_req_ids or actual_req_ids)
+            if next_slice_idx < len(round_suffix_req_ids):
+                suffix_req_ids = _dedupe_req_ids(round_suffix_req_ids[next_slice_idx])
+                if suffix_req_ids:
+                    suffix_req_id_keys = {str(rid) for rid in suffix_req_ids}
+                    if req_ids and all(str(rid) in suffix_req_id_keys for rid in req_ids):
+                        sched_req_ids = list(suffix_req_ids)
+                    elif not req_ids:
+                        sched_req_ids = list(suffix_req_ids)
+                    else:
+                        sched_req_ids = list(req_ids)
+                else:
+                    sched_req_ids = list(req_ids)
+            else:
+                sched_req_ids = list(req_ids)
+            info["round_next_slice_idx"] = next_slice_idx + 1
         else:
-            info["current_process_req_ids"] = []
-            info["current_process_size"] = 0
-    _flush_pending_output_handler_sched_events(task=task, req_ids=req_ids)
+            if req_ids:
+                info["process_seq"] = int(info.get("process_seq") or 0) + 1
+                process_seq = info["process_seq"]
+                info["active_round_seq"] = process_seq
+            else:
+                process_seq = info.get("active_round_seq")
+        info["current_process_req_ids"] = list(req_ids)
+        info["current_process_size"] = len(req_ids)
+    _flush_pending_output_handler_sched_events(task=task, req_ids=sched_req_ids)
     return req_ids, process_seq
 
 
@@ -746,7 +902,8 @@ def patch_asyncio_scheduler():
 
 def patch_vllm():
     try:
-        from vllm.v1.engine.async_llm import AsyncLLM
+        from vllm.v1.engine import async_llm as async_llm_module
+        AsyncLLM = async_llm_module.AsyncLLM
         from vllm.v1.engine.processor import Processor
         from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
         from vllm.v1.engine import core_client as core_client_module
@@ -769,6 +926,10 @@ def patch_vllm():
     def _is_patched(func):
         return getattr(func, "_de_latency_req_stage_wrapped", False)
 
+    output_chunk_size = getattr(async_llm_module, "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", None)
+    iteration_stats_cls = getattr(async_llm_module, "IterationStats", None)
+    async_llm_logger = getattr(async_llm_module, "logger", patch_logger)
+
     # 1) Patch AsyncLLM._run_output_handler: generate() 早期初始化阶段
     if hasattr(AsyncLLM, "_run_output_handler"):
         original_run_output_handler = AsyncLLM._run_output_handler
@@ -777,24 +938,102 @@ def patch_vllm():
             def patched_run_output_handler(self, *args, **kwargs):
                 rid, rname = get_request_ctx_from_context(None)
                 start_ns = time.time_ns()
-                prev_output_handler = getattr(self, "output_handler", None)
                 try:
-                    return original_run_output_handler(self, *args, **kwargs)
+                    if hasattr(self, "process_engine_outputs"):
+                        prev_output_handler = getattr(self, "output_handler", None)
+                        try:
+                            return original_run_output_handler(self, *args, **kwargs)
+                        finally:
+                            output_handler_task = getattr(self, "output_handler", None)
+                            if output_handler_task is not None and output_handler_task is not prev_output_handler:
+                                _register_task_context(
+                                    output_handler_task,
+                                    request_id=None,
+                                    request_name="output_handler",
+                                    task_kind="output_handler",
+                                    extra={
+                                        "pending_sched_events": [],
+                                        "current_process_req_ids": [],
+                                        "current_process_size": 0,
+                                        "process_seq": 0,
+                                        "active_round_seq": None,
+                                        "round_slice_req_ids": [],
+                                        "round_suffix_req_ids": [],
+                                        "round_next_slice_idx": 0,
+                                    },
+                                )
+
+                    if getattr(self, "output_handler", None) is not None:
+                        return None
+                    if iteration_stats_cls is None or not hasattr(self, "engine_core") or not hasattr(self, "output_processor"):
+                        return original_run_output_handler(self, *args, **kwargs)
+
+                    engine_core = self.engine_core
+                    output_processor = self.output_processor
+                    log_stats = getattr(self, "log_stats", False)
+                    logger_manager = getattr(self, "logger_manager", None)
+
+                    async def output_handler():
+                        try:
+                            while True:
+                                outputs = await engine_core.get_output_async()
+                                raw_outputs = getattr(outputs, "outputs", None)
+                                try:
+                                    num_outputs = len(raw_outputs) if raw_outputs is not None else 0
+                                except TypeError:
+                                    num_outputs = 0
+                                iteration_stats = (
+                                    iteration_stats_cls() if (log_stats and num_outputs) else None
+                                )
+                                output_slices = _chunk_output_handler_slices(outputs, output_chunk_size)
+                                _set_output_handler_round_slices(output_slices)
+                                try:
+                                    for idx, outputs_slice in enumerate(output_slices):
+                                        processed_outputs = output_processor.process_outputs(
+                                            outputs_slice,
+                                            outputs.timestamp,
+                                            iteration_stats,
+                                        )
+                                        assert not processed_outputs.request_outputs
+
+                                        if idx + 1 < len(output_slices):
+                                            await asyncio.sleep(0)
+
+                                        await engine_core.abort_requests_async(
+                                            processed_outputs.reqs_to_abort,
+                                        )
+                                finally:
+                                    _clear_output_handler_round_state()
+
+                                _record_output_handler_iteration_stats(
+                                    logger_manager,
+                                    outputs,
+                                    iteration_stats,
+                                )
+
+                        except Exception as e:
+                            async_llm_logger.exception("Engine output handler hit an error.")
+                            output_processor.propagate_error(e)
+
+                    self.output_handler = asyncio.create_task(output_handler())
+                    _register_task_context(
+                        self.output_handler,
+                        request_id=None,
+                        request_name="output_handler",
+                        task_kind="output_handler",
+                        extra={
+                            "pending_sched_events": [],
+                            "current_process_req_ids": [],
+                            "current_process_size": 0,
+                            "process_seq": 0,
+                            "active_round_seq": None,
+                            "round_slice_req_ids": [],
+                            "round_suffix_req_ids": [],
+                            "round_next_slice_idx": 0,
+                        },
+                    )
+                    return None
                 finally:
-                    output_handler_task = getattr(self, "output_handler", None)
-                    if output_handler_task is not None and output_handler_task is not prev_output_handler:
-                        _register_task_context(
-                            output_handler_task,
-                            request_id=None,
-                            request_name="output_handler",
-                            task_kind="output_handler",
-                            extra={
-                                "pending_sched_events": [],
-                                "current_process_req_ids": [],
-                                "current_process_size": 0,
-                                "process_seq": 0,
-                            },
-                        )
                     emit_stage_duration(
                         stage="async_llm._run_output_handler",
                         start_ns=start_ns,
@@ -806,9 +1045,32 @@ def patch_vllm():
             AsyncLLM._run_output_handler = _mark_patched(patched_run_output_handler)
             patch_logger.info("[VLLM_PATCH] Patched AsyncLLM._run_output_handler.")
 
-    # 1.5) Patch OutputProcessor.process_outputs:
-    # output_handler 在每次 resume 后，这里会消化该轮/该 chunk 的输出，
-    # 用它来把 pending 的 output_handler 调度排队时间归因到当前轮 req_ids。
+    # 1.5) Patch AsyncLLM.process_engine_outputs:
+    # 对支持该方法的版本，在整轮 slices 已知时预先登记 suffix 请求集合，
+    # 让后续每次 process_outputs 都能把 scheduler wait 归因给“当前及后续未处理”的请求。
+    if hasattr(AsyncLLM, "process_engine_outputs"):
+        original_process_engine_outputs = AsyncLLM.process_engine_outputs
+        if not _is_patched(original_process_engine_outputs):
+            @wraps(original_process_engine_outputs)
+            async def patched_process_engine_outputs(self, *args, **kwargs):
+                outputs = get_arg_value(original_process_engine_outputs, "outputs", args, kwargs)
+                if outputs is None:
+                    outputs = get_arg_value(original_process_engine_outputs, "engine_outputs", args, kwargs)
+                if outputs is None:
+                    outputs = get_arg_value(original_process_engine_outputs, "engine_core_outputs", args, kwargs)
+                output_slices = _chunk_output_handler_slices(outputs, output_chunk_size)
+                _set_output_handler_round_slices(output_slices)
+                try:
+                    return await original_process_engine_outputs(self, *args, **kwargs)
+                finally:
+                    _clear_output_handler_round_state()
+
+            AsyncLLM.process_engine_outputs = _mark_patched(patched_process_engine_outputs)
+            patch_logger.info("[VLLM_PATCH] Patched AsyncLLM.process_engine_outputs.")
+
+    # 1.6) Patch OutputProcessor.process_outputs:
+    # output_handler 的 scheduler wait 在外层 round 上准备 req 集合；
+    # 到每个 slice 真正处理时，再消费对应的 suffix 请求集合并记录 exec。
     if hasattr(OutputProcessor, "process_outputs"):
         original_process_outputs = OutputProcessor.process_outputs
         if not _is_patched(original_process_outputs):

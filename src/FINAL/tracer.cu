@@ -86,6 +86,70 @@ static int g_zmq_linger_ms = 30000;
 static int g_zmq_send_retry = 200;
 static int g_zmq_send_retry_us = 50;
 
+static bool should_flush_after_api(CUpti_CallbackDomain domain, CUpti_CallbackId cbid) {
+    if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {
+        switch (cbid) {
+            case CUPTI_RUNTIME_TRACE_CBID_cudaEventSynchronize_v3020:
+            case CUPTI_RUNTIME_TRACE_CBID_cudaStreamSynchronize_v3020:
+            case CUPTI_RUNTIME_TRACE_CBID_cudaDeviceSynchronize_v3020:
+            case CUPTI_RUNTIME_TRACE_CBID_cudaEventQuery_v3020:
+            case CUPTI_RUNTIME_TRACE_CBID_cudaStreamQuery_v3020:
+                return true;
+            default:
+                break;
+        }
+    }
+    if (domain == CUPTI_CB_DOMAIN_DRIVER_API) {
+        switch (cbid) {
+            case CUPTI_DRIVER_TRACE_CBID_cuEventSynchronize:
+            case CUPTI_DRIVER_TRACE_CBID_cuStreamSynchronize:
+            case CUPTI_DRIVER_TRACE_CBID_cuCtxSynchronize:
+            case CUPTI_DRIVER_TRACE_CBID_cuEventQuery:
+            case CUPTI_DRIVER_TRACE_CBID_cuStreamQuery:
+                return true;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
+static void flush_cupti_after_sync_api(CUpti_CallbackDomain domain, CUpti_CallbackId cbid) {
+    if (!should_flush_after_api(domain, cbid)) {
+        return;
+    }
+
+    CUptiResult status = cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
+    if (status != CUPTI_SUCCESS) {
+        const char *errstr = NULL;
+        cuptiGetResultString(status, &errstr);
+        tracer_log("Activity flush after sync API failed for domain=%u cbid=%u: %s",
+                   (unsigned)domain, (unsigned)cbid, errstr ? errstr : "unknown");
+        return;
+    }
+}
+
+static void try_sync_current_cuda_context() {
+    CUcontext ctx = nullptr;
+    CUresult get_ctx_res = cuCtxGetCurrent(&ctx);
+    if (get_ctx_res != CUDA_SUCCESS) {
+        tracer_log("[DEINIT] cuCtxGetCurrent failed with error %d", (int)get_ctx_res);
+        return;
+    }
+    if (ctx == nullptr) {
+        tracer_log("[DEINIT] No current CUDA context, skip cuCtxSynchronize.");
+        return;
+    }
+
+    tracer_log("[DEINIT] Synchronizing current CUDA context before flushing CUPTI activity...");
+    CUresult sync_res = cuCtxSynchronize();
+    if (sync_res != CUDA_SUCCESS) {
+        tracer_log("[DEINIT] cuCtxSynchronize failed with error %d", (int)sync_res);
+        return;
+    }
+    tracer_log("[DEINIT] Current CUDA context synchronized.");
+}
+
 static int read_env_int(const char *key, int default_value, int min_value, int max_value) {
     const char *s = getenv(key);
     if (!s || !*s) return default_value;
@@ -285,6 +349,13 @@ void CUPTIAPI api_callback(
           std::lock_guard<std::mutex> lock(g_corr_mutex);
           g_corr_to_ostid_map[correlationId] = os_tid;
       }
+      return;
+  }
+
+  if (cbdata->callbackSite == CUPTI_API_EXIT) {
+      // 在同步/查询 API 返回时，相关 GPU 工作通常已经完成，且 CUDA context 仍然有效。
+      // 这里主动 flush，可避免等到进程退出时才拿到尾部 activity，进而减少 start/end=0 的记录。
+      flush_cupti_after_sync_api(domain, cbid);
   }
 }
 
@@ -478,8 +549,24 @@ void deinitCuptiTracer() {
     tracer_log("--- [DEINIT] libtracer.so unloading from PID %d ---", getpid());
 
     // --------------------------------------------------------------------
-    // 步骤 1: 禁用所有 Activity Kinds
-    // 这是最先要做的事情之一，告诉CUPTI不要再产生新的活动记录。
+    // 步骤 1: 尽量等待当前 CUDA context 上的异步工作完成
+    // 末尾几个 step 常常在 Python 侧 execute_model 返回后，GPU 上还有尾巴。
+    // 如果直接 disable/flush，CUPTI 可能只能吐出 start/end=0 的未完成 kernel 记录。
+    // --------------------------------------------------------------------
+    try_sync_current_cuda_context();
+
+
+    // --------------------------------------------------------------------
+    // 步骤 2: 先 Flush 一次所有剩余的 Activity 记录
+    // 先 drain 已完成的活动，再进入 disable 流程，避免尾部 kernel 只有 correlationId
+    // 却拿不到完整时间戳。
+    // --------------------------------------------------------------------
+    tracer_log("[DEINIT] Flushing all remaining CUPTI activity...");
+    CUPTI_CALL(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED));
+    tracer_log("[DEINIT] Flushed all activity.");
+
+    // --------------------------------------------------------------------
+    // 步骤 3: 禁用所有 Activity Kinds，阻止后续再生成新的记录
     // 这与初始化的启用顺序相反。
     // --------------------------------------------------------------------
     tracer_log("[DEINIT] Disabling Activity kinds...");
@@ -490,18 +577,16 @@ void deinitCuptiTracer() {
     CUPTI_CALL(cuptiActivityDisable(CUPTI_ACTIVITY_KIND_KERNEL));
     tracer_log("[DEINIT] Activity kinds disabled.");
 
-
     // --------------------------------------------------------------------
-    // 步骤 2: Flush 所有剩余的 Activity 记录
-    // 确保在关闭追踪之前，处理完所有已经产生但在缓冲区中的数据。
+    // 步骤 4: Disable 后再强制 Flush 一次，带走收尾阶段残留到缓冲区里的记录。
     // --------------------------------------------------------------------
-    tracer_log("[DEINIT] Flushing all remaining CUPTI activity...");
+    tracer_log("[DEINIT] Final CUPTI flush after disabling activity kinds...");
     CUPTI_CALL(cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED));
-    tracer_log("[DEINIT] Flushed all activity.");
+    tracer_log("[DEINIT] Final flush complete.");
 
 
     // --------------------------------------------------------------------
-    // 步骤 3: 取消订阅 Callback API
+    // 步骤 5: 取消订阅 Callback API
     // 告诉CUPTI，我们不再对任何同步回调感兴趣。
     // 这是非常关键的一步，防止卸载后出现悬空指针调用。
     // --------------------------------------------------------------------
@@ -515,7 +600,7 @@ void deinitCuptiTracer() {
 
 
     // --------------------------------------------------------------------
-    // 步骤 4: 清理外部资源，例如 ZMQ
+    // 步骤 6: 清理外部资源，例如 ZMQ
     // 此时所有CUPTI活动都已停止，可以安全地关闭网络连接。
     // --------------------------------------------------------------------
     if (g_zmq_push) {

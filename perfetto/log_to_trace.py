@@ -1595,10 +1595,6 @@ def process_logs(input_file, output_file):
 
     # --- 4. Scheduler 处理 (保持原逻辑) ---
     print("Processing Scheduler Events...")
-    QUEUE_PID = 1000
-    QUEUE_TID = 0
-    trace_events.append({"name": "process_name", "ph": "M", "pid": QUEUE_PID, "args": {"name": "Scheduler Queue"}})
-    
     req_enqueue_map = {}
     req_first_dispatch_done = set()
     queue_intervals_map = defaultdict(list)  # 可视化用（墙上时间）
@@ -1608,50 +1604,16 @@ def process_logs(input_file, output_file):
     req_dispatch_intervals_map = defaultdict(list)  # 请求每次被调度执行的区间（out_rpc -> step_ready）
     req_dispatch_phase_ns = defaultdict(lambda: defaultdict(int))
     req_dispatch_phase_count = defaultdict(lambda: defaultdict(int))
-    
-    # 3.1 入队
-    for item in scheduler_events:
-        if item['type'] == 'req_enqueue_scheduler':
-            p = item['payload']
-            rid = p.get('req_id')
-            ts = p.get('timestamp_ns')
-            if rid and ts:
-                if rid not in req_enqueue_map:
-                    req_enqueue_map[rid] = ts
-                flow_id = hash(rid) & 0x7FFFFFFF
-                
-                trace_events.append(create_perfetto_event(
-                    f"Enqueue: {rid[:8]}", "scheduler", "i", ts, 0, QUEUE_PID, QUEUE_TID, {"full_id": rid}
-                ))
-                trace_events.append(create_flow_event("s", ts, QUEUE_PID, QUEUE_TID, flow_id))
 
-    # 3.2 调度出队 (RPC)
+    # 3.1 只保留事件到请求级区间的计算，不再生成 category=scheduler 的顶层点/流。
     for item in scheduler_events:
-        if item['type'] == 'req_scheduler_out_rpc':
-            p = item['payload']
-            ts = p.get('timestamp_ns')
-            for rid in p.get('req_ids', []):
-                if rid in req_enqueue_map:
-                    flow_id = hash(rid) & 0x7FFFFFFF
-                    trace_events.append(create_perfetto_event(
-                        f"Execute: {rid[:8]}", "scheduler", "i", ts, 0, QUEUE_PID, QUEUE_TID, {"full_id": rid}
-                    ))
-                    # 't' step, 'f' finish. 这里用 t 表示流转到 Worker
-                    trace_events.append(create_flow_event("t", ts, QUEUE_PID, QUEUE_TID, flow_id))
-    
-    # 3.3 Ready
-    for item in scheduler_events:
-        if item['type'] == 'req_step_ready':
-            p = item['payload']
-            ts = p.get('timestamp_ns')
-            for rid in p.get('req_ids', []):
-                if rid in req_enqueue_map:
-                    flow_id = hash(rid) & 0x7FFFFFFF
-                    trace_events.append(create_perfetto_event(
-                        f"Ready: {rid[:8]}", "scheduler", "i", ts, 0, QUEUE_PID, QUEUE_TID, {"full_id": rid}
-                    ))
-                    # 回到了 Scheduler 视野
-                    trace_events.append(create_flow_event("t", ts, QUEUE_PID, QUEUE_TID, flow_id))
+        if item['type'] != 'req_enqueue_scheduler':
+            continue
+        p = item['payload']
+        rid = p.get('req_id')
+        ts = p.get('timestamp_ns')
+        if rid and ts and rid not in req_enqueue_map:
+            req_enqueue_map[rid] = ts
 
     # 3.4 排队时间计算（顺序配对）：
     # 初次：req_scheduler_out_rpc - req_enqueue_scheduler
