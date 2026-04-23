@@ -5,15 +5,31 @@ import os
 import threading
 import inspect
 import time
-import zmq
 import json
 from typing import Dict, List, Any
 from importlib.abc import MetaPathFinder, Loader
 from importlib.util import spec_from_loader
+from monkeypatch_runtime import (
+    is_enabled as monkeypatch_enabled,
+    start_control_server as start_monkeypatch_control_server,
+)
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [TRACE] %(message)s")
 logger = logging.getLogger("VLLM_HOOK")
+_CONTROL_SCRIPT_NAMES = {"cupti_ctl.py", "trace_ctl.py"}
+_SKIP_TRACE_BOOTSTRAP = (
+    os.getenv("DE_LATENCY_DISABLE_SITECUSTOMIZE", "0") == "1" or
+    os.path.basename(sys.argv[0]) in _CONTROL_SCRIPT_NAMES
+)
+try:
+    import zmq
+except ModuleNotFoundError:
+    if not _SKIP_TRACE_BOOTSTRAP:
+        raise
+    zmq = None
+if not _SKIP_TRACE_BOOTSTRAP:
+    start_monkeypatch_control_server()
 
 # =============================================================================
 # Part 1: 基础设施层 (Infrastructure)
@@ -31,6 +47,8 @@ class TraceSender:
 
     @classmethod
     def get_socket(cls):
+        if zmq is None:
+            return None
         if not hasattr(cls._thread_local, "sock"):
             try:
                 ctx = zmq.Context()
@@ -53,6 +71,8 @@ class TraceSender:
         发送 Trace 事件。
         flags=zmq.DONTWAIT: 关键设置，如果队列满则丢弃，绝对不阻塞 vLLM 推理线程。
         """
+        if not monkeypatch_enabled():
+            return
         sock = cls.get_socket()
         if sock:
             try:
@@ -264,6 +284,8 @@ def _pop_core_preprocess_done(req_id: str):
 
 
 def emit_req_stage(stage: str, start_ns: int, end_ns: int, request_id=None, request_name=None, extra=None):
+    if not monkeypatch_enabled():
+        return
     if start_ns is None or end_ns is None:
         return
     if end_ns < start_ns:
@@ -287,6 +309,8 @@ def emit_req_stage(stage: str, start_ns: int, end_ns: int, request_id=None, requ
 
 
 def emit_worker_process_ready(stage):
+    if not monkeypatch_enabled():
+        return
     pid = os.getpid()
     with _WORKER_READY_LOCK:
         if pid in _WORKER_READY_PIDS:
@@ -1067,6 +1091,8 @@ def patch_worker_base(module):
 
 #整个程序的入口，一旦执行了这个insert的进程都会在每次import的时候自动执行上方的find_spec
 #如果find_spec返回成功则执行exec_module方法
-sys.meta_path.insert(0, VllmUniversalPatcher())
-
-logger.info(">>> [TRACE SYSTEM] VllmUniversalPatcher installed. Ready to intercept.")
+if not _SKIP_TRACE_BOOTSTRAP:
+    sys.meta_path.insert(0, VllmUniversalPatcher())
+    logger.info(">>> [TRACE SYSTEM] VllmUniversalPatcher installed. Ready to intercept.")
+else:
+    logger.info(">>> [TRACE SYSTEM] sitecustomize bootstrap skipped for control/utility process.")

@@ -6,7 +6,10 @@
 *.log
 *.dSYM
 *.json
+__pycache__/
 *.pyc
+*.gz
 *.svg
 *.html
 .codex
+*.pt.trace.json.gz

@@ -10,6 +10,10 @@ import threading
 import weakref
 import zmq
 from encode import make_metadata, metadata_to_bytes 
+from monkeypatch_runtime import (
+    is_enabled as monkeypatch_enabled,
+    start_control_server as start_monkeypatch_control_server,
+)
 from request_context import (
     bind_request_context,
     reset_request_context,
@@ -20,6 +24,7 @@ from request_context import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 patch_logger = logging.getLogger("vllm_patch")
 patch_logger.info("--- VLLM Patch Logger Initialized ---")
+start_monkeypatch_control_server()
 
 coroutine_timers = {}
 task_request_ctx = {}
@@ -47,6 +52,8 @@ def _get_native_tid():
         return threading.get_ident()
 
 def send_event(source, event_type, payload=None, extra=None):
+    if not monkeypatch_enabled():
+        return
     meta = make_metadata(source, event_type, extra=extra)
     try:
         # 如果 payload 是结构化数据且小，直接将其合并到 meta（单帧）
@@ -72,6 +79,8 @@ def send_event(source, event_type, payload=None, extra=None):
 
 
 def emit_thread_role(role, extra=None):
+    if not monkeypatch_enabled():
+        return
     pid = os.getpid()
     tid = _get_native_tid()
     key = (pid, tid, role)
@@ -815,6 +824,8 @@ def _patch_loop_class(loop_cls):
 
     @wraps(original_call_soon)
     def patched_call_soon(self, callback, *args, context=None):
+        if not monkeypatch_enabled():
+            return _call_with_optional_context(original_call_soon, self, callback, args, context)
         debug_counters["call_soon_hits"] += 1
         task_obj = _extract_task_from_callback(callback)
         task_id, req_id, req_name = _resolve_schedule_context(task_obj, context)
@@ -841,6 +852,8 @@ def _patch_loop_class(loop_cls):
     if original_call_soon_threadsafe is not None:
         @wraps(original_call_soon_threadsafe)
         def patched_call_soon_threadsafe(self, callback, *args, context=None):
+            if not monkeypatch_enabled():
+                return _call_with_optional_context(original_call_soon_threadsafe, self, callback, args, context)
             debug_counters["call_soon_threadsafe_hits"] += 1
             task_obj = _extract_task_from_callback(callback)
             task_id, req_id, req_name = _resolve_schedule_context(task_obj, context)
@@ -1343,6 +1356,10 @@ def patch_vllm():
 
     @wraps(original_generate)
     async def patched_generate(self, *args, **kwargs):
+        if not monkeypatch_enabled():
+            async for out in original_generate(self, *args, **kwargs):
+                yield out
+            return
         wrapper_start_ns = time.time_ns()
         prompt = get_arg_value(original_generate, "prompt", args, kwargs)
         sampling_params = get_arg_value(original_generate, "sampling_params", args, kwargs)

@@ -21,6 +21,7 @@ static pid_t ebpf_pid = 0;
 #define DEFAULT_EBPF_MONITOR_BIN "ebpf_monitor"
 #define DEFAULT_LIBTRACER_SO "libtracer.so"
 #define DEFAULT_WORKER_PID_FILE "/tmp/tracer_worker_pids"
+#define DEFAULT_CONTROL_STATE_FILE "/tmp/de_latency_control_state"
 
 static const char *env_or_default(const char *name, const char *fallback) {
     const char *value = getenv(name);
@@ -91,6 +92,84 @@ static const char *ipc_path_from_addr(const char *addr) {
         return NULL;
     }
     return strncmp(addr, "ipc://", 6) == 0 ? addr + 6 : NULL;
+}
+
+static int write_control_state_file(
+    const char *path,
+    pid_t controller_pid,
+    pid_t target_pid,
+    pid_t collector_pid_value,
+    pid_t ebpf_pid_value,
+    const char *zmq_addr,
+    const char *worker_pid_file,
+    const char *ebpf_monitor_bin) {
+    char tmp_path[PATH_MAX];
+    FILE *fp = NULL;
+
+    if (!path || !path[0]) {
+        return -1;
+    }
+
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path) < 0 ||
+        strlen(tmp_path) >= sizeof(tmp_path)) {
+        return -1;
+    }
+
+    fp = fopen(tmp_path, "w");
+    if (!fp) {
+        return -1;
+    }
+
+    fprintf(fp, "state_version=1\n");
+    fprintf(fp, "controller_pid=%d\n", (int)controller_pid);
+    fprintf(fp, "target_pid=%d\n", (int)target_pid);
+    fprintf(fp, "collector_pid=%d\n", (int)collector_pid_value);
+    fprintf(fp, "ebpf_pid=%d\n", (int)ebpf_pid_value);
+    fprintf(fp, "zmq_addr=%s\n", zmq_addr ? zmq_addr : "");
+    fprintf(fp, "worker_pid_file=%s\n", worker_pid_file ? worker_pid_file : "");
+    fprintf(fp, "ebpf_monitor_bin=%s\n", ebpf_monitor_bin ? ebpf_monitor_bin : "");
+
+    if (fclose(fp) != 0) {
+        unlink(tmp_path);
+        return -1;
+    }
+
+    if (rename(tmp_path, path) != 0) {
+        unlink(tmp_path);
+        return -1;
+    }
+    return 0;
+}
+
+static void remove_control_state_file(const char *path) {
+    if (path && path[0]) {
+        unlink(path);
+    }
+}
+
+static pid_t read_ebpf_pid_from_control_state(const char *path) {
+    FILE *fp = NULL;
+    char line[256];
+
+    if (!path || !path[0]) {
+        return 0;
+    }
+
+    fp = fopen(path, "r");
+    if (!fp) {
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        int value = 0;
+        if (sscanf(line, "ebpf_pid=%d", &value) == 1 && value > 0) {
+            fclose(fp);
+            return (pid_t)value;
+        }
+    }
+
+    fclose(fp);
+    return 0;
 }
 
 // --- Helper: wait for collector socket ---
@@ -200,6 +279,7 @@ int main(int argc, char **argv) {
     const char *collector_python;
     const char *zmq_addr;
     const char *worker_pid_file;
+    const char *control_state_file;
 
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <program> [args...]\n", argv[0]);
@@ -209,6 +289,7 @@ int main(int argc, char **argv) {
     collector_python = pick_collector_python(argv[1]);
     zmq_addr = env_or_default("TRACER_ZMQ_ADDR", DEFAULT_ZMQ_ADDR);
     worker_pid_file = env_or_default("TRACER_WORKER_PID_FILE", DEFAULT_WORKER_PID_FILE);
+    control_state_file = env_or_default("DE_LATENCY_CONTROL_STATE_FILE", DEFAULT_CONTROL_STATE_FILE);
 
     if (resolve_self_dir(controller_dir, sizeof(controller_dir)) != 0) {
         perror("resolve_self_dir");
@@ -291,6 +372,19 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr, "warning: eBPF monitor failed to start; continue without scheduler tracing\n");
     }
+    if (write_control_state_file(
+            control_state_file,
+            getpid(),
+            child_pid,
+            collector_pid,
+            ebpf_pid,
+            zmq_addr,
+            worker_pid_file,
+            ebpf_monitor_bin) != 0) {
+        fprintf(stderr, "warning: failed to write control state file: %s\n", control_state_file);
+    } else {
+        printf("Control state file: %s\n", control_state_file);
+    }
 
     printf("Waiting for target to finish...\n");
 
@@ -320,6 +414,14 @@ cleanup:
         kill(ebpf_pid, SIGTERM);
         waitpid(ebpf_pid, NULL, 0);
     }
+    {
+        pid_t current_ebpf_pid = read_ebpf_pid_from_control_state(control_state_file);
+        if (current_ebpf_pid > 0 && current_ebpf_pid != ebpf_pid) {
+            kill(current_ebpf_pid, SIGTERM);
+            waitpid(current_ebpf_pid, NULL, 0);
+        }
+    }
+    remove_control_state_file(control_state_file);
 
     printf("Controller exiting.\n");
     return 0;
