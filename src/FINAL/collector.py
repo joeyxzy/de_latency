@@ -53,6 +53,15 @@ _known_exact_tids = set()
 _stop_requested = False
 
 
+def _safe_write_text(path, content):
+    try:
+        path.write_text(content, encoding="utf-8")
+        return True
+    except OSError as exc:
+        print(f"[collector] warning: failed to write {path}: {exc}", flush=True)
+        return False
+
+
 def _handle_stop_signal(signum, _frame):
     global _stop_requested
     _stop_requested = True
@@ -121,7 +130,7 @@ def _persist_target_file():
     lines = [str(x) for x in sorted(_known_worker_pids)]
     lines.extend(f"tid:{x}" for x in sorted(_known_exact_tids))
     content = ("\n".join(lines) + "\n") if lines else ""
-    TARGET_FILE.write_text(content, encoding="utf-8")
+    _safe_write_text(TARGET_FILE, content)
 
 
 def _persist_worker_pid(pid):
@@ -240,6 +249,7 @@ def collector():
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, _handle_stop_signal)
     signal.signal(signal.SIGINT, _handle_stop_signal)
-    CUPTI_LOG.write_text("", encoding="utf-8")
-    TARGET_FILE.write_text("", encoding="utf-8")
+    if not _safe_write_text(CUPTI_LOG, ""):
+        raise SystemExit(1)
+    _safe_write_text(TARGET_FILE, "")
     collector()

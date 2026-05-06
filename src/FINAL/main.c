@@ -28,6 +28,27 @@ static const char *env_or_default(const char *name, const char *fallback) {
     return (value && value[0]) ? value : fallback;
 }
 
+static int env_enabled(const char *name, int default_value) {
+    const char *value = getenv(name);
+
+    if (!value || !value[0]) {
+        return default_value;
+    }
+    if (strcmp(value, "0") == 0 ||
+        strcasecmp(value, "false") == 0 ||
+        strcasecmp(value, "off") == 0 ||
+        strcasecmp(value, "no") == 0) {
+        return 0;
+    }
+    if (strcmp(value, "1") == 0 ||
+        strcasecmp(value, "true") == 0 ||
+        strcasecmp(value, "on") == 0 ||
+        strcasecmp(value, "yes") == 0) {
+        return 1;
+    }
+    return default_value;
+}
+
 static const char *pick_collector_python(const char *target_program) {
     const char *configured = getenv("DE_LATENCY_COLLECTOR_PY");
     const char *base = NULL;
@@ -190,14 +211,22 @@ static int start_collector_process(
     const char *collector_python,
     const char *collector_script,
     const char *zmq_addr) {
-    pid_t pid = fork();
     const char *socket_path = ipc_path_from_addr(zmq_addr);
+    pid_t pid;
+
+    if (socket_path && unlink(socket_path) != 0 && errno != ENOENT) {
+        fprintf(stderr, "warning: failed to remove stale collector socket %s: %s\n",
+                socket_path, strerror(errno));
+    }
+
+    pid = fork();
     if (pid < 0) {
         perror("fork collector");
         return 0;
     }
     if (pid == 0) {
         setenv("TRACER_ZMQ_ADDR", zmq_addr, 1);
+        setenv("DE_LATENCY_DISABLE_SITECUSTOMIZE", "1", 1);
         execlp(collector_python, collector_python, collector_script, (char *)NULL);
         perror("execl collector");
         _exit(127);
@@ -261,6 +290,7 @@ void shutdown_zmq_sender(void *ctx, void *sock) {
 static void sigint_handler(int sig) {
     exiting = 1;
     if (child_pid > 0) {
+        kill(-child_pid, SIGTERM);
         kill(child_pid, SIGTERM);
     }
     if (ebpf_pid > 0) {
@@ -280,6 +310,7 @@ int main(int argc, char **argv) {
     const char *zmq_addr;
     const char *worker_pid_file;
     const char *control_state_file;
+    int ebpf_start_enabled;
 
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <program> [args...]\n", argv[0]);
@@ -290,6 +321,7 @@ int main(int argc, char **argv) {
     zmq_addr = env_or_default("TRACER_ZMQ_ADDR", DEFAULT_ZMQ_ADDR);
     worker_pid_file = env_or_default("TRACER_WORKER_PID_FILE", DEFAULT_WORKER_PID_FILE);
     control_state_file = env_or_default("DE_LATENCY_CONTROL_STATE_FILE", DEFAULT_CONTROL_STATE_FILE);
+    ebpf_start_enabled = env_enabled("TRACER_EBPF_START_ENABLED", 1);
 
     if (resolve_self_dir(controller_dir, sizeof(controller_dir)) != 0) {
         perror("resolve_self_dir");
@@ -355,22 +387,34 @@ int main(int argc, char **argv) {
 
     if (child_pid == 0) {
         // Child: inject libtracer.so and exec
+        if (setpgid(0, 0) != 0) {
+            perror("setpgid child");
+        }
         setenv("LD_PRELOAD", libtracer_path, 1);
         setenv("TRACER_ZMQ_ADDR", zmq_addr, 1);
         execvp(argv[1], &argv[1]);
         perror("execvp");
         _exit(127);
     }
+    if (setpgid(child_pid, child_pid) != 0 && errno != EACCES) {
+        perror("setpgid parent");
+    }
 
     printf("Launched target process PID: %d\n", child_pid);
     printf("Collector PID: %d\n", collector_pid);
 
-    // 4. Start standalone eBPF monitor automatically
-    ebpf_pid = start_ebpf_monitor_process(ebpf_monitor_bin, child_pid, worker_pid_file);
-    if (ebpf_pid > 0) {
-        printf("eBPF monitor PID: %d (auto mode)\n", ebpf_pid);
+    // 4. Optionally start standalone eBPF monitor automatically
+    if (ebpf_start_enabled) {
+        ebpf_pid = start_ebpf_monitor_process(ebpf_monitor_bin, child_pid, worker_pid_file);
+        if (ebpf_pid > 0) {
+            printf("eBPF monitor PID: %d (auto mode)\n", ebpf_pid);
+        } else {
+            fprintf(stderr, "warning: eBPF monitor failed to start; continue without scheduler tracing\n");
+        }
     } else {
-        fprintf(stderr, "warning: eBPF monitor failed to start; continue without scheduler tracing\n");
+        ebpf_pid = 0;
+        printf("eBPF monitor auto-start disabled by TRACER_EBPF_START_ENABLED=%s\n",
+               getenv("TRACER_EBPF_START_ENABLED"));
     }
     if (write_control_state_file(
             control_state_file,
@@ -403,6 +447,7 @@ cleanup:
 
     // Ensure child is cleaned up
     if (child_pid > 0) {
+        kill(-child_pid, SIGTERM);
         kill(child_pid, SIGTERM);
         waitpid(child_pid, NULL, 0);
     }

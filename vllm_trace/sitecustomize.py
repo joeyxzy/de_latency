@@ -17,7 +17,7 @@ from monkeypatch_runtime import (
 # 配置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [TRACE] %(message)s")
 logger = logging.getLogger("VLLM_HOOK")
-_CONTROL_SCRIPT_NAMES = {"cupti_ctl.py", "trace_ctl.py"}
+_CONTROL_SCRIPT_NAMES = {"collector.py", "cupti_ctl.py", "trace_ctl.py"}
 _SKIP_TRACE_BOOTSTRAP = (
     os.getenv("DE_LATENCY_DISABLE_SITECUSTOMIZE", "0") == "1" or
     os.path.basename(sys.argv[0]) in _CONTROL_SCRIPT_NAMES
@@ -29,7 +29,10 @@ except ModuleNotFoundError:
         raise
     zmq = None
 if not _SKIP_TRACE_BOOTSTRAP:
-    start_monkeypatch_control_server()
+    try:
+        start_monkeypatch_control_server()
+    except OSError as exc:
+        logger.warning("monkeypatch control bootstrap failed: %s", exc)
 
 # =============================================================================
 # Part 1: 基础设施层 (Infrastructure)

@@ -10,9 +10,11 @@ _lock = threading.Lock()
 _server_thread = None
 _server_socket = None
 _server_started = False
+_server_start_failed_pid = 0
 _stop_event = threading.Event()
 _control_dir = os.getenv("TRACER_MONKEYPATCH_CONTROL_DIR", "/tmp")
-_socket_path = os.path.join(_control_dir, f"de_latency_monkeypatch_{os.getpid()}.sock")
+_process_pid = os.getpid()
+_socket_path = os.path.join(_control_dir, f"de_latency_monkeypatch_{_process_pid}.sock")
 _poll_timeout_s = max(0.05, float(os.getenv("TRACER_MONKEYPATCH_CONTROL_POLL_TIMEOUT_S", "0.5")))
 _backlog = max(1, int(os.getenv("TRACER_MONKEYPATCH_CONTROL_BACKLOG", "8")))
 _enabled = os.getenv("TRACER_MONKEYPATCH_START_ENABLED", "1").strip().lower() not in {
@@ -24,16 +26,65 @@ _enabled = os.getenv("TRACER_MONKEYPATCH_START_ENABLED", "1").strip().lower() no
 _generation = 1 if _enabled else 0
 
 
+def _socket_path_for_pid(pid):
+    return os.path.join(_control_dir, f"de_latency_monkeypatch_{pid}.sock")
+
+
+def _reset_after_fork_locked(pid):
+    global _server_socket, _server_thread, _server_started, _server_start_failed_pid
+    global _process_pid, _socket_path
+
+    inherited_socket = _server_socket
+    _server_socket = None
+    _server_thread = None
+    _server_started = False
+    _server_start_failed_pid = 0
+    _process_pid = pid
+    _socket_path = _socket_path_for_pid(pid)
+    _stop_event.clear()
+
+    if inherited_socket is not None:
+        try:
+            inherited_socket.close()
+        except OSError:
+            pass
+
+
+def _refresh_process_identity():
+    pid = os.getpid()
+    if pid == _process_pid:
+        return
+    with _lock:
+        if pid != _process_pid:
+            _reset_after_fork_locked(pid)
+
+
+def _after_fork_child():
+    _reset_after_fork_locked(os.getpid())
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_child)
+
+
 def is_enabled():
+    _refresh_process_identity()
+    if not _server_started and _server_start_failed_pid != os.getpid():
+        try:
+            start_control_server()
+        except OSError as exc:
+            _logger.warning("monkeypatch control start failed in pid=%s: %s", os.getpid(), exc)
     with _lock:
         return _enabled
 
 
 def get_socket_path():
+    _refresh_process_identity()
     return _socket_path
 
 
 def get_status():
+    _refresh_process_identity()
     with _lock:
         return {
             "enabled": _enabled,
@@ -107,8 +158,9 @@ def _server_loop():
 
 
 def start_control_server():
-    global _server_socket, _server_thread, _server_started
+    global _server_socket, _server_thread, _server_started, _server_start_failed_pid
 
+    _refresh_process_identity()
     with _lock:
         if _server_started:
             return _socket_path
@@ -131,6 +183,7 @@ def start_control_server():
             server.listen(_backlog)
             os.chmod(_socket_path, 0o600)
         except OSError:
+            _server_start_failed_pid = os.getpid()
             server.close()
             raise
 
@@ -143,6 +196,7 @@ def start_control_server():
         )
         _server_thread.start()
         _server_started = True
+        _server_start_failed_pid = 0
         _logger.info("monkeypatch control listening on %s", _socket_path)
         return _socket_path
 

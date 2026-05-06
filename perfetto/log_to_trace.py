@@ -938,6 +938,24 @@ def process_logs(input_file, output_file):
     all_kernels_map = {}
     eager_kernels = []
 
+    def cupti_corr_key(payload, corr_id=None, pid_override=None):
+        if corr_id is None:
+            corr_id = payload.get("correlationId")
+        pid = pid_override if pid_override is not None else payload.get("pid")
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            pid = 0
+        return (pid, corr_id)
+
+    def cupti_flow_id(payload, corr_id=None, pid_override=None):
+        pid, corr_id = cupti_corr_key(
+            payload,
+            corr_id=corr_id,
+            pid_override=pid_override,
+        )
+        return f"{pid}:{corr_id}"
+
     for entry in raw_events:
         # 处理可能的 TraceSender 格式差异
         if 'meta' in entry:
@@ -1062,9 +1080,10 @@ def process_logs(input_file, output_file):
             if etype in ['runtime', 'driver']:
                 cupti_events.append(payload)
             elif etype in ['kernel', 'memset', 'memcpy']:
-                if corr_id not in all_kernels_map:
-                    all_kernels_map[corr_id] = []
-                all_kernels_map[corr_id].append(payload)
+                kernel_key = cupti_corr_key(payload, corr_id=corr_id)
+                if kernel_key not in all_kernels_map:
+                    all_kernels_map[kernel_key] = []
+                all_kernels_map[kernel_key].append(payload)
                 if payload.get('start_ns', 0) > 0:
                     eager_kernels.append(payload)
 
@@ -1932,12 +1951,17 @@ def process_logs(input_file, output_file):
         corr_id = rt.get('correlationId')
         func_name = rt.get('name', 'cuda_runtime')
         
-        # 查找关联的 Kernel (无论它是在什么时候 launch 的)
-        kernels = all_kernels_map.get(corr_id, [])
+        # 查找同一进程内关联的 Kernel。CUPTI correlationId 不是跨进程全局唯一，
+        # DP 多进程下必须用 (pid, correlationId) 做键，避免一个 runtime
+        # 错连到另一个 EngineCore 进程的 GPU kernel。
+        runtime_corr_key = cupti_corr_key(rt, corr_id=corr_id, pid_override=rt_pid)
+        runtime_flow_id = cupti_flow_id(rt, corr_id=corr_id, pid_override=rt_pid)
+        kernels = all_kernels_map.get(runtime_corr_key, [])
         k_names = [k.get('name', 'unknown') for k in kernels]
         
         args = {
             "correlationId": corr_id,
+            "correlationKey": runtime_flow_id,
             "kernels": "\n".join(k_names[:5]) + ("..." if len(k_names)>5 else ""),
             "is_graph": "graph" in func_name.lower()
         }
@@ -1953,19 +1977,41 @@ def process_logs(input_file, output_file):
         # 哪怕是 CUDAGraph，只要有 correlationId，就尝试连线
         has_eager_kernel = any(k.get('start_ns', 0) > 0 for k in kernels)
         if has_eager_kernel:
-            trace_events.append(create_flow_event("s", rt_start, rt_pid, rt_tid, corr_id))
+            trace_events.append(create_flow_event("s", rt_start, rt_pid, rt_tid, runtime_flow_id))
 
     # --- 5. 画 GPU Kernel ---
     print(f"Processing Eager Kernels ({len(eager_kernels)})...")
+    gpu_track_pid_by_key = {}
+    gpu_track_names_emitted = set()
+
+    def get_gpu_track_pid(source_pid, device):
+        # CUPTI 的 deviceId 是进程内 local ordinal。DP 多进程时，两个
+        # EngineCore 可能都看到 deviceId=0，所以轨道必须同时按 pid 区分。
+        try:
+            source_pid = int(source_pid)
+        except (TypeError, ValueError):
+            source_pid = 0
+        try:
+            device = int(device)
+        except (TypeError, ValueError):
+            device = 0
+
+        key = (source_pid, device)
+        if key not in gpu_track_pid_by_key:
+            gpu_track_pid_by_key[key] = 9000 + len(gpu_track_pid_by_key)
+        return gpu_track_pid_by_key[key], key
+
     for k in eager_kernels:
         start = k['start_ns']
         end = k['end_ns']
         corr_id = k.get('correlationId')
         stream = k.get('streamId', 0)
         device = k.get('deviceId', 0)
+        source_pid = k.get('pid', 0)
         
-        # 虚拟 PID 用于区分 GPU
-        gpu_pid = 9000 + device
+        # 虚拟 PID 用于区分 GPU 执行轨道。这里用 (source_pid, local device)
+        # 而不是单独 deviceId，避免 DP0/DP1 的 local GPU 0 被合并到一条轴。
+        gpu_pid, gpu_key = get_gpu_track_pid(source_pid, device)
         
         trace_events.append(create_perfetto_event(
             name=k.get('name', 'kernel'), cat="gpu_kernel", ph="X", ts=start, dur=end-start,
@@ -1973,12 +2019,34 @@ def process_logs(input_file, output_file):
         ))
         
         # 命名轨道
-        trace_events.append({"name": "process_name", "ph": "M", "pid": gpu_pid, "args": {"name": f"GPU {device}"}})
-        trace_events.append({"name": "thread_name", "ph": "M", "pid": gpu_pid, "tid": stream, "args": {"name": f"Stream {stream}"}})
+        if gpu_key not in gpu_track_names_emitted:
+            source_pid_label, device_label = gpu_key
+            trace_events.append({
+                "name": "process_name",
+                "ph": "M",
+                "pid": gpu_pid,
+                "args": {
+                    "name": f"GPU local {device_label} / source pid {source_pid_label}",
+                },
+            })
+            gpu_track_names_emitted.add(gpu_key)
+        trace_events.append({
+            "name": "thread_name",
+            "ph": "M",
+            "pid": gpu_pid,
+            "tid": stream,
+            "args": {"name": f"Stream {stream}"},
+        })
 
         # Flow 终点
         if corr_id:
-            trace_events.append(create_flow_event("f", start, gpu_pid, stream, corr_id))
+            trace_events.append(create_flow_event(
+                "f",
+                start,
+                gpu_pid,
+                stream,
+                cupti_flow_id(k, corr_id=corr_id, pid_override=source_pid),
+            ))
 
     print(f"Processing Request Metric Events ({len(req_metric_events)})...")
     req_metric_mono_to_wall_offsets = []

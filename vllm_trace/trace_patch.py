@@ -24,7 +24,10 @@ from request_context import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 patch_logger = logging.getLogger("vllm_patch")
 patch_logger.info("--- VLLM Patch Logger Initialized ---")
-start_monkeypatch_control_server()
+try:
+    start_monkeypatch_control_server()
+except OSError as exc:
+    patch_logger.warning("monkeypatch control bootstrap failed: %s", exc)
 
 coroutine_timers = {}
 task_request_ctx = {}
