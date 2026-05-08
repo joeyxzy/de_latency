@@ -937,6 +937,9 @@ def process_logs(input_file, output_file):
     # 辅助字典：存储 Kernel 信息
     all_kernels_map = {}
     eager_kernels = []
+    zero_kernel_records = []
+    runtime_name_by_corr = {}
+    cupti_nonzero_max_end_by_pid = defaultdict(int)
 
     def cupti_corr_key(payload, corr_id=None, pid_override=None):
         if corr_id is None:
@@ -948,13 +951,27 @@ def process_logs(input_file, output_file):
             pid = 0
         return (pid, corr_id)
 
-    def cupti_flow_id(payload, corr_id=None, pid_override=None):
+    flow_id_by_corr_key = {}
+
+    def cupti_flow_debug_key(payload, corr_id=None, pid_override=None):
         pid, corr_id = cupti_corr_key(
             payload,
             corr_id=corr_id,
             pid_override=pid_override,
         )
         return f"{pid}:{corr_id}"
+
+    def cupti_flow_id(payload, corr_id=None, pid_override=None):
+        key = cupti_corr_key(
+            payload,
+            corr_id=corr_id,
+            pid_override=pid_override,
+        )
+        flow_id = flow_id_by_corr_key.get(key)
+        if flow_id is None:
+            flow_id = len(flow_id_by_corr_key) + 1
+            flow_id_by_corr_key[key] = flow_id
+        return flow_id
 
     for entry in raw_events:
         # 处理可能的 TraceSender 格式差异
@@ -1077,19 +1094,77 @@ def process_logs(input_file, output_file):
 
         elif src == 'CUPTI':
             corr_id = payload.get('correlationId')
+            pid = to_int(payload.get("pid"))
+            start_ns = to_ns(payload.get("start_ns"))
+            end_ns = to_ns(payload.get("end_ns"))
+            if (
+                pid is not None
+                and start_ns is not None
+                and end_ns is not None
+                and start_ns > 0
+                and end_ns > 0
+                and end_ns > cupti_nonzero_max_end_by_pid[pid]
+            ):
+                cupti_nonzero_max_end_by_pid[pid] = end_ns
             if etype in ['runtime', 'driver']:
                 cupti_events.append(payload)
+                if etype == 'runtime':
+                    runtime_name_by_corr[
+                        cupti_corr_key(payload, corr_id=corr_id, pid_override=pid)
+                    ] = payload.get("name", "")
             elif etype in ['kernel', 'memset', 'memcpy']:
                 kernel_key = cupti_corr_key(payload, corr_id=corr_id)
                 if kernel_key not in all_kernels_map:
                     all_kernels_map[kernel_key] = []
                 all_kernels_map[kernel_key].append(payload)
-                if payload.get('start_ns', 0) > 0:
+                if start_ns is not None and start_ns > 0:
                     eager_kernels.append(payload)
+                elif etype == 'kernel':
+                    zero_kernel_records.append(payload)
 
         elif src == 'ebpf':
             if etype == 'sched_latency':
                 ebpf_sched_latency_events.append(payload)
+
+    if zero_kernel_records:
+        zero_kernel_count_by_pid = defaultdict(int)
+        zero_kernel_graph_count_by_pid = defaultdict(int)
+        for payload in zero_kernel_records:
+            pid = to_int(payload.get("pid"))
+            if pid is None:
+                continue
+            zero_kernel_count_by_pid[pid] += 1
+            runtime_name = runtime_name_by_corr.get(
+                cupti_corr_key(payload, pid_override=pid),
+                "",
+            )
+            if "graph" in str(runtime_name).lower():
+                zero_kernel_graph_count_by_pid[pid] += 1
+
+        zero_total = sum(zero_kernel_count_by_pid.values())
+        zero_graph_total = sum(zero_kernel_graph_count_by_pid.values())
+        graph_ratio = (zero_graph_total / zero_total) if zero_total else 0.0
+        print(
+            "  [warn] Detected "
+            f"{zero_total} kernel activity records with start_ns/end_ns <= 0; "
+            f"{zero_graph_total} ({graph_ratio:.1%}) are linked to CUDA Graph launches."
+        )
+        for pid in sorted(
+            zero_kernel_count_by_pid,
+            key=lambda x: zero_kernel_count_by_pid[x],
+            reverse=True,
+        ):
+            zero_cnt = zero_kernel_count_by_pid[pid]
+            graph_cnt = zero_kernel_graph_count_by_pid.get(pid, 0)
+            ratio = (graph_cnt / zero_cnt) if zero_cnt else 0.0
+            print(
+                f"    pid={pid}: zero_ts_kernels={zero_cnt}, "
+                f"graph_linked={graph_cnt} ({ratio:.1%})"
+            )
+        print(
+            "    These records cannot be placed on the wall-clock timeline. "
+            "Blank later Step Execution spans usually mean CUDA Graph replay, not a simple global offset."
+        )
 
     global TRACE_TS_ORIGIN_NS
     TRACE_TS_ORIGIN_NS = infer_trace_origin_ns(
@@ -1332,6 +1407,39 @@ def process_logs(input_file, output_file):
                     args={"req_ids": "\n".join(req_ids)},
                     cname="cyan"  # 青色
                 ))
+
+    if generated_dispatch_slices and cupti_nonzero_max_end_by_pid:
+        execute_total_by_pid = defaultdict(int)
+        execute_after_last_cupti_by_pid = defaultdict(int)
+        for span in generated_dispatch_slices:
+            pid = to_int(span.get("pid"))
+            start_ns = to_ns(span.get("start"))
+            if pid is None or start_ns is None:
+                continue
+            execute_total_by_pid[pid] += 1
+            if start_ns > cupti_nonzero_max_end_by_pid.get(pid, 0):
+                execute_after_last_cupti_by_pid[pid] += 1
+
+        affected = {
+            pid: execute_after_last_cupti_by_pid[pid]
+            for pid in execute_after_last_cupti_by_pid
+            if execute_after_last_cupti_by_pid[pid] > 0
+        }
+        if affected:
+            print(
+                "  [warn] Some Step Execution spans start after the last non-zero CUPTI event "
+                "for the same worker pid."
+            )
+            for pid in sorted(
+                affected,
+                key=lambda x: affected[x],
+                reverse=True,
+            ):
+                print(
+                    f"    pid={pid}: step_exec_after_last_cupti="
+                    f"{affected[pid]}/{execute_total_by_pid.get(pid, 0)}, "
+                    f"last_nonzero_cupti_end_ns={cupti_nonzero_max_end_by_pid.get(pid)}"
+                )
 
     # --- 3. 请求生命周期 (AsyncLLM.generate 包装) ---
     print(f"Processing Coroutine Lifecycle Events ({len(coroutine_events)})...")
@@ -1956,12 +2064,17 @@ def process_logs(input_file, output_file):
         # 错连到另一个 EngineCore 进程的 GPU kernel。
         runtime_corr_key = cupti_corr_key(rt, corr_id=corr_id, pid_override=rt_pid)
         runtime_flow_id = cupti_flow_id(rt, corr_id=corr_id, pid_override=rt_pid)
+        runtime_flow_debug_key = cupti_flow_debug_key(
+            rt,
+            corr_id=corr_id,
+            pid_override=rt_pid,
+        )
         kernels = all_kernels_map.get(runtime_corr_key, [])
         k_names = [k.get('name', 'unknown') for k in kernels]
         
         args = {
             "correlationId": corr_id,
-            "correlationKey": runtime_flow_id,
+            "correlationKey": runtime_flow_debug_key,
             "kernels": "\n".join(k_names[:5]) + ("..." if len(k_names)>5 else ""),
             "is_graph": "graph" in func_name.lower()
         }
