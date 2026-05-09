@@ -6,6 +6,7 @@ import threading
 import inspect
 import time
 import json
+import hashlib
 from typing import Dict, List, Any
 from importlib.abc import MetaPathFinder, Loader
 from importlib.util import spec_from_loader
@@ -158,6 +159,219 @@ def _extract_req_ids_from_scheduler_output(scheduler_output):
     except Exception:
         return []
     return req_ids
+
+
+def _safe_int(value, default=None):
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _extract_scheduler_step_maps(scheduler_output):
+    """Build per-request scheduler metadata that stays stable across processes."""
+    num_computed_by_req = {}
+    scheduled_tokens_by_req = {}
+
+    try:
+        if hasattr(scheduler_output, "scheduled_new_reqs"):
+            for req in scheduler_output.scheduled_new_reqs:
+                rid = _normalize_req_ids(req)
+                if not rid:
+                    continue
+                rid = rid[0]
+                num_computed_by_req[rid] = _safe_int(
+                    getattr(req, "num_computed_tokens", None)
+                )
+                token_ids = getattr(req, "prompt_token_ids", None)
+                if token_ids is not None:
+                    scheduled_tokens_by_req.setdefault(rid, _safe_int(len(token_ids), 0))
+    except Exception:
+        pass
+
+    try:
+        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached is not None and hasattr(cached, "req_ids"):
+            req_ids = _normalize_req_ids(cached.req_ids)
+            computed_values = list(getattr(cached, "num_computed_tokens", []) or [])
+            for idx, rid in enumerate(req_ids):
+                if idx < len(computed_values):
+                    num_computed_by_req[rid] = _safe_int(computed_values[idx])
+    except Exception:
+        pass
+
+    try:
+        val = getattr(scheduler_output, "num_scheduled_tokens", None)
+        if isinstance(val, dict):
+            for key, item in val.items():
+                rid = _normalize_req_ids(key)
+                if rid:
+                    scheduled_tokens_by_req[rid[0]] = _safe_int(item, 0)
+        elif isinstance(val, (list, tuple)):
+            req_ids = _extract_req_ids_from_scheduler_output(scheduler_output)
+            for rid, item in zip(req_ids, val):
+                scheduled_tokens_by_req[rid] = _safe_int(item, 0)
+    except Exception:
+        pass
+
+    return num_computed_by_req, scheduled_tokens_by_req
+
+
+def _make_dispatch_key(scheduler_output, phase_by_req=None):
+    req_ids = _extract_req_ids_from_scheduler_output(scheduler_output)
+    num_computed_by_req, scheduled_tokens_by_req = _extract_scheduler_step_maps(
+        scheduler_output
+    )
+    try:
+        total_scheduled = _safe_int(
+            getattr(scheduler_output, "total_num_scheduled_tokens", None)
+        )
+    except Exception:
+        total_scheduled = None
+
+    parts = {
+        "req_ids": list(req_ids),
+        "num_computed_by_req": num_computed_by_req,
+        "scheduled_tokens_by_req": scheduled_tokens_by_req,
+        "total_scheduled_tokens": total_scheduled,
+    }
+    try:
+        raw = json.dumps(parts, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    except Exception:
+        raw = repr(parts)
+    return "sched:" + hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _get_parallel_rank_info(obj=None):
+    p_cfg = getattr(obj, "parallel_config", None)
+    if p_cfg is None:
+        vllm_config = getattr(obj, "vllm_config", None)
+        p_cfg = getattr(vllm_config, "parallel_config", None)
+
+    ranks = {
+        "rank": -1,
+        "dp": -1,
+        "tp": -1,
+        "pp": -1,
+        "dp_size": -1,
+        "tp_size": -1,
+        "pp_size": -1,
+        "is_pp_first": None,
+        "is_pp_last": None,
+    }
+
+    if p_cfg is not None:
+        ranks["rank"] = _safe_int(getattr(p_cfg, "rank", None), -1)
+        ranks["dp"] = _safe_int(getattr(p_cfg, "data_parallel_rank", None), -1)
+        ranks["dp_size"] = _safe_int(getattr(p_cfg, "data_parallel_size", None), -1)
+        ranks["tp_size"] = _safe_int(getattr(p_cfg, "tensor_parallel_size", None), -1)
+        ranks["pp_size"] = _safe_int(getattr(p_cfg, "pipeline_parallel_size", None), -1)
+        if ranks["rank"] >= 0 and ranks["tp_size"] > 0:
+            ranks["tp"] = ranks["rank"] % ranks["tp_size"]
+        if ranks["rank"] >= 0 and ranks["tp_size"] > 0 and ranks["pp_size"] > 0:
+            ranks["pp"] = (ranks["rank"] // ranks["tp_size"]) % ranks["pp_size"]
+
+    try:
+        from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+        pp_group = get_pp_group()
+        ranks["pp"] = _safe_int(getattr(pp_group, "rank_in_group", None), ranks["pp"])
+        ranks["pp_size"] = _safe_int(getattr(pp_group, "world_size", None), ranks["pp_size"])
+        ranks["is_pp_first"] = bool(getattr(pp_group, "is_first_rank", False))
+        ranks["is_pp_last"] = bool(getattr(pp_group, "is_last_rank", False))
+        tp_group = get_tp_group()
+        ranks["tp"] = _safe_int(getattr(tp_group, "rank_in_group", None), ranks["tp"])
+        ranks["tp_size"] = _safe_int(getattr(tp_group, "world_size", None), ranks["tp_size"])
+    except Exception:
+        pass
+
+    return ranks
+
+
+def _estimate_tensor_payload(value, max_items=32):
+    summary = {
+        "tensor_count": 0,
+        "bytes": 0,
+        "items": [],
+    }
+
+    def _visit(item, path):
+        if summary["tensor_count"] >= max_items:
+            return
+        if hasattr(item, "numel") and hasattr(item, "element_size"):
+            try:
+                numel = int(item.numel())
+                elem_size = int(item.element_size())
+            except Exception:
+                numel = 0
+                elem_size = 0
+            nbytes = max(0, numel * elem_size)
+            summary["tensor_count"] += 1
+            summary["bytes"] += nbytes
+            try:
+                shape = list(item.shape)
+            except Exception:
+                shape = None
+            summary["items"].append({
+                "path": path,
+                "shape": shape,
+                "dtype": str(getattr(item, "dtype", "")),
+                "device": str(getattr(item, "device", "")),
+                "bytes": nbytes,
+            })
+            return
+        if isinstance(item, dict):
+            for key, child in list(item.items())[:max_items]:
+                _visit(child, f"{path}.{key}" if path else str(key))
+            return
+        if isinstance(item, (list, tuple)):
+            for idx, child in enumerate(list(item)[:max_items]):
+                _visit(child, f"{path}[{idx}]")
+
+    _visit(value, "")
+    return summary
+
+
+def _is_pp_group(group):
+    try:
+        from vllm.distributed.parallel_state import get_pp_group
+        pp_group = get_pp_group()
+        if group is pp_group:
+            return True
+        return (
+            list(getattr(group, "ranks", [])) == list(getattr(pp_group, "ranks", []))
+            and _safe_int(getattr(group, "world_size", None), 1) > 1
+        )
+    except Exception:
+        return False
+
+
+def _pp_comm_context_payload(group, op, start_ns, end_ns, peer_rank=None, src=None, dst=None, tensor_payload=None):
+    ctx = _current_gpu_exec_context() or {}
+    ranks = dict(ctx.get("ranks") or _get_parallel_rank_info(None))
+    payload_summary = _estimate_tensor_payload(tensor_payload) if tensor_payload is not None else {}
+    return {
+        "op": op,
+        "pid": os.getpid(),
+        "tid": _get_native_tid(),
+        "dispatch_key": ctx.get("dispatch_key"),
+        "req_ids": list(ctx.get("req_ids") or []),
+        "ranks": ranks,
+        "group_rank": _safe_int(getattr(group, "rank_in_group", None), -1),
+        "group_world_size": _safe_int(getattr(group, "world_size", None), -1),
+        "group_ranks": list(getattr(group, "ranks", []) or []),
+        "peer_rank": peer_rank,
+        "src": src,
+        "dst": dst,
+        "tensor_count": payload_summary.get("tensor_count", 0),
+        "tensor_bytes": payload_summary.get("bytes", 0),
+        "tensor_items": payload_summary.get("items", []),
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "duration_ns": max(0, end_ns - start_ns),
+        "timestamp_ns": end_ns,
+    }
 
 
 def _summarize_scheduler_output(scheduler_output):
@@ -543,6 +757,116 @@ class VllmUniversalPatcher(MetaPathFinder):
         return None
 
 
+@register_hook("vllm.distributed.parallel_state")
+def patch_parallel_state_pp_comm(module):
+    group_cls = getattr(module, "GroupCoordinator", None)
+    if group_cls is None:
+        logger.warning(f"GroupCoordinator not found in {module.__name__}")
+        return
+    if getattr(group_cls, "_de_latency_pp_comm_patch_installed", False):
+        return
+
+    def _wrap_send(original_func):
+        def wrapper(self, tensor_dict, *args, **kwargs):
+            if not monkeypatch_enabled() or not _is_pp_group(self):
+                return original_func(self, tensor_dict, *args, **kwargs)
+            dst = kwargs.get("dst")
+            if dst is None and args:
+                dst = args[0]
+            if dst is None:
+                try:
+                    dst = (self.rank_in_group + 1) % self.world_size
+                except Exception:
+                    dst = None
+            start_ns = time.time_ns()
+            try:
+                return original_func(self, tensor_dict, *args, **kwargs)
+            finally:
+                end_ns = time.time_ns()
+                TraceSender.emit(
+                    event_type="pp_comm_span",
+                    payload=_pp_comm_context_payload(
+                        self,
+                        op="send_tensor_dict",
+                        start_ns=start_ns,
+                        end_ns=end_ns,
+                        peer_rank=dst,
+                        dst=dst,
+                        tensor_payload=tensor_dict,
+                    ),
+                )
+        return wrapper
+
+    def _wrap_recv(original_func):
+        def wrapper(self, *args, **kwargs):
+            if not monkeypatch_enabled() or not _is_pp_group(self):
+                return original_func(self, *args, **kwargs)
+            src = kwargs.get("src")
+            if src is None and args:
+                src = args[0]
+            if src is None:
+                try:
+                    src = (self.rank_in_group - 1) % self.world_size
+                except Exception:
+                    src = None
+            start_ns = time.time_ns()
+            result = None
+            try:
+                result = original_func(self, *args, **kwargs)
+                return result
+            finally:
+                end_ns = time.time_ns()
+                TraceSender.emit(
+                    event_type="pp_comm_span",
+                    payload=_pp_comm_context_payload(
+                        self,
+                        op="recv_tensor_dict",
+                        start_ns=start_ns,
+                        end_ns=end_ns,
+                        peer_rank=src,
+                        src=src,
+                        tensor_payload=result,
+                    ),
+                )
+        return wrapper
+
+    def _wrap_broadcast(original_func):
+        def wrapper(self, tensor_dict=None, *args, **kwargs):
+            if not monkeypatch_enabled() or not _is_pp_group(self):
+                return original_func(self, tensor_dict, *args, **kwargs)
+            src = kwargs.get("src")
+            if src is None and args:
+                src = args[0]
+            if src is None:
+                src = 0
+            start_ns = time.time_ns()
+            result = None
+            try:
+                result = original_func(self, tensor_dict, *args, **kwargs)
+                return result
+            finally:
+                end_ns = time.time_ns()
+                payload_obj = tensor_dict if tensor_dict is not None else result
+                TraceSender.emit(
+                    event_type="pp_comm_span",
+                    payload=_pp_comm_context_payload(
+                        self,
+                        op="broadcast_tensor_dict",
+                        start_ns=start_ns,
+                        end_ns=end_ns,
+                        peer_rank=src,
+                        src=src,
+                        tensor_payload=payload_obj,
+                    ),
+                )
+        return wrapper
+
+    apply_method_patch(group_cls, "send_tensor_dict", _wrap_send)
+    apply_method_patch(group_cls, "recv_tensor_dict", _wrap_recv)
+    apply_method_patch(group_cls, "broadcast_tensor_dict", _wrap_broadcast)
+    group_cls._de_latency_pp_comm_patch_installed = True
+    logger.info(">>> [HOOK] Patched PP communication spans on GroupCoordinator")
+
 
 @register_hook("vllm.v1.worker.gpu_model_runner")
 def patch_gpu_model_runner(module):
@@ -593,6 +917,7 @@ def patch_gpu_model_runner(module):
                                 "batch_size": ctx.get("batch_size", 0),
                                 "input_type": ctx.get("input_type", "unknown"),
                                 "ranks": dict(ctx.get("ranks", {})),
+                                "dispatch_key": ctx.get("dispatch_key"),
                                 "start_ns": self._start_ns,
                                 "end_ns": end_ns,
                                 "timestamp_ns": end_ns,
@@ -636,11 +961,8 @@ def patch_gpu_model_runner(module):
             except Exception:
                 pass
 
-            ranks = {"dp": -1, "tp": -1}
-            p_cfg = getattr(self, "parallel_config", None)
-            if p_cfg:
-                ranks["dp"] = getattr(p_cfg, "data_parallel_rank", -1)
-                ranks["tp"] = getattr(p_cfg, "tensor_parallel_rank", -1)
+            ranks = _get_parallel_rank_info(self)
+            dispatch_key = _make_dispatch_key(scheduler_output)
 
             ctx = {
                 "runner": self,
@@ -650,6 +972,7 @@ def patch_gpu_model_runner(module):
                 "batch_size": summary.get("batch_size", 0),
                 "input_type": summary.get("input_type", "unknown"),
                 "ranks": ranks,
+                "dispatch_key": dispatch_key,
             }
             _push_gpu_exec_context(ctx)
             try:
@@ -668,6 +991,7 @@ def patch_gpu_model_runner(module):
                         "input_type": ctx.get("input_type", "unknown"),
                         "hooked_method": original_func.__name__,
                         "req_ids": list(ctx.get("req_ids", [])),
+                        "dispatch_key": dispatch_key,
                         "start_ns": start_ns,
                         "end_ns": end_ns,
                     },
@@ -837,6 +1161,10 @@ def patch_v1_scheduler(module):
     def update_from_output_wrapper(original_func):
         def wrapper(self, scheduler_output, model_output):
             scheduled_phase_by_req = _build_scheduled_phase_map(self, scheduler_output)
+            dispatch_key = _make_dispatch_key(
+                scheduler_output,
+                phase_by_req=scheduled_phase_by_req,
+            )
             # 1. 先执行原逻辑 (确保状态更新完毕)
             res = original_func(self, scheduler_output, model_output)
             
@@ -863,6 +1191,7 @@ def patch_v1_scheduler(module):
                     payload={
                         "req_ids": req_ids,
                         "phase_by_req": scheduled_phase_by_req,
+                        "dispatch_key": dispatch_key,
                         "event": "step_ready",
                         "timestamp_ns": time.time_ns(),
                     }
@@ -876,6 +1205,7 @@ def patch_v1_scheduler(module):
                         event_type="req_metrics_events",
                         payload={
                             "req_events": req_events,
+                            "dispatch_key": dispatch_key,
                         }
                     )
             except Exception as e:
@@ -899,32 +1229,8 @@ def patch_v1_executor(module):
     def execute_model_wrapper(original_func):
         def wrapper(self, scheduler_output, *args, **kwargs):
             # --- [开始采集] ---
-            req_ids = []
-            try:
-                # 1. 提取 Prefill 阶段的新请求 (这是一个 List)
-                # SchedulerOutput.scheduled_new_reqs: list[NewRequestData]
-                if hasattr(scheduler_output, "scheduled_new_reqs"):
-                    # 这里依然需要遍历，因为每个 NewRequestData 是独立的
-                    for req in scheduler_output.scheduled_new_reqs:
-                        # 尝试获取 request_id
-                        if hasattr(req, "request_id"):
-                            req_ids.append(req.request_id)
-                        elif hasattr(req, "req_id"):
-                            req_ids.append(req.req_id)
-
-                # 2. 提取 Decode 阶段的缓存请求 (这是一个 Object)
-                # SchedulerOutput.scheduled_cached_reqs: CachedRequestData
-                if hasattr(scheduler_output, "scheduled_cached_reqs"):
-                    cached_data = scheduler_output.scheduled_cached_reqs
-                    # 确保不是 None (有些时候可能为空)
-                    if cached_data is not None:
-                        # 直接获取里面的 req_ids 列表，不需要遍历 cached_data
-                        if hasattr(cached_data, "req_ids"):
-                            req_ids.extend(cached_data.req_ids)
-
-            except Exception:
-                # 生产环境保持静默，避免影响性能
-                pass
+            req_ids = _extract_req_ids_from_scheduler_output(scheduler_output)
+            dispatch_key = _make_dispatch_key(scheduler_output)
 
             # 发送数据
             if req_ids:
@@ -932,6 +1238,7 @@ def patch_v1_executor(module):
                     event_type="req_scheduler_out_rpc",
                     payload={
                         "req_ids": req_ids,
+                        "dispatch_key": dispatch_key,
                         "event": "execute_start", # 代表 RPC 发送前一瞬间
                         "batch_size": len(req_ids),
                         "timestamp_ns": time.time_ns()
@@ -958,27 +1265,15 @@ def patch_v1_uniproc_executor(module):
 
     def execute_model_wrapper(original_func):
         def wrapper(self, scheduler_output, *args, **kwargs):
-            req_ids = []
-            try:
-                if hasattr(scheduler_output, "scheduled_new_reqs"):
-                    for req in scheduler_output.scheduled_new_reqs:
-                        if hasattr(req, "request_id"):
-                            req_ids.append(req.request_id)
-                        elif hasattr(req, "req_id"):
-                            req_ids.append(req.req_id)
-
-                if hasattr(scheduler_output, "scheduled_cached_reqs"):
-                    cached_data = scheduler_output.scheduled_cached_reqs
-                    if cached_data is not None and hasattr(cached_data, "req_ids"):
-                        req_ids.extend(cached_data.req_ids)
-            except Exception:
-                pass
+            req_ids = _extract_req_ids_from_scheduler_output(scheduler_output)
+            dispatch_key = _make_dispatch_key(scheduler_output)
 
             if req_ids:
                 TraceSender.emit(
                     event_type="req_scheduler_out_rpc",
                     payload={
                         "req_ids": req_ids,
+                        "dispatch_key": dispatch_key,
                         "event": "execute_start",
                         "batch_size": len(req_ids),
                         "timestamp_ns": time.time_ns()
@@ -1028,20 +1323,9 @@ def patch_worker_base(module):
             # [DEBUG] 确认被调用
             #print(f">>> [WORKER DEBUG] WorkerBase.execute_model HIT! PID={os.getpid()}")
 
-            req_ids = []
-            try:
-                # 提取 req_ids (保持之前的逻辑)
-                if hasattr(scheduler_output, "scheduled_new_reqs"):
-                    for req in scheduler_output.scheduled_new_reqs:
-                        if hasattr(req, "request_id"): req_ids.append(req.request_id)
-                        elif hasattr(req, "req_id"): req_ids.append(req.req_id)
-
-                if hasattr(scheduler_output, "scheduled_cached_reqs"):
-                    cached = scheduler_output.scheduled_cached_reqs
-                    if cached is not None and hasattr(cached, "req_ids"):
-                        req_ids.extend(cached.req_ids)
-            except:
-                pass
+            req_ids = _extract_req_ids_from_scheduler_output(scheduler_output)
+            dispatch_key = _make_dispatch_key(scheduler_output)
+            ranks = _get_parallel_rank_info(self)
             
             if req_ids:
                 TraceSender.emit(
@@ -1049,6 +1333,8 @@ def patch_worker_base(module):
                     payload={
                         "req_ids": req_ids,
                         "event": "preprocess_start",
+                        "dispatch_key": dispatch_key,
+                        "ranks": ranks,
                         "timestamp_ns": start_ns,
                         "pid": os.getpid(),
                         "tid": tid
@@ -1067,6 +1353,8 @@ def patch_worker_base(module):
                             "req_ids": req_ids,
                             "pid": os.getpid(),
                             "tid": tid,
+                            "dispatch_key": dispatch_key,
+                            "ranks": ranks,
                             "start_ns": start_mono,
                             "end_ns": end_mono,
                             "duration_us": (end_mono - start_mono) // 1000
