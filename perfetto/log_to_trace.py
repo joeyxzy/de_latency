@@ -59,7 +59,7 @@ def build_request_lane_tids(req_index):
         "os": base + 11,
         "stage": base + 12,
         "task": base + 13,
-        "pp_comm": base + 14,
+        "pp_gap": base + 14,
     }
 
 
@@ -527,13 +527,142 @@ def sum_intersections(intervals_a, intervals_b):
     return total_ns, intersections
 
 
-def build_pp_dispatch_breakdown(dispatches, phase_intervals_by_name, pp_comm_intervals):
-    """Return per-dispatch PP compute/communication details for request reports."""
+def _dispatch_key_matches(dispatch_key, interval):
+    interval_key = interval.get("dispatch_key") if isinstance(interval, dict) else None
+    return not dispatch_key or not interval_key or interval_key == dispatch_key
+
+
+def _component_priority(component):
+    priority = {
+        "pp_gap": 0,
+        "model_forward": 10,
+        "sampling": 20,
+        "postprocess": 30,
+        "bookkeeping_sync": 40,
+        "worker_preprocess": 50,
+        "other_compute": 60,
+        "other_exec": 70,
+        "other_prefill_exec": 70,
+        "pipeline_gap": 100,
+    }
+    return (priority.get(component, 80), str(component))
+
+
+def _rank_sort_value(value):
+    try:
+        return (0, int(value))
+    except (TypeError, ValueError):
+        return (1, str(value))
+
+
+def _attribute_wall_components(component_intervals, window_start_ns, window_end_ns):
+    """Assign one dispatch window to non-overlapping wall-time components."""
+    window_start = to_ns(window_start_ns)
+    window_end = to_ns(window_end_ns)
+    if window_start is None or window_end is None or window_end <= window_start:
+        return {
+            "wall_components_ns": {},
+            "wall_components_ms": {},
+            "pipeline_gap_ns": 0,
+            "pipeline_gap_ms": 0.0,
+            "parallel_overlap_ns": 0,
+            "parallel_overlap_ms": 0.0,
+            "segments": [],
+        }
+
+    clipped = []
+    boundaries = {window_start, window_end}
+    for item in component_intervals:
+        span = clip_interval(item.get("start_ns"), item.get("end_ns"), window_start, window_end)
+        if not span:
+            continue
+        component = item.get("component") or "other_compute"
+        detail_key = item.get("detail_key")
+        clipped.append((span[0], span[1], component, detail_key))
+        boundaries.add(span[0])
+        boundaries.add(span[1])
+
+    if not clipped:
+        duration_ns = window_end - window_start
+        wall_components = {"other_compute": duration_ns}
+        return {
+            "wall_components_ns": wall_components,
+            "wall_components_ms": normalize_component_map_ms(wall_components),
+            "pipeline_gap_ns": 0,
+            "pipeline_gap_ms": ns_to_ms(0),
+            "parallel_overlap_ns": 0,
+            "parallel_overlap_ms": ns_to_ms(0),
+            "segments": [{
+                "start_ns": window_start,
+                "end_ns": window_end,
+                "duration_ns": duration_ns,
+                "duration_ms": ns_to_ms(duration_ns),
+                "component": "other_compute",
+                "active_components": [],
+            }],
+        }
+
+    wall_components = defaultdict(int)
+    parallel_overlap_ns = 0
+    segments = []
+    sorted_boundaries = sorted(boundaries)
+
+    for start, end in zip(sorted_boundaries, sorted_boundaries[1:]):
+        if end <= start:
+            continue
+        active = [
+            (component, detail_key)
+            for it_start, it_end, component, detail_key in clipped
+            if it_start < end and it_end > start
+        ]
+        dur_ns = end - start
+        if not active:
+            chosen = "pipeline_gap"
+            active_components = []
+        else:
+            active_components = sorted({component for component, _detail in active}, key=_component_priority)
+            chosen = active_components[0]
+            parallel_overlap_ns += max(0, len(active) - 1) * dur_ns
+
+        wall_components[chosen] += dur_ns
+        segments.append({
+            "start_ns": start,
+            "end_ns": end,
+            "duration_ns": dur_ns,
+            "duration_ms": ns_to_ms(dur_ns),
+            "component": chosen,
+            "active_components": active_components,
+        })
+
+    return {
+        "wall_components_ns": dict(wall_components),
+        "wall_components_ms": normalize_component_map_ms(wall_components),
+        "pipeline_gap_ns": wall_components.get("pipeline_gap", 0),
+        "pipeline_gap_ms": ns_to_ms(wall_components.get("pipeline_gap", 0)),
+        "parallel_overlap_ns": parallel_overlap_ns,
+        "parallel_overlap_ms": ns_to_ms(parallel_overlap_ns),
+        "segments": segments,
+    }
+
+
+def build_pp_gap_dispatch_breakdown(dispatches, phase_intervals_by_name, step_execution_intervals, phase_component_map=None):
+    """Return wall-time execution details with PP gaps from Step Execution windows.
+
+    For TP>1, each PP stage can have one Step Execution per TP rank for the
+    same dispatch/batch.  We first merge those TP-local spans into a single
+    PP-stage window, then charge only the gap between adjacent PP-stage windows
+    as pp_gap.
+    """
+    phase_component_map = phase_component_map or {}
     rows = []
     compute_by_pp = defaultdict(int)
-    comm_by_edge = defaultdict(int)
-    total_compute_ns = 0
-    total_comm_ns = 0
+    raw_compute_by_pp_tp = defaultdict(int)
+    raw_compute_by_component = defaultdict(int)
+    step_execution_by_pp = defaultdict(int)
+    raw_step_execution_by_pp_tp = defaultdict(int)
+    pp_gap_by_edge = defaultdict(int)
+    wall_components_total = defaultdict(int)
+    total_parallel_overlap_ns = 0
 
     for dispatch in sorted(dispatches, key=lambda x: (x.get("start_ns") or 0, x.get("end_ns") or 0)):
         dispatch_key = dispatch.get("dispatch_key")
@@ -543,37 +672,129 @@ def build_pp_dispatch_breakdown(dispatches, phase_intervals_by_name, pp_comm_int
             continue
 
         stage_compute = defaultdict(int)
+        stage_raw_compute = defaultdict(int)
+        stage_raw_compute_by_component = defaultdict(int)
+        pp_component_intervals = defaultdict(list)
+        component_intervals = []
+
         for phase_name, intervals in phase_intervals_by_name.items():
+            component = phase_component_map.get(phase_name, "other_compute")
             for interval in intervals:
-                if dispatch_key and interval.get("dispatch_key") and interval.get("dispatch_key") != dispatch_key:
+                if not _dispatch_key_matches(dispatch_key, interval):
                     continue
                 span = clip_interval(interval.get("start_ns"), interval.get("end_ns"), d_start, d_end)
                 if not span:
                     continue
                 ranks = interval.get("ranks") if isinstance(interval.get("ranks"), dict) else {}
                 pp_rank = ranks.get("pp", "unknown")
-                key = f"pp{pp_rank}:{phase_name}"
+                tp_rank = ranks.get("tp", "unknown")
                 dur_ns = span[1] - span[0]
-                stage_compute[key] += dur_ns
-                compute_by_pp[key] += dur_ns
-                total_compute_ns += dur_ns
+                raw_key = f"pp{pp_rank}:tp{tp_rank}:{component}"
+                stage_raw_compute[raw_key] += dur_ns
+                raw_compute_by_pp_tp[raw_key] += dur_ns
+                stage_raw_compute_by_component[component] += dur_ns
+                raw_compute_by_component[component] += dur_ns
+                pp_component_intervals[(pp_rank, component)].append(span)
 
-        stage_comm = defaultdict(int)
-        for interval in pp_comm_intervals:
-            if dispatch_key and interval.get("dispatch_key") and interval.get("dispatch_key") != dispatch_key:
+        for (pp_rank, component), spans in pp_component_intervals.items():
+            wall_key = f"pp{pp_rank}:{component}"
+            for start_ns, end_ns in merge_intervals(spans):
+                dur_ns = end_ns - start_ns
+                stage_compute[wall_key] += dur_ns
+                compute_by_pp[wall_key] += dur_ns
+                component_intervals.append({
+                    "start_ns": start_ns,
+                    "end_ns": end_ns,
+                    "component": component,
+                    "detail_key": wall_key,
+                })
+
+        step_spans_by_stage = defaultdict(list)
+        step_tp_by_stage = defaultdict(set)
+        stage_raw_step = defaultdict(int)
+        stage_step_exec = defaultdict(int)
+        for interval in step_execution_intervals:
+            if not _dispatch_key_matches(dispatch_key, interval):
                 continue
             span = clip_interval(interval.get("start_ns"), interval.get("end_ns"), d_start, d_end)
             if not span:
                 continue
             ranks = interval.get("ranks") if isinstance(interval.get("ranks"), dict) else {}
+            dp_rank = ranks.get("dp", "unknown")
             pp_rank = ranks.get("pp", "unknown")
-            op = interval.get("op", "pp_comm")
-            peer = interval.get("peer_rank")
-            edge = f"pp{pp_rank}->{peer}:{op}"
+            tp_rank = ranks.get("tp", "unknown")
             dur_ns = span[1] - span[0]
-            stage_comm[edge] += dur_ns
-            comm_by_edge[edge] += dur_ns
-            total_comm_ns += dur_ns
+            stage_key = (dp_rank, pp_rank)
+            raw_key = f"dp{dp_rank}:pp{pp_rank}:tp{tp_rank}:step_execution"
+            wall_key = f"dp{dp_rank}:pp{pp_rank}:step_execution"
+            stage_raw_step[raw_key] += dur_ns
+            raw_step_execution_by_pp_tp[raw_key] += dur_ns
+            step_spans_by_stage[stage_key].append(span)
+            step_tp_by_stage[stage_key].add(tp_rank)
+            stage_step_exec[wall_key] += 0
+
+        stage_windows_by_dp = defaultdict(list)
+        for (dp_rank, pp_rank), spans in step_spans_by_stage.items():
+            merged = merge_intervals(spans)
+            if not merged:
+                continue
+            start_ns = min(start for start, _end in merged)
+            end_ns = max(end for _start, end in merged)
+            union_ns = sum(end - start for start, end in merged)
+            wall_key = f"dp{dp_rank}:pp{pp_rank}:step_execution"
+            stage_step_exec[wall_key] += union_ns
+            step_execution_by_pp[wall_key] += union_ns
+            stage_windows_by_dp[dp_rank].append({
+                "dp_rank": dp_rank,
+                "pp_rank": pp_rank,
+                "start_ns": start_ns,
+                "end_ns": end_ns,
+                "duration_ns": end_ns - start_ns,
+                "duration_ms": ns_to_ms(end_ns - start_ns),
+                "union_duration_ns": union_ns,
+                "union_duration_ms": ns_to_ms(union_ns),
+                "tp_ranks": sorted(step_tp_by_stage[(dp_rank, pp_rank)], key=_rank_sort_value),
+                "span_count": len(spans),
+            })
+
+        pp_gap_intervals = []
+        row_pp_gap_by_edge = defaultdict(int)
+        for dp_rank, windows in stage_windows_by_dp.items():
+            windows.sort(key=lambda item: _rank_sort_value(item.get("pp_rank")))
+            for prev_stage, next_stage in zip(windows, windows[1:]):
+                gap_start = to_ns(prev_stage.get("end_ns"))
+                gap_end = to_ns(next_stage.get("start_ns"))
+                if gap_start is None or gap_end is None or gap_end <= gap_start:
+                    continue
+                edge = f"dp{dp_rank}:pp{prev_stage.get('pp_rank')}->pp{next_stage.get('pp_rank')}"
+                gap_ns = gap_end - gap_start
+                pp_gap_by_edge[edge] += gap_ns
+                row_pp_gap_by_edge[edge] += gap_ns
+                pp_gap_intervals.append({
+                    "start_ns": gap_start,
+                    "end_ns": gap_end,
+                    "duration_ns": gap_ns,
+                    "duration_ms": ns_to_ms(gap_ns),
+                    "edge": edge,
+                    "dp_rank": dp_rank,
+                    "src_pp": prev_stage.get("pp_rank"),
+                    "dst_pp": next_stage.get("pp_rank"),
+                })
+                component_intervals.append({
+                    "start_ns": gap_start,
+                    "end_ns": gap_end,
+                    "component": "pp_gap",
+                    "detail_key": edge,
+                })
+
+        row_pp_gap_ns = sum(gap["duration_ns"] for gap in pp_gap_intervals)
+        wall_info = _attribute_wall_components(component_intervals, d_start, d_end)
+        row_wall_components = dict(wall_info["wall_components_ns"])
+        if row_pp_gap_ns or "pp_gap" in row_wall_components:
+            row_wall_components["pp_gap"] = row_pp_gap_ns
+        for key, value in row_wall_components.items():
+            wall_components_total[key] += value
+        total_parallel_overlap_ns += wall_info["parallel_overlap_ns"]
 
         rows.append({
             "dispatch_key": dispatch_key,
@@ -581,22 +802,71 @@ def build_pp_dispatch_breakdown(dispatches, phase_intervals_by_name, pp_comm_int
             "start_ns": d_start,
             "end_ns": d_end,
             "duration_ns": d_end - d_start,
+            "duration_ms": ns_to_ms(d_end - d_start),
             "compute_by_pp_phase_ns": dict(stage_compute),
             "compute_by_pp_phase_ms": normalize_component_map_ms(stage_compute),
-            "comm_by_edge_ns": dict(stage_comm),
-            "comm_by_edge_ms": normalize_component_map_ms(stage_comm),
+            "raw_compute_by_pp_tp_phase_ns": dict(stage_raw_compute),
+            "raw_compute_by_pp_tp_phase_ms": normalize_component_map_ms(stage_raw_compute),
+            "raw_compute_by_component_ns": dict(stage_raw_compute_by_component),
+            "raw_compute_by_component_ms": normalize_component_map_ms(stage_raw_compute_by_component),
+            "step_execution_by_pp_ns": dict(stage_step_exec),
+            "step_execution_by_pp_ms": normalize_component_map_ms(stage_step_exec),
+            "raw_step_execution_by_pp_tp_ns": dict(stage_raw_step),
+            "raw_step_execution_by_pp_tp_ms": normalize_component_map_ms(stage_raw_step),
+            "pp_gap_by_edge_ns": dict(row_pp_gap_by_edge),
+            "pp_gap_by_edge_ms": normalize_component_map_ms(row_pp_gap_by_edge),
+            "stage_windows": [
+                window
+                for _dp_rank, windows in sorted(stage_windows_by_dp.items(), key=lambda item: _rank_sort_value(item[0]))
+                for window in windows
+            ],
+            "pp_gap_intervals": pp_gap_intervals,
+            "wall_components_ns": row_wall_components,
+            "wall_components_ms": normalize_component_map_ms(row_wall_components),
+            "pp_gap_ns": row_pp_gap_ns,
+            "pp_gap_ms": ns_to_ms(row_pp_gap_ns),
+            "unattributed_gap_ns": wall_info["pipeline_gap_ns"],
+            "unattributed_gap_ms": wall_info["pipeline_gap_ms"],
+            "parallel_overlap_ns": wall_info["parallel_overlap_ns"],
+            "parallel_overlap_ms": wall_info["parallel_overlap_ms"],
+            "wall_segments": wall_info["segments"],
         })
+
+    total_wall_ns = sum(max(0, row["duration_ns"]) for row in rows)
+    total_compute_ns = sum(
+        val for key, val in wall_components_total.items()
+        if key not in ("pp_gap", "pipeline_gap")
+    )
+    total_pp_gap_ns = wall_components_total.get("pp_gap", 0)
+    total_unattributed_gap_ns = wall_components_total.get("pipeline_gap", 0)
 
     return {
         "dispatches": rows,
         "compute_by_pp_phase_ns": dict(compute_by_pp),
         "compute_by_pp_phase_ms": normalize_component_map_ms(compute_by_pp),
-        "comm_by_edge_ns": dict(comm_by_edge),
-        "comm_by_edge_ms": normalize_component_map_ms(comm_by_edge),
+        "raw_compute_by_pp_tp_phase_ns": dict(raw_compute_by_pp_tp),
+        "raw_compute_by_pp_tp_phase_ms": normalize_component_map_ms(raw_compute_by_pp_tp),
+        "raw_compute_by_component_ns": dict(raw_compute_by_component),
+        "raw_compute_by_component_ms": normalize_component_map_ms(raw_compute_by_component),
+        "step_execution_by_pp_ns": dict(step_execution_by_pp),
+        "step_execution_by_pp_ms": normalize_component_map_ms(step_execution_by_pp),
+        "raw_step_execution_by_pp_tp_ns": dict(raw_step_execution_by_pp_tp),
+        "raw_step_execution_by_pp_tp_ms": normalize_component_map_ms(raw_step_execution_by_pp_tp),
+        "pp_gap_by_edge_ns": dict(pp_gap_by_edge),
+        "pp_gap_by_edge_ms": normalize_component_map_ms(pp_gap_by_edge),
+        "wall_components_ns": dict(wall_components_total),
+        "wall_components_ms": normalize_component_map_ms(wall_components_total),
         "total_compute_ns": total_compute_ns,
         "total_compute_ms": ns_to_ms(total_compute_ns),
-        "total_comm_ns": total_comm_ns,
-        "total_comm_ms": ns_to_ms(total_comm_ns),
+        "total_pp_gap_ns": total_pp_gap_ns,
+        "total_pp_gap_ms": ns_to_ms(total_pp_gap_ns),
+        "total_unattributed_gap_ns": total_unattributed_gap_ns,
+        "total_unattributed_gap_ms": ns_to_ms(total_unattributed_gap_ns),
+        "total_wall_ns": total_wall_ns,
+        "total_wall_ms": ns_to_ms(total_wall_ns),
+        "total_parallel_overlap_ns": total_parallel_overlap_ns,
+        "total_parallel_overlap_ms": ns_to_ms(total_parallel_overlap_ns),
+        "aggregation_policy": "pp_gap_from_adjacent_pp_step_execution_windows; TP ranks in the same PP stage are merged before computing PP-stage gaps; pp_gap totals are the direct sum of pp_gap_intervals; raw_step_execution_by_pp_tp keeps per-TP-rank sums",
     }
 
 
@@ -649,16 +919,16 @@ def render_compute_breakdown_svg(svg_path, ttft_components_ms, tpot_components_m
         ("other_gap", "#BAB0AC", "Other Gap"),
     ]
     tpot_order = [
-        ("preempt_queue", "#D37295", "Preempt Queue"),
-        ("decode_normal_queue_gap", "#F28E2B", "Decode Normal Queue Gap"),
-        ("post_ttft_prefill_queue", "#E15759", "Post-TTFT Prefill Queue"),
+        ("vllm_scheduling_wait", "#E15759", "vLLM Scheduling Wait"),
         ("worker_preprocess", "#59A14F", "Worker Preprocess"),
         ("model_forward", "#4E79A7", "Model Forward"),
         ("postprocess", "#9C755F", "Postprocess"),
         ("sampling", "#B07AA1", "Sampling"),
         ("bookkeeping_sync", "#76B7B2", "Bookkeeping / Sync"),
+        ("pp_gap", "#F28E2B", "PP Gap"),
         ("other_exec", "#EDC948", "Other Exec"),
-        ("unknown_gap", "#BAB0AC", "Unknown Gap"),
+        ("tail_transport", "#86BCB6", "Tail Transport"),
+        ("other_gap", "#BAB0AC", "Other Gap"),
     ]
 
     width = 1280
@@ -815,6 +1085,7 @@ def render_request_breakdown_svg(svg_path, rid, request_name, ttft_entry, tpot_e
             "postprocess": "#9C755F",
             "sampling": "#B07AA1",
             "bookkeeping_sync": "#76B7B2",
+            "pp_gap": "#F28E2B",
             "other_exec": "#EDC948",
             "tail_transport": "#86BCB6",
             "other_gap": "#BAB0AC",
@@ -826,11 +1097,23 @@ def render_request_breakdown_svg(svg_path, rid, request_name, ttft_entry, tpot_e
             "postprocess": "Postprocess",
             "sampling": "Sampling",
             "bookkeeping_sync": "Bookkeeping / Sync",
+            "pp_gap": "PP Gap",
             "other_exec": "Other Exec",
             "tail_transport": "Tail Transport",
             "other_gap": "Other Gap",
         }
-        for key in ["vllm_scheduling_wait", "worker_preprocess", "model_forward", "postprocess", "sampling", "bookkeeping_sync", "other_exec", "tail_transport", "other_gap"]:
+        for key in [
+            "vllm_scheduling_wait",
+            "worker_preprocess",
+            "model_forward",
+            "postprocess",
+            "sampling",
+            "bookkeeping_sync",
+            "pp_gap",
+            "other_exec",
+            "tail_transport",
+            "other_gap",
+        ]:
             tpot_rows.append({
                 "label": tpot_labels[key],
                 "value_ms": tpot_entry["components_ms_per_token"].get(key, 0.0),
@@ -839,7 +1122,7 @@ def render_request_breakdown_svg(svg_path, rid, request_name, ttft_entry, tpot_e
 
     width = 1500
     base_height = 210
-    ttft_extra = len(ttft_rows) * 26 + 80 if ttft_rows else 0
+    ttft_extra = len(ttft_rows) * 26 + 112 if ttft_rows else 0
     tpot_extra = len(tpot_rows) * 26 + 100 if tpot_rows else 0
     height = base_height + ttft_extra + tpot_extra
     chart_x = 110
@@ -867,7 +1150,11 @@ def render_request_breakdown_svg(svg_path, rid, request_name, ttft_entry, tpot_e
         lines.append(
             f'<text x="{chart_x}" y="{end_y + 18}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#374151">vLLM queue breakdown: before_first_prefill={float(breakdown.get("before_first_prefill", 0.0)):.3f} ms, between_prefills={float(breakdown.get("between_prefills", 0.0)):.3f} ms</text>'
         )
-        cursor_y = end_y + 56
+        prefill_phase = ttft_entry.get("prefill_exec_phase_ms", {})
+        lines.append(
+            f'<text x="{chart_x}" y="{end_y + 40}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#374151">prefill exec wall breakdown: forward={float(prefill_phase.get("model_forward", 0.0)):.3f} ms, pp_gap={float(prefill_phase.get("pp_gap", 0.0)):.3f} ms, other_exec={float(prefill_phase.get("other_prefill_exec", 0.0)):.3f} ms</text>'
+        )
+        cursor_y = end_y + 78
 
     if tpot_entry:
         lines.append(f'<text x="48" y="{cursor_y}" font-size="22" font-family="Helvetica, Arial, sans-serif" font-weight="700" fill="#111827">TPOT</text>')
@@ -1313,7 +1600,9 @@ def process_logs(input_file, output_file):
     worker_events.sort(key=lambda x: x['ts'])
     has_precise_phase_spans = any(ev.get('type') == 'gpu_phase_span' for ev in worker_events)
     req_worker_phase_intervals = defaultdict(lambda: defaultdict(list))
+    req_step_execution_intervals = defaultdict(list)
     req_pp_comm_intervals = defaultdict(list)
+    pp_comm_attr_stats = defaultdict(int)
 
     # 状态存储: Key=(pid, tid), Value={
     #   't_pre_start': ..., 
@@ -1354,6 +1643,17 @@ def process_logs(input_file, output_file):
                     'dispatch_key': dispatch_key,
                     'ranks': ranks,
                 })
+                for rid in normalize_request_ids(req_ids):
+                    req_step_execution_intervals[rid].append({
+                        "pid": pid,
+                        "tid": tid,
+                        "start_ns": t_start,
+                        "end_ns": t_end,
+                        "dispatch_key": dispatch_key,
+                        "ranks": ranks,
+                        "batch_size": batch_size,
+                        "input_type": input_type,
+                    })
                 
                 # 画一个透明容器（浅灰色背景）
                 trace_events.append(create_perfetto_event(
@@ -1517,6 +1817,72 @@ def process_logs(input_file, output_file):
                     cname="cyan"  # 青色
                 ))
 
+    dispatch_slices_by_pid = defaultdict(list)
+    for span in generated_dispatch_slices:
+        span_start = to_ns(span.get("start"))
+        span_end = to_ns(span.get("end"))
+        if span_start is None or span_end is None or span_end <= span_start:
+            continue
+        dispatch_slices_by_pid[span.get("pid")].append(span)
+    for spans in dispatch_slices_by_pid.values():
+        spans.sort(key=lambda x: (to_ns(x.get("start")) or 0, to_ns(x.get("end")) or 0))
+
+    def _rank_value_known(value):
+        if value is None:
+            return False
+        if isinstance(value, str) and value.strip() in ("", "unknown", "-1"):
+            return False
+        return value != -1
+
+    def _rank_compatible(left, right):
+        if not _rank_value_known(left) or not _rank_value_known(right):
+            return True
+        return str(left) == str(right)
+
+    def _infer_pp_comm_request_context(start_ns, end_ns, pid, ranks, dispatch_key):
+        candidates = dispatch_slices_by_pid.get(pid, [])
+        if not candidates:
+            candidates = generated_dispatch_slices
+
+        best_overlap = 0
+        best_spans = []
+        for span in candidates:
+            span_start = to_ns(span.get("start"))
+            span_end = to_ns(span.get("end"))
+            if span_start is None or span_end is None or span_end <= span_start:
+                continue
+            if dispatch_key and span.get("dispatch_key") and span.get("dispatch_key") != dispatch_key:
+                continue
+            span_ranks = span.get("ranks") if isinstance(span.get("ranks"), dict) else {}
+            if not (
+                _rank_compatible(ranks.get("pp"), span_ranks.get("pp"))
+                and _rank_compatible(ranks.get("tp"), span_ranks.get("tp"))
+                and _rank_compatible(ranks.get("dp"), span_ranks.get("dp"))
+            ):
+                continue
+            overlap_start = max(start_ns, span_start)
+            overlap_end = min(end_ns, span_end)
+            overlap_ns = max(0, overlap_end - overlap_start)
+            if overlap_ns <= 0:
+                continue
+            if overlap_ns > best_overlap:
+                best_overlap = overlap_ns
+                best_spans = [span]
+            elif overlap_ns == best_overlap:
+                best_spans.append(span)
+
+        inferred_req_ids = []
+        inferred_dispatch_keys = []
+        for span in best_spans:
+            inferred_req_ids.extend(normalize_request_ids(span.get("req_ids")))
+            if span.get("dispatch_key"):
+                inferred_dispatch_keys.append(span.get("dispatch_key"))
+
+        inferred_req_ids = sorted(set(inferred_req_ids))
+        inferred_dispatch_keys = sorted(set(inferred_dispatch_keys))
+        inferred_dispatch_key = inferred_dispatch_keys[0] if len(inferred_dispatch_keys) == 1 else dispatch_key
+        return inferred_req_ids, inferred_dispatch_key, best_overlap
+
     if pp_comm_events:
         print(f"Processing PP Communication Events ({len(pp_comm_events)})...")
     pp_comm_flow_points = defaultdict(dict)
@@ -1534,6 +1900,29 @@ def process_logs(input_file, output_file):
         req_ids = normalize_request_ids(payload.get("req_ids"))
         pp_rank = ranks.get("pp")
         peer_rank = payload.get("peer_rank")
+        attribution_source = "payload_req_ids"
+        attribution_overlap_ns = 0
+        if not req_ids or not dispatch_key:
+            inferred_req_ids, inferred_dispatch_key, attribution_overlap_ns = _infer_pp_comm_request_context(
+                start_ns,
+                end_ns,
+                pid,
+                ranks,
+                dispatch_key,
+            )
+            if not req_ids and inferred_req_ids:
+                req_ids = inferred_req_ids
+                attribution_source = "gpu_execute_model_overlap"
+            if not dispatch_key and inferred_dispatch_key:
+                dispatch_key = inferred_dispatch_key
+                if attribution_source == "payload_req_ids":
+                    attribution_source = "gpu_execute_model_overlap_dispatch_key"
+        if req_ids:
+            pp_comm_attr_stats["attributed"] += 1
+            if attribution_source != "payload_req_ids":
+                pp_comm_attr_stats["overlap_attributed"] += 1
+        else:
+            pp_comm_attr_stats["unattributed"] += 1
         if op == "send_tensor_dict":
             flow_key = (dispatch_key, pp_rank, peer_rank)
             pp_comm_flow_points[flow_key]["send"] = (start_ns, pid, tid)
@@ -1551,6 +1940,8 @@ def process_logs(input_file, output_file):
             "dst": payload.get("dst"),
             "tensor_bytes": payload.get("tensor_bytes"),
             "tensor_count": payload.get("tensor_count"),
+            "attribution_source": attribution_source,
+            "attribution_overlap_ns": attribution_overlap_ns,
         }
         for rid in req_ids:
             req_pp_comm_intervals[rid].append(dict(interval))
@@ -1565,6 +1956,8 @@ def process_logs(input_file, output_file):
             args={
                 "dispatch_key": dispatch_key,
                 "req_ids": "\n".join(req_ids),
+                "attribution_source": attribution_source,
+                "attribution_overlap_ns": attribution_overlap_ns,
                 "dp_rank": ranks.get("dp"),
                 "pp_rank": ranks.get("pp"),
                 "tp_rank": ranks.get("tp"),
@@ -2033,6 +2426,7 @@ def process_logs(input_file, output_file):
                 "end_ns": first_start,
                 "reason": "scheduled_enqueue_wait",
                 "scheduled_from": "enqueue",
+                "gap_kind": "normal_wait",
                 "next_dispatch_key": dispatches_sorted[0].get("dispatch_key"),
             })
 
@@ -2049,11 +2443,18 @@ def process_logs(input_file, output_file):
             queue_ns = next_start - prev_end
             req_vllm_queue_ns[rid] += queue_ns
             req_vllm_queue_from_step_ready_ns[rid] += queue_ns
+            preempt_hits = [
+                ts for ts in req_preempt_ts_by_req.get(rid, [])
+                if prev_end <= ts <= next_start
+            ]
+            gap_kind = "preempt_wait" if preempt_hits else "normal_wait"
             queue_intervals_map[rid].append({
                 "start_ns": prev_end,
                 "end_ns": next_start,
-                "reason": "scheduled_step_ready_wait",
+                "reason": "scheduled_preempt_wait" if preempt_hits else "scheduled_step_ready_wait",
                 "scheduled_from": "step_ready",
+                "gap_kind": gap_kind,
+                "preempt_ts_ns": preempt_hits,
                 "prev_dispatch_key": prev_dispatch.get("dispatch_key"),
                 "next_dispatch_key": next_dispatch.get("dispatch_key"),
             })
@@ -2577,7 +2978,7 @@ def process_logs(input_file, output_file):
         | set(req_latency_map.keys())
         | set(req_stage_ns.keys())
         | set(req_dispatch_intervals_map.keys())
-        | set(req_pp_comm_intervals.keys())
+        | set(req_step_execution_intervals.keys())
     )
     req_os_intervals_wall = defaultdict(list)
     if global_mono_to_wall_offset is not None:
@@ -2602,8 +3003,10 @@ def process_logs(input_file, output_file):
         "Bookkeep": "bookkeeping_sync",
     }
     compute_breakdown = {
-        "version": 1,
+        "version": 4,
         "tpot_denominator": "decode_dispatch_count",
+        "wall_time_policy": "TTFT prefill_exec and TPOT exec phases use TP-aware wall-time attribution; pp_gap is measured from adjacent PP Step Execution windows within the same dispatch/batch after merging TP ranks in each PP stage.",
+        "scheduling_wait_policy": "preempt_gap is classified only from explicit vLLM per-request preempt events; waiting behind another running batch remains normal_gap.",
         "requests": {},
         "summary": {},
         "skipped_requests": {
@@ -2614,19 +3017,12 @@ def process_logs(input_file, output_file):
     }
     ttft_component_totals_ns = defaultdict(int)
     ttft_vllm_queue_breakdown_totals_ns = defaultdict(int)
+    ttft_prefill_exec_breakdown_totals_ns = defaultdict(int)
     ttft_req_count = 0
     tpot_component_totals_ns = defaultdict(int)
     tpot_req_count = 0
     tpot_total_decode_steps = 0
     tpot_per_req_values_ns = []
-    step_execution_intervals = [
-        {
-            "start_ns": to_ns(item.get("start")),
-            "end_ns": to_ns(item.get("end")),
-        }
-        for item in generated_dispatch_slices
-        if to_ns(item.get("start")) is not None and to_ns(item.get("end")) is not None and to_ns(item.get("end")) > to_ns(item.get("start"))
-    ]
 
     for rid in sorted(all_req_ids):
         dispatches = sorted(req_dispatch_intervals_map.get(rid, []), key=lambda x: (x["start_ns"], x["end_ns"]))
@@ -2652,7 +3048,7 @@ def process_logs(input_file, output_file):
             q_copy["phase"] = dispatch_phase_by_start.get(q_copy.get("end_ns"))
             queue_intervals.append(q_copy)
         request_phase_intervals = req_worker_phase_intervals.get(rid, {})
-        request_pp_comm_intervals = req_pp_comm_intervals.get(rid, [])
+        request_step_execution_intervals = req_step_execution_intervals.get(rid, [])
 
         ttft_entry = None
         generate_setup_intervals = [
@@ -2740,18 +3136,19 @@ def process_logs(input_file, output_file):
                         ttft_total_ns - preprocess_ns - enginecore_queue_ns - vllm_queue_ns - prefill_exec_ns - postprocess_transport_ns,
                     )
 
-                    prefill_exec_phase_ns = defaultdict(int)
-                    for phase_name, component_key in phase_exec_name_map.items():
-                        total_ns, _ = sum_intersections(
-                            req_worker_phase_intervals.get(rid, {}).get(phase_name, []),
-                            initial_prefill_dispatches_sorted,
-                        )
-                        if total_ns > 0:
-                            prefill_exec_phase_ns[component_key] = total_ns
-                    prefill_exec_phase_ns["other_prefill_exec"] = max(
-                        0,
-                        prefill_exec_ns - sum(prefill_exec_phase_ns.values()),
+                    prefill_pp_gap_breakdown = build_pp_gap_dispatch_breakdown(
+                        initial_prefill_dispatches_sorted,
+                        request_phase_intervals,
+                        request_step_execution_intervals,
+                        phase_component_map=phase_exec_name_map,
                     )
+                    prefill_exec_phase_ns = defaultdict(int)
+                    for key, value in prefill_pp_gap_breakdown.get("wall_components_ns", {}).items():
+                        prefill_exec_phase_ns[key] += value
+                    if "other_compute" in prefill_exec_phase_ns:
+                        prefill_exec_phase_ns["other_prefill_exec"] += prefill_exec_phase_ns.pop("other_compute")
+                    if "pipeline_gap" in prefill_exec_phase_ns:
+                        prefill_exec_phase_ns["other_prefill_exec"] += prefill_exec_phase_ns.pop("pipeline_gap")
 
                     ttft_components_ns = {
                         "preprocess": preprocess_ns,
@@ -2784,17 +3181,15 @@ def process_logs(input_file, output_file):
                         },
                         "prefill_exec_phase_ns": dict(prefill_exec_phase_ns),
                         "prefill_exec_phase_ms": normalize_component_map_ms(prefill_exec_phase_ns),
-                        "pp_pipeline_breakdown": build_pp_dispatch_breakdown(
-                            initial_prefill_dispatches_sorted,
-                            request_phase_intervals,
-                            request_pp_comm_intervals,
-                        ),
+                        "pp_gap_breakdown": prefill_pp_gap_breakdown,
                     }
                     ttft_req_count += 1
                     for key, val in ttft_components_ns.items():
                         ttft_component_totals_ns[key] += val
                     ttft_vllm_queue_breakdown_totals_ns["before_first_prefill"] += vllm_queue_before_first_prefill_ns
                     ttft_vllm_queue_breakdown_totals_ns["between_prefills"] += prefill_schedule_gap_ns
+                    for key, val in prefill_exec_phase_ns.items():
+                        ttft_prefill_exec_breakdown_totals_ns[key] += val
             else:
                 compute_breakdown["skipped_requests"]["ttft_missing"].append(rid)
         else:
@@ -2856,6 +3251,7 @@ def process_logs(input_file, output_file):
                 ]
                 scheduling_wait_normal_ns = 0
                 scheduling_wait_preempt_ns = 0
+                scheduling_wait_preempt_events = []
                 tpot_queue_pairs = []
                 for q in post_start_queue_intervals:
                     span = clip_interval(q.get("start_ns"), q.get("end_ns"), tpot_window_start_ns, tpot_exec_end_ns)
@@ -2863,32 +3259,29 @@ def process_logs(input_file, output_file):
                         continue
                     start_ns, end_ns = span
                     tpot_queue_pairs.append(span)
-                    overlapped_step_exec_count = 0
-                    for step_it in step_execution_intervals:
-                        if step_it["end_ns"] <= start_ns:
-                            continue
-                        if step_it["start_ns"] >= end_ns:
-                            continue
-                        overlapped_step_exec_count += 1
-                        if overlapped_step_exec_count >= 1:
-                            break
-                    if overlapped_step_exec_count >= 1:
+                    preempt_hits = [
+                        ts for ts in q.get("preempt_ts_ns", [])
+                        if start_ns <= ts <= end_ns
+                    ]
+                    if q.get("gap_kind") == "preempt_wait" and preempt_hits:
                         scheduling_wait_preempt_ns += end_ns - start_ns
+                        scheduling_wait_preempt_events.extend(preempt_hits)
                     else:
                         scheduling_wait_normal_ns += end_ns - start_ns
 
-                tpot_exec_phase_ns = defaultdict(int)
-                for phase_name, component_key in phase_exec_name_map.items():
-                    total_ns, _ = sum_intersections(
-                        req_worker_phase_intervals.get(rid, {}).get(phase_name, []),
-                        tpot_exec_dispatches,
-                    )
-                    if total_ns > 0:
-                        tpot_exec_phase_ns[component_key] = total_ns
-                tpot_exec_phase_ns["other_exec"] = max(
-                    0,
-                    tpot_exec_ns - sum(tpot_exec_phase_ns.values()),
+                tpot_pp_gap_breakdown = build_pp_gap_dispatch_breakdown(
+                    tpot_exec_dispatches,
+                    request_phase_intervals,
+                    request_step_execution_intervals,
+                    phase_component_map=phase_exec_name_map,
                 )
+                tpot_exec_phase_ns = defaultdict(int)
+                for key, value in tpot_pp_gap_breakdown.get("wall_components_ns", {}).items():
+                    tpot_exec_phase_ns[key] += value
+                if "other_compute" in tpot_exec_phase_ns:
+                    tpot_exec_phase_ns["other_exec"] += tpot_exec_phase_ns.pop("other_compute")
+                if "pipeline_gap" in tpot_exec_phase_ns:
+                    tpot_exec_phase_ns["other_exec"] += tpot_exec_phase_ns.pop("pipeline_gap")
 
                 tail_transport_ns = max(0, tpot_window_end_ns - last_decode_end_ns)
                 tpot_total_ns = tpot_window_end_ns - tpot_window_start_ns
@@ -2913,6 +3306,7 @@ def process_logs(input_file, output_file):
                     "postprocess": tpot_exec_phase_ns.get("postprocess", 0),
                     "sampling": tpot_exec_phase_ns.get("sampling", 0),
                     "bookkeeping_sync": tpot_exec_phase_ns.get("bookkeeping_sync", 0),
+                    "pp_gap": tpot_exec_phase_ns.get("pp_gap", 0),
                     "other_exec": tpot_exec_phase_ns.get("other_exec", 0),
                     "tail_transport": tail_transport_ns,
                     "other_gap": tpot_other_gap_ns,
@@ -2946,11 +3340,7 @@ def process_logs(input_file, output_file):
                     "components_ms_per_token": tpot_components_ms_per_token,
                     "exec_phase_ns": dict(tpot_exec_phase_ns),
                     "exec_phase_ms": normalize_component_map_ms(tpot_exec_phase_ns),
-                    "pp_pipeline_breakdown": build_pp_dispatch_breakdown(
-                        tpot_exec_dispatches,
-                        request_phase_intervals,
-                        request_pp_comm_intervals,
-                    ),
+                    "pp_gap_breakdown": tpot_pp_gap_breakdown,
                     "scheduling_wait_breakdown_ns": {
                         "normal_gap": scheduling_wait_normal_ns,
                         "preempt_gap": scheduling_wait_preempt_ns,
@@ -2964,6 +3354,11 @@ def process_logs(input_file, output_file):
                     "scheduling_wait_breakdown_ratio": {
                         "normal_gap_pct": round(scheduling_wait_normal_pct, 6),
                         "preempt_gap_pct": round(scheduling_wait_preempt_pct, 6),
+                    },
+                    "scheduling_wait_classification": {
+                        "policy": "explicit_req_preempt_events_only",
+                        "preempt_event_count": len(scheduling_wait_preempt_events),
+                        "preempt_ts_ns": scheduling_wait_preempt_events,
                     },
                     "avg_ms_per_token": round(tpot_total_ns / decode_steps / 1e6, 6),
                     "denominator_kind": "decode_dispatch_count",
@@ -2987,6 +3382,7 @@ def process_logs(input_file, output_file):
 
     ttft_avg_components_ms = {}
     ttft_vllm_queue_breakdown_avg_ms = {}
+    ttft_prefill_exec_breakdown_avg_ms = {}
     if ttft_req_count > 0:
         ttft_avg_components_ms = {
             key: round(ttft_component_totals_ns.get(key, 0) / ttft_req_count / 1e6, 6)
@@ -2995,6 +3391,23 @@ def process_logs(input_file, output_file):
         ttft_vllm_queue_breakdown_avg_ms = {
             key: round(ttft_vllm_queue_breakdown_totals_ns.get(key, 0) / ttft_req_count / 1e6, 6)
             for key in ["before_first_prefill", "between_prefills"]
+        }
+        ttft_prefill_exec_keys = [
+            "worker_preprocess",
+            "model_forward",
+            "postprocess",
+            "sampling",
+            "bookkeeping_sync",
+            "pp_gap",
+            "other_prefill_exec",
+        ]
+        ttft_prefill_exec_keys.extend(
+            sorted(set(ttft_prefill_exec_breakdown_totals_ns.keys()) - set(ttft_prefill_exec_keys))
+        )
+        ttft_prefill_exec_breakdown_avg_ms = {
+            key: round(ttft_prefill_exec_breakdown_totals_ns.get(key, 0) / ttft_req_count / 1e6, 6)
+            for key in ttft_prefill_exec_keys
+            if ttft_prefill_exec_breakdown_totals_ns.get(key, 0) > 0 or key == "pp_gap"
         }
     tpot_avg_components_ms = {}
     if tpot_total_decode_steps > 0:
@@ -3007,6 +3420,7 @@ def process_logs(input_file, output_file):
                 "postprocess",
                 "sampling",
                 "bookkeeping_sync",
+                "pp_gap",
                 "other_exec",
                 "tail_transport",
                 "other_gap",
@@ -3017,6 +3431,7 @@ def process_logs(input_file, output_file):
         "ttft_request_count": ttft_req_count,
         "ttft_avg_components_ms": ttft_avg_components_ms,
         "ttft_vllm_queue_breakdown_avg_ms": ttft_vllm_queue_breakdown_avg_ms,
+        "ttft_prefill_exec_breakdown_avg_ms": ttft_prefill_exec_breakdown_avg_ms,
         "ttft_avg_ms": round(sum(ttft_avg_components_ms.values()), 6) if ttft_avg_components_ms else None,
         "tpot_request_count": tpot_req_count,
         "tpot_total_decode_steps": tpot_total_decode_steps,
@@ -3043,6 +3458,21 @@ def process_logs(input_file, output_file):
             f"before_first_prefill={ttft_vllm_queue_breakdown_avg_ms.get('before_first_prefill', 0.0):.3f} ms, "
             f"between_prefills={ttft_vllm_queue_breakdown_avg_ms.get('between_prefills', 0.0):.3f} ms"
         )
+        if ttft_prefill_exec_breakdown_avg_ms:
+            detail = ", ".join(
+                f"{key}={ttft_prefill_exec_breakdown_avg_ms.get(key, 0.0):.3f} ms"
+                for key in [
+                    "worker_preprocess",
+                    "model_forward",
+                    "postprocess",
+                    "sampling",
+                    "bookkeeping_sync",
+                    "pp_gap",
+                    "other_prefill_exec",
+                ]
+                if key in ttft_prefill_exec_breakdown_avg_ms
+            )
+            print(f"  - prefill_exec_breakdown: {detail}")
     else:
         print("TTFT Avg (compute-side): 无可用请求")
 
@@ -3059,6 +3489,7 @@ def process_logs(input_file, output_file):
             "postprocess",
             "sampling",
             "bookkeeping_sync",
+            "pp_gap",
             "other_exec",
             "tail_transport",
             "other_gap",
@@ -3133,6 +3564,21 @@ def process_logs(input_file, output_file):
     print(f"Saved per-request compute charts: {per_request_dir}")
     print(f"Saved per-request chart index:  {per_request_index_path}")
 
+    def _request_pp_gap_intervals(rid):
+        req_entry = compute_breakdown["requests"].get(rid, {})
+        intervals = []
+        for section_name in ("ttft", "tpot"):
+            section = req_entry.get(section_name) or {}
+            breakdown = section.get("pp_gap_breakdown") or {}
+            for dispatch in breakdown.get("dispatches", []):
+                for gap in dispatch.get("pp_gap_intervals", []):
+                    item = dict(gap)
+                    item["section"] = section_name
+                    item["dispatch_key"] = dispatch.get("dispatch_key")
+                    item["phase"] = dispatch.get("phase")
+                    intervals.append(item)
+        return sorted(intervals, key=lambda item: (item.get("start_ns") or 0, item.get("end_ns") or 0))
+
     for req_index, rid in enumerate(sorted_req_ids, start=1):
         lane_tids = build_request_lane_tids(req_index)
         lane_names = {
@@ -3149,7 +3595,7 @@ def process_logs(input_file, output_file):
             "os": f"{rid[:12]} | os",
             "stage": f"{rid[:12]} | stage",
             "task": f"{rid[:12]} | task",
-            "pp_comm": f"{rid[:12]} | pp comm",
+            "pp_gap": f"{rid[:12]} | pp gap",
         }
         for lane_key, lane_tid in lane_tids.items():
             trace_events.append({
@@ -3168,10 +3614,8 @@ def process_logs(input_file, output_file):
         output_handler_sched_queue_ms = req_output_handler_sched_ns.get(rid, 0) / 1e6
         output_handler_exec_ms = req_output_handler_exec_ns.get(rid, 0) / 1e6
         vllm_queue_ms = req_vllm_queue_ns.get(rid, 0) / 1e6
-        pp_comm_ms = sum(
-            max(0, it.get("end_ns", 0) - it.get("start_ns", 0))
-            for it in req_pp_comm_intervals.get(rid, [])
-        ) / 1e6
+        pp_gap_intervals = _request_pp_gap_intervals(rid)
+        pp_gap_ms = sum(max(0, it.get("duration_ns", 0)) for it in pp_gap_intervals) / 1e6
         vllm_queue_from_enqueue_ms = req_vllm_queue_from_enqueue_ns.get(rid, 0) / 1e6
         vllm_queue_from_step_ready_ms = req_vllm_queue_from_step_ready_ns.get(rid, 0) / 1e6
         os_delay_ms = req_latency_map.get(rid, 0) / 1e6
@@ -3202,7 +3646,7 @@ def process_logs(input_file, output_file):
                     "output_handler_sched_queue_ms": round(output_handler_sched_queue_ms, 3),
                     "output_handler_exec_ms": round(output_handler_exec_ms, 3),
                     "vllm_queue_ms": round(vllm_queue_ms, 3),
-                    "pp_comm_ms": round(pp_comm_ms, 3),
+                    "pp_gap_ms": round(pp_gap_ms, 3),
                     "vllm_queue_from_enqueue_ms": round(vllm_queue_from_enqueue_ms, 3),
                     "vllm_queue_from_step_ready_ms": round(vllm_queue_from_step_ready_ms, 3),
                     "engine_input_queue_wait_ms": round(engine_input_queue_wait_ms, 3),
@@ -3248,27 +3692,26 @@ def process_logs(input_file, output_file):
                 cname=d_color,
             ))
 
-        for pc in req_pp_comm_intervals.get(rid, []):
-            if pc["end_ns"] > pc["start_ns"]:
-                ranks = pc.get("ranks") if isinstance(pc.get("ranks"), dict) else {}
+        for gap in pp_gap_intervals:
+            if gap["end_ns"] > gap["start_ns"]:
                 trace_events.append(create_perfetto_event(
-                    name=f"PP Comm: {pc.get('op', 'pp_comm')}",
-                    cat="request_pp_comm",
+                    name="PP Gap",
+                    cat="request_pp_gap",
                     ph="X",
-                    ts=pc["start_ns"],
-                    dur=pc["end_ns"] - pc["start_ns"],
+                    ts=gap["start_ns"],
+                    dur=gap["end_ns"] - gap["start_ns"],
                     pid=REQUEST_PID,
-                    tid=lane_tids["pp_comm"],
+                    tid=lane_tids["pp_gap"],
                     args={
                         "request_id": rid,
-                        "dispatch_key": pc.get("dispatch_key"),
-                        "op": pc.get("op"),
-                        "pp_rank": ranks.get("pp"),
-                        "peer_rank": pc.get("peer_rank"),
-                        "src": pc.get("src"),
-                        "dst": pc.get("dst"),
-                        "tensor_count": pc.get("tensor_count"),
-                        "tensor_bytes": pc.get("tensor_bytes"),
+                        "dispatch_key": gap.get("dispatch_key"),
+                        "phase": gap.get("phase"),
+                        "section": gap.get("section"),
+                        "edge": gap.get("edge"),
+                        "dp_rank": gap.get("dp_rank"),
+                        "src_pp": gap.get("src_pp"),
+                        "dst_pp": gap.get("dst_pp"),
+                        "duration_ms": gap.get("duration_ms"),
                     },
                     cname="rail_load",
                 ))
@@ -3398,15 +3841,23 @@ def process_logs(input_file, output_file):
         for q in queue_intervals_map.get(rid, []):
             if q["end_ns"] > q["start_ns"]:
                 scheduled_from = q.get("scheduled_from")
-                if scheduled_from == "enqueue":
+                gap_kind = q.get("gap_kind", "normal_wait")
+                if gap_kind == "preempt_wait":
+                    q_name = "vLLM Preempt Wait (explicit preempt)"
+                    q_cat = "request_queue_preempt"
+                    q_color = "terrible"
+                elif scheduled_from == "enqueue":
                     q_name = "vLLM Queue Wait (scheduled-enqueue)"
                     q_cat = "request_queue_scheduled_enqueue"
+                    q_color = "yellow"
                 elif scheduled_from == "step_ready":
                     q_name = "vLLM Scheduling Wait (step_ready->out_rpc)"
                     q_cat = "request_queue_scheduled_step_ready"
+                    q_color = "yellow"
                 else:
                     q_name = "vLLM Queue Wait"
                     q_cat = "request_queue"
+                    q_color = "yellow"
                 trace_events.append(create_perfetto_event(
                     name=q_name,
                     cat=q_cat,
@@ -3419,10 +3870,12 @@ def process_logs(input_file, output_file):
                         "request_id": rid,
                         "reason": q["reason"],
                         "scheduled_from": scheduled_from,
+                        "gap_kind": gap_kind,
+                        "preempt_ts_ns": q.get("preempt_ts_ns", []),
                         "prev_dispatch_key": q.get("prev_dispatch_key"),
                         "next_dispatch_key": q.get("next_dispatch_key"),
                     },
-                    cname="yellow",
+                    cname=q_color,
                 ))
 
         for o in req_os_intervals_wall.get(rid, []):
@@ -3470,7 +3923,7 @@ def process_logs(input_file, output_file):
             + req_output_handler_sched_ns.get(x, 0)
             + req_output_handler_exec_ns.get(x, 0)
             + req_vllm_queue_ns.get(x, 0)
-            + sum(max(0, it.get("end_ns", 0) - it.get("start_ns", 0)) for it in req_pp_comm_intervals.get(x, []))
+            + sum(max(0, it.get("duration_ns", 0)) for it in _request_pp_gap_intervals(x))
             + req_latency_map.get(x, 0)
         ),
         reverse=True,
@@ -3478,10 +3931,7 @@ def process_logs(input_file, output_file):
         lifecycle_ms = None
         if rid in request_spans:
             lifecycle_ms = (request_spans[rid]["end_ns"] - request_spans[rid]["start_ns"]) / 1e6
-        pp_comm_ms = sum(
-            max(0, it.get("end_ns", 0) - it.get("start_ns", 0))
-            for it in req_pp_comm_intervals.get(rid, [])
-        ) / 1e6
+        pp_gap_ms = sum(max(0, it.get("duration_ns", 0)) for it in _request_pp_gap_intervals(rid)) / 1e6
         print(
             f"  - {rid}: "
             f"lifecycle={f'{lifecycle_ms:.3f} ms' if lifecycle_ms is not None else 'N/A'}, "
@@ -3495,7 +3945,7 @@ def process_logs(input_file, output_file):
             f"vllm_queue={req_vllm_queue_ns.get(rid, 0) / 1e6:.3f} ms "
             f"(scheduled-enqueue={req_vllm_queue_from_enqueue_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"scheduled-step_ready={req_vllm_queue_from_step_ready_ns.get(rid, 0) / 1e6:.3f} ms), "
-            f"pp_comm={pp_comm_ms:.3f} ms, "
+            f"pp_gap={pp_gap_ms:.3f} ms, "
             f"os_delay={req_latency_map.get(rid, 0) / 1e6:.3f} ms, "
             f"prefill_exec={req_dispatch_phase_ns.get(rid, {}).get('prefill', 0) / 1e6:.3f} ms, "
             f"decode_exec={req_dispatch_phase_ns.get(rid, {}).get('decode', 0) / 1e6:.3f} ms"
@@ -3517,7 +3967,7 @@ def process_logs(input_file, output_file):
             "request_generate_exec",
             "request_output_socket_exec",
             "request_output_handler_exec",
-            "request_pp_comm",
+            "request_pp_gap",
         ),
         snap_tolerance_us=1.0,
     )

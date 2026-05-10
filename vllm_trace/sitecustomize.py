@@ -1323,9 +1323,20 @@ def patch_worker_base(module):
             # [DEBUG] 确认被调用
             #print(f">>> [WORKER DEBUG] WorkerBase.execute_model HIT! PID={os.getpid()}")
 
-            req_ids = _extract_req_ids_from_scheduler_output(scheduler_output)
+            summary = _summarize_scheduler_output(scheduler_output)
+            req_ids = list(summary.get("req_ids") or _extract_req_ids_from_scheduler_output(scheduler_output))
             dispatch_key = _make_dispatch_key(scheduler_output)
             ranks = _get_parallel_rank_info(self)
+            ctx = {
+                "runner": getattr(self, "model_runner", None),
+                "pid": os.getpid(),
+                "tid": tid,
+                "req_ids": req_ids,
+                "batch_size": summary.get("batch_size", 0),
+                "input_type": summary.get("input_type", "unknown"),
+                "ranks": ranks,
+                "dispatch_key": dispatch_key,
+            }
             
             if req_ids:
                 TraceSender.emit(
@@ -1342,9 +1353,11 @@ def patch_worker_base(module):
                 )
             # ---------------------------------------
             start_mono = int(time.clock_gettime_ns(time.CLOCK_MONOTONIC))
+            _push_gpu_exec_context(ctx)
             try:
                 return original_func(self, scheduler_output, *args, **kwargs)
             finally:
+                _pop_gpu_exec_context()
                 end_mono = int(time.clock_gettime_ns(time.CLOCK_MONOTONIC))
                 if req_ids:
                     TraceSender.emit(
