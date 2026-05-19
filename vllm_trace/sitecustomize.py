@@ -7,6 +7,7 @@ import inspect
 import time
 import json
 import hashlib
+import itertools
 from typing import Dict, List, Any
 from importlib.abc import MetaPathFinder, Loader
 from importlib.util import spec_from_loader
@@ -97,15 +98,29 @@ class TraceSender:
 
 
 _GPU_EXEC_CONTEXT = threading.local()
-GPU_PHASE_SCOPE_NAMES = {
-    "Preprocess",
-    "Forward",
-    "Postprocess",
-    "Sample",
-    "Bookkeep",
-    "Draft",
-    "EPLB",
+GPU_PHASE_NAME_ALIASES = {
+    "Preprocess": "Preprocess",
+    "Forward": "Forward",
+    "Postprocess": "Postprocess",
+    "Sample": "Sample",
+    "Bookkeep": "Bookkeep",
+    "Draft": "Draft",
+    "EPLB": "EPLB",
+    # vLLM 0.20 renamed record_function scopes to namespaced lowercase names.
+    "gpu_model_runner: preprocess": "Preprocess",
+    "gpu_model_runner: forward": "Forward",
+    "gpu_model_runner: postprocess": "Postprocess",
+    "gpu_model_runner: sample": "Sample",
+    "gpu_model_runner: bookkeep": "Bookkeep",
+    "gpu_model_runner: draft": "Draft",
+    "gpu_model_runner: eplb": "EPLB",
+    "gpu_model_runner: ModelRunnerOutput": "ModelRunnerOutput",
 }
+GPU_PHASE_SCOPE_NAMES = set(GPU_PHASE_NAME_ALIASES)
+
+
+def _canonical_gpu_phase_name(name):
+    return GPU_PHASE_NAME_ALIASES.get(name)
 
 
 def _get_native_tid():
@@ -244,6 +259,19 @@ def _make_dispatch_key(scheduler_output, phase_by_req=None):
     return "sched:" + hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
+def _extract_scheduler_output_from_runner_state(runner):
+    state = getattr(runner, "execute_model_state", None)
+    if state is None:
+        return None
+    scheduler_output = getattr(state, "scheduler_output", None)
+    if scheduler_output is not None:
+        return scheduler_output
+    try:
+        return state[0]
+    except Exception:
+        return None
+
+
 def _get_parallel_rank_info(obj=None):
     p_cfg = getattr(obj, "parallel_config", None)
     if p_cfg is None:
@@ -339,6 +367,9 @@ def _is_pp_group(group):
         pp_group = get_pp_group()
         if group is pp_group:
             return True
+        unique_name = str(getattr(group, "unique_name", "") or "").lower()
+        if unique_name.startswith("pp") or ":pp" in unique_name or unique_name.endswith("pp"):
+            return True
         return (
             list(getattr(group, "ranks", [])) == list(getattr(pp_group, "ranks", []))
             and _safe_int(getattr(group, "world_size", None), 1) > 1
@@ -372,6 +403,47 @@ def _pp_comm_context_payload(group, op, start_ns, end_ns, peer_rank=None, src=No
         "duration_ns": max(0, end_ns - start_ns),
         "timestamp_ns": end_ns,
     }
+
+
+_ASYNC_PP_COMM_SEQ = itertools.count(1)
+
+
+class _TracedCommHandle:
+    """Proxy a torch distributed async handle and emit the blocking wait span."""
+
+    def __init__(self, handle, launch_payload, wait_op, handle_index=None):
+        self._handle = handle
+        self._launch_payload = dict(launch_payload or {})
+        self._wait_op = wait_op
+        self._handle_index = handle_index
+
+    def is_completed(self):
+        return self._handle.is_completed()
+
+    def wait(self, *args, **kwargs):
+        wait_start_ns = time.time_ns()
+        try:
+            return self._handle.wait(*args, **kwargs)
+        finally:
+            wait_end_ns = time.time_ns()
+            payload = dict(self._launch_payload)
+            payload.update({
+                "op": self._wait_op,
+                "tid": _get_native_tid(),
+                "start_ns": wait_start_ns,
+                "end_ns": wait_end_ns,
+                "duration_ns": max(0, wait_end_ns - wait_start_ns),
+                "timestamp_ns": wait_end_ns,
+                "async_phase": "wait",
+                "handle_index": self._handle_index,
+                "async_elapsed_ns": max(
+                    0, wait_end_ns - _safe_int(payload.get("launch_start_ns"), wait_start_ns)
+                ),
+            })
+            TraceSender.emit(event_type="pp_comm_span", payload=payload)
+
+    def __getattr__(self, name):
+        return getattr(self._handle, name)
 
 
 def _summarize_scheduler_output(scheduler_output):
@@ -433,8 +505,33 @@ def _refresh_gpu_exec_context(ctx):
     runner = ctx.get("runner")
     req_ids = _extract_req_ids_from_input_batch(getattr(runner, "input_batch", None))
     if req_ids:
-        ctx["req_ids"] = req_ids
+        ctx["input_batch_req_ids"] = req_ids
+        # In PP/async scheduling the input batch is persistent state and may
+        # include requests outside the current SchedulerOutput. Keep the
+        # scheduler-derived request set as the authoritative dispatch
+        # membership, and only fall back to input_batch when the scheduler
+        # output was unavailable.
+        if not ctx.get("req_ids"):
+            ctx["req_ids"] = req_ids
     return ctx
+
+
+def _build_gpu_exec_context(runner, scheduler_output=None, method_name=None):
+    summary = _summarize_scheduler_output(scheduler_output)
+    ranks = _get_parallel_rank_info(runner)
+    dispatch_key = _make_dispatch_key(scheduler_output)
+    ctx = {
+        "runner": runner,
+        "pid": os.getpid(),
+        "tid": _get_native_tid(),
+        "req_ids": list(summary.get("req_ids", [])),
+        "batch_size": summary.get("batch_size", 0),
+        "input_type": summary.get("input_type", "unknown"),
+        "ranks": ranks,
+        "dispatch_key": dispatch_key,
+        "method_name": method_name,
+    }
+    return _refresh_gpu_exec_context(ctx)
 
 
 def _emit_legacy_gpu_phase_events(phase_name, payload):
@@ -572,6 +669,45 @@ def apply_method_patch(cls, method_name, wrapper_factory):
     setattr(cls, method_name, patched_func)
     logger.info(f"Successfully patched: {cls.__name__}.{method_name}")
     return True
+
+
+def _emit_scheduler_out_rpc(scheduler_output, event="execute_start"):
+    req_ids = _extract_req_ids_from_scheduler_output(scheduler_output)
+    dispatch_key = _make_dispatch_key(scheduler_output)
+    num_computed_by_req, scheduled_tokens_by_req = _extract_scheduler_step_maps(
+        scheduler_output
+    )
+    total_scheduled = _safe_int(
+        getattr(scheduler_output, "total_num_scheduled_tokens", None),
+        0,
+    )
+    if not req_ids:
+        return
+    TraceSender.emit(
+        event_type="req_scheduler_out_rpc",
+        payload={
+            "req_ids": req_ids,
+            "dispatch_key": dispatch_key,
+            "event": event,
+            "batch_size": len(req_ids),
+            "total_scheduled_tokens": total_scheduled,
+            "num_computed_by_req": num_computed_by_req,
+            "scheduled_tokens_by_req": scheduled_tokens_by_req,
+            "timestamp_ns": time.time_ns(),
+        },
+    )
+
+
+def _make_scheduler_out_rpc_wrapper(original_func):
+    if getattr(original_func, "_de_latency_scheduler_out_rpc_patch", False):
+        return original_func
+
+    def wrapper(self, scheduler_output, *args, **kwargs):
+        _emit_scheduler_out_rpc(scheduler_output, event="execute_start")
+        return original_func(self, scheduler_output, *args, **kwargs)
+
+    setattr(wrapper, "_de_latency_scheduler_out_rpc_patch", True)
+    return wrapper
 
 
 @register_hook("vllm.v1.engine.core")
@@ -797,6 +933,68 @@ def patch_parallel_state_pp_comm(module):
                 )
         return wrapper
 
+    def _wrap_isend(original_func):
+        def wrapper(self, tensor_dict, *args, **kwargs):
+            if not monkeypatch_enabled() or not _is_pp_group(self):
+                return original_func(self, tensor_dict, *args, **kwargs)
+            dst = kwargs.get("dst")
+            if dst is None and args:
+                dst = args[0]
+            if dst is None:
+                try:
+                    dst = (self.rank_in_group + 1) % self.world_size
+                except Exception:
+                    dst = None
+            comm_id = f"pp-async-{os.getpid()}-{next(_ASYNC_PP_COMM_SEQ)}"
+            start_ns = time.time_ns()
+            handles = None
+            try:
+                handles = original_func(self, tensor_dict, *args, **kwargs)
+            except Exception:
+                end_ns = time.time_ns()
+                error_payload = _pp_comm_context_payload(
+                    self,
+                    op="isend_tensor_dict_launch",
+                    start_ns=start_ns,
+                    end_ns=end_ns,
+                    peer_rank=dst,
+                    dst=dst,
+                    tensor_payload=tensor_dict,
+                )
+                error_payload.update({
+                    "comm_id": comm_id,
+                    "async_phase": "launch",
+                    "launch_start_ns": start_ns,
+                    "launch_end_ns": end_ns,
+                    "handle_count": 0,
+                    "error": True,
+                })
+                TraceSender.emit(event_type="pp_comm_span", payload=error_payload)
+                raise
+            end_ns = time.time_ns()
+            launch_payload = _pp_comm_context_payload(
+                self,
+                op="isend_tensor_dict_launch",
+                start_ns=start_ns,
+                end_ns=end_ns,
+                peer_rank=dst,
+                dst=dst,
+                tensor_payload=tensor_dict,
+            )
+            launch_payload.update({
+                "comm_id": comm_id,
+                "async_phase": "launch",
+                "launch_start_ns": start_ns,
+                "launch_end_ns": end_ns,
+                "handle_count": len(handles or []),
+            })
+            TraceSender.emit(event_type="pp_comm_span", payload=launch_payload)
+            return [
+                _TracedCommHandle(handle, launch_payload, "isend_tensor_dict_wait", idx)
+                for idx, handle in enumerate(handles or [])
+            ]
+        return wrapper
+
     def _wrap_recv(original_func):
         def wrapper(self, *args, **kwargs):
             if not monkeypatch_enabled() or not _is_pp_group(self):
@@ -830,6 +1028,76 @@ def patch_parallel_state_pp_comm(module):
                 )
         return wrapper
 
+    def _wrap_irecv(original_func):
+        def wrapper(self, *args, **kwargs):
+            if not monkeypatch_enabled() or not _is_pp_group(self):
+                return original_func(self, *args, **kwargs)
+            src = kwargs.get("src")
+            if src is None and args:
+                src = args[0]
+            if src is None:
+                try:
+                    src = (self.rank_in_group - 1) % self.world_size
+                except Exception:
+                    src = None
+            comm_id = f"pp-async-{os.getpid()}-{next(_ASYNC_PP_COMM_SEQ)}"
+            start_ns = time.time_ns()
+            tensor_dict = None
+            handles = None
+            postprocess = None
+            try:
+                tensor_dict, handles, postprocess = original_func(self, *args, **kwargs)
+            except Exception:
+                end_ns = time.time_ns()
+                error_payload = _pp_comm_context_payload(
+                    self,
+                    op="irecv_tensor_dict_launch",
+                    start_ns=start_ns,
+                    end_ns=end_ns,
+                    peer_rank=src,
+                    src=src,
+                    tensor_payload=tensor_dict,
+                )
+                error_payload.update({
+                    "comm_id": comm_id,
+                    "async_phase": "launch",
+                    "launch_start_ns": start_ns,
+                    "launch_end_ns": end_ns,
+                    "handle_count": 0,
+                    "postprocess_count": 0,
+                    "error": True,
+                })
+                TraceSender.emit(event_type="pp_comm_span", payload=error_payload)
+                raise
+            end_ns = time.time_ns()
+            launch_payload = _pp_comm_context_payload(
+                self,
+                op="irecv_tensor_dict_launch",
+                start_ns=start_ns,
+                end_ns=end_ns,
+                peer_rank=src,
+                src=src,
+                tensor_payload=tensor_dict,
+            )
+            launch_payload.update({
+                "comm_id": comm_id,
+                "async_phase": "launch",
+                "launch_start_ns": start_ns,
+                "launch_end_ns": end_ns,
+                "handle_count": len(handles or []),
+                "postprocess_count": len(postprocess or []),
+            })
+            TraceSender.emit(event_type="pp_comm_span", payload=launch_payload)
+            return (
+                tensor_dict,
+                [
+                    _TracedCommHandle(handle, launch_payload, "irecv_tensor_dict_wait", idx)
+                    for idx, handle in enumerate(handles or [])
+                ],
+                postprocess,
+            )
+        return wrapper
+
     def _wrap_broadcast(original_func):
         def wrapper(self, tensor_dict=None, *args, **kwargs):
             if not monkeypatch_enabled() or not _is_pp_group(self):
@@ -861,9 +1129,106 @@ def patch_parallel_state_pp_comm(module):
                 )
         return wrapper
 
+    def _wrap_send_tensor(original_func):
+        def wrapper(self, tensor, *args, **kwargs):
+            if not monkeypatch_enabled() or not _is_pp_group(self):
+                return original_func(self, tensor, *args, **kwargs)
+            dst = kwargs.get("dst")
+            if dst is None and args:
+                dst = args[0]
+            if dst is None:
+                try:
+                    dst = (self.rank_in_group + 1) % self.world_size
+                except Exception:
+                    dst = None
+            start_ns = time.time_ns()
+            try:
+                return original_func(self, tensor, *args, **kwargs)
+            finally:
+                end_ns = time.time_ns()
+                TraceSender.emit(
+                    event_type="pp_comm_span",
+                    payload=_pp_comm_context_payload(
+                        self,
+                        op="send_tensor",
+                        start_ns=start_ns,
+                        end_ns=end_ns,
+                        peer_rank=dst,
+                        dst=dst,
+                        tensor_payload=tensor,
+                    ),
+                )
+        return wrapper
+
+    def _wrap_recv_tensor(original_func):
+        def wrapper(self, *args, **kwargs):
+            if not monkeypatch_enabled() or not _is_pp_group(self):
+                return original_func(self, *args, **kwargs)
+            src = kwargs.get("src")
+            if src is None and len(args) >= 3:
+                src = args[2]
+            if src is None:
+                try:
+                    src = (self.rank_in_group - 1) % self.world_size
+                except Exception:
+                    src = None
+            start_ns = time.time_ns()
+            result = None
+            try:
+                result = original_func(self, *args, **kwargs)
+                return result
+            finally:
+                end_ns = time.time_ns()
+                TraceSender.emit(
+                    event_type="pp_comm_span",
+                    payload=_pp_comm_context_payload(
+                        self,
+                        op="recv_tensor",
+                        start_ns=start_ns,
+                        end_ns=end_ns,
+                        peer_rank=src,
+                        src=src,
+                        tensor_payload=result,
+                    ),
+                )
+        return wrapper
+
+    def _wrap_broadcast_tensor(original_func):
+        def wrapper(self, tensor, *args, **kwargs):
+            if not monkeypatch_enabled() or not _is_pp_group(self):
+                return original_func(self, tensor, *args, **kwargs)
+            src = kwargs.get("src")
+            if src is None and args:
+                src = args[0]
+            if src is None:
+                src = 0
+            start_ns = time.time_ns()
+            try:
+                return original_func(self, tensor, *args, **kwargs)
+            finally:
+                end_ns = time.time_ns()
+                TraceSender.emit(
+                    event_type="pp_comm_span",
+                    payload=_pp_comm_context_payload(
+                        self,
+                        op="broadcast_tensor",
+                        start_ns=start_ns,
+                        end_ns=end_ns,
+                        peer_rank=src,
+                        src=src,
+                        tensor_payload=tensor,
+                    ),
+                )
+        return wrapper
+
     apply_method_patch(group_cls, "send_tensor_dict", _wrap_send)
+    apply_method_patch(group_cls, "isend_tensor_dict", _wrap_isend)
     apply_method_patch(group_cls, "recv_tensor_dict", _wrap_recv)
+    apply_method_patch(group_cls, "irecv_tensor_dict", _wrap_irecv)
     apply_method_patch(group_cls, "broadcast_tensor_dict", _wrap_broadcast)
+    apply_method_patch(group_cls, "send", _wrap_send_tensor)
+    apply_method_patch(group_cls, "recv", _wrap_recv_tensor)
+    apply_method_patch(group_cls, "broadcast", _wrap_broadcast_tensor)
     group_cls._de_latency_pp_comm_patch_installed = True
     logger.info(">>> [HOOK] Patched PP communication spans on GroupCoordinator")
 
@@ -887,13 +1252,15 @@ def patch_gpu_model_runner(module):
 
         def patched_record_function_or_nullcontext(name):
             base_cm = original_record_function(name)
-            if name not in GPU_PHASE_SCOPE_NAMES:
+            phase_name = _canonical_gpu_phase_name(name)
+            if phase_name is None:
                 return base_cm
 
             class _TracePhaseScope:
-                def __init__(self, wrapped_cm, phase_name):
+                def __init__(self, wrapped_cm, phase_name, raw_phase_name):
                     self._wrapped_cm = wrapped_cm
                     self._phase_name = phase_name
+                    self._raw_phase_name = raw_phase_name
                     self._start_ns = None
 
                 def __enter__(self):
@@ -911,6 +1278,7 @@ def patch_gpu_model_runner(module):
                             ctx = _refresh_gpu_exec_context(ctx)
                             payload = {
                                 "phase": self._phase_name,
+                                "raw_phase": self._raw_phase_name,
                                 "pid": ctx.get("pid", os.getpid()),
                                 "tid": ctx.get("tid", _get_native_tid()),
                                 "req_ids": list(ctx.get("req_ids", [])),
@@ -918,6 +1286,7 @@ def patch_gpu_model_runner(module):
                                 "input_type": ctx.get("input_type", "unknown"),
                                 "ranks": dict(ctx.get("ranks", {})),
                                 "dispatch_key": ctx.get("dispatch_key"),
+                                "method_name": ctx.get("method_name"),
                                 "start_ns": self._start_ns,
                                 "end_ns": end_ns,
                                 "timestamp_ns": end_ns,
@@ -929,51 +1298,36 @@ def patch_gpu_model_runner(module):
                             _emit_legacy_gpu_phase_events(self._phase_name, payload)
                     return suppressed
 
-            return _TracePhaseScope(base_cm, name)
+            return _TracePhaseScope(base_cm, phase_name, name)
 
         module.record_function_or_nullcontext = patched_record_function_or_nullcontext
         module._de_latency_phase_scope_patch_installed = True
         logger.info(">>> [HOOK] Patched gpu_model_runner.record_function_or_nullcontext")
 
-    if getattr(cls, "_de_latency_execute_model_patch_installed", False):
+    execute_model_already_patched = getattr(
+        cls, "_de_latency_execute_model_patch_installed", False
+    )
+    if execute_model_already_patched:
         logger.info(">>> [HOOK] GPUModelRunner.execute_model patch already installed")
-        return
 
     def execute_model_wrapper(original_func):
         sig = inspect.signature(original_func)
 
         def wrapper(self, *args, **kwargs):
-            start_ns = time.time_ns()
-            pid = os.getpid()
-            tid = _get_native_tid()
-
             scheduler_output = None
-            summary = {
-                "req_ids": [],
-                "batch_size": 0,
-                "input_type": "unknown",
-            }
             try:
                 bound_args = sig.bind(self, *args, **kwargs)
                 bound_args.apply_defaults()
                 scheduler_output = bound_args.arguments.get("scheduler_output")
-                summary = _summarize_scheduler_output(scheduler_output)
             except Exception:
                 pass
 
-            ranks = _get_parallel_rank_info(self)
-            dispatch_key = _make_dispatch_key(scheduler_output)
-
-            ctx = {
-                "runner": self,
-                "pid": pid,
-                "tid": tid,
-                "req_ids": list(summary.get("req_ids", [])),
-                "batch_size": summary.get("batch_size", 0),
-                "input_type": summary.get("input_type", "unknown"),
-                "ranks": ranks,
-                "dispatch_key": dispatch_key,
-            }
+            start_ns = time.time_ns()
+            ctx = _build_gpu_exec_context(
+                self,
+                scheduler_output=scheduler_output,
+                method_name=original_func.__name__,
+            )
             _push_gpu_exec_context(ctx)
             try:
                 return original_func(self, *args, **kwargs)
@@ -984,14 +1338,15 @@ def patch_gpu_model_runner(module):
                 TraceSender.emit(
                     event_type="gpu_execute_model",
                     payload={
-                        "pid": pid,
-                        "tid": tid,
-                        "ranks": ranks,
+                        "pid": ctx.get("pid", os.getpid()),
+                        "tid": ctx.get("tid", _get_native_tid()),
+                        "ranks": dict(ctx.get("ranks", {})),
                         "batch_size": ctx.get("batch_size", 0),
                         "input_type": ctx.get("input_type", "unknown"),
                         "hooked_method": original_func.__name__,
                         "req_ids": list(ctx.get("req_ids", [])),
-                        "dispatch_key": dispatch_key,
+                        "input_batch_req_ids": list(ctx.get("input_batch_req_ids", [])),
+                        "dispatch_key": ctx.get("dispatch_key"),
                         "start_ns": start_ns,
                         "end_ns": end_ns,
                     },
@@ -999,8 +1354,50 @@ def patch_gpu_model_runner(module):
 
         return wrapper
 
-    if apply_method_patch(cls, "execute_model", execute_model_wrapper):
+    if not execute_model_already_patched and apply_method_patch(cls, "execute_model", execute_model_wrapper):
         cls._de_latency_execute_model_patch_installed = True
+
+    if getattr(cls, "_de_latency_sample_tokens_patch_installed", False):
+        logger.info(">>> [HOOK] GPUModelRunner.sample_tokens patch already installed")
+    elif hasattr(cls, "sample_tokens"):
+        def sample_tokens_wrapper(original_func):
+            def wrapper(self, *args, **kwargs):
+                start_mono = int(time.clock_gettime_ns(time.CLOCK_MONOTONIC))
+                scheduler_output = _extract_scheduler_output_from_runner_state(self)
+                ctx = _build_gpu_exec_context(
+                    self,
+                    scheduler_output=scheduler_output,
+                    method_name=original_func.__name__,
+                )
+                _push_gpu_exec_context(ctx)
+                try:
+                    return original_func(self, *args, **kwargs)
+                finally:
+                    ctx = _pop_gpu_exec_context() or ctx
+                    ctx = _refresh_gpu_exec_context(ctx)
+                    end_mono = int(time.clock_gettime_ns(time.CLOCK_MONOTONIC))
+                    req_ids = list(ctx.get("req_ids", []))
+                    if req_ids:
+                        TraceSender.emit(
+                            event_type="worker_model_execute_span",
+                            payload={
+                                "req_ids": req_ids,
+                                "pid": ctx.get("pid", os.getpid()),
+                                "tid": ctx.get("tid", _get_native_tid()),
+                                "dispatch_key": ctx.get("dispatch_key"),
+                                "ranks": dict(ctx.get("ranks", {})),
+                                "batch_size": ctx.get("batch_size", 0),
+                                "input_type": ctx.get("input_type", "unknown"),
+                                "hooked_method": original_func.__name__,
+                                "start_ns": start_mono,
+                                "end_ns": end_mono,
+                                "duration_us": (end_mono - start_mono) // 1000,
+                            },
+                        )
+            return wrapper
+
+        if apply_method_patch(cls, "sample_tokens", sample_tokens_wrapper):
+            cls._de_latency_sample_tokens_patch_installed = True
 
 @register_hook("vllm.v1.core.sched.scheduler") 
 def patch_v1_scheduler(module):
@@ -1028,11 +1425,11 @@ def patch_v1_scheduler(module):
             )
             return original_func(self, request)
         return wrapper
-    def _safe_int(val):
+    def _safe_int(val, default=None):
         try:
             return int(val)
         except Exception:
-            return None
+            return default
 
     def _phase_from_counts(num_computed_tokens, num_prompt_tokens):
         if num_computed_tokens is None or num_prompt_tokens is None:
@@ -1042,11 +1439,13 @@ def patch_v1_scheduler(module):
     def _build_scheduled_phase_map(scheduler_obj, scheduler_output) -> Dict[str, str]:
         """
         为当前调度步构建 req_id -> phase 映射。
-        判定标准：num_computed_tokens < num_prompt_tokens => prefill，否则 decode。
-        这能正确覆盖 chunked prefill（包含被抢占后恢复仍在 prefill 的情况）。
+        vLLM 0.20 的调度语义以 context/generation 区分请求阶段：
+        新请求或 cached.is_context_phase(req_id) 为 prefill，否则为 decode。
+        旧版缺少该信息时，再回退到 num_computed_tokens < num_prompt_tokens。
         """
         phase_by_req = {}
         prompt_tokens_by_req = {}
+        output_tokens_by_req = {}
 
         try:
             req_map = getattr(scheduler_obj, "requests", {}) or {}
@@ -1054,15 +1453,28 @@ def patch_v1_scheduler(module):
                 npt = _safe_int(getattr(req, "num_prompt_tokens", None))
                 if rid and npt is not None:
                     prompt_tokens_by_req[rid] = npt
+                notok = _safe_int(
+                    getattr(req, "num_output_tokens", None),
+                )
+                placeholders = _safe_int(
+                    getattr(req, "num_output_placeholders", None),
+                    0,
+                )
+                if rid and notok is not None:
+                    output_tokens_by_req[rid] = notok + (placeholders or 0)
         except Exception:
             pass
 
-        # 新请求：使用 NewRequestData.num_computed_tokens + num_prompt_tokens 判定
+        # 新请求在 vLLM 0.20 的 compute_iteration_details 中总是 context。
         try:
             if hasattr(scheduler_output, "scheduled_new_reqs"):
                 for req in scheduler_output.scheduled_new_reqs:
                     rid = getattr(req, "request_id", None) or getattr(req, "req_id", None)
                     if not rid:
+                        continue
+                    output_tokens = output_tokens_by_req.get(rid)
+                    if output_tokens == 0 or output_tokens is None:
+                        phase_by_req[rid] = "prefill"
                         continue
                     num_computed = _safe_int(getattr(req, "num_computed_tokens", None))
                     num_prompt = prompt_tokens_by_req.get(rid)
@@ -1076,7 +1488,7 @@ def patch_v1_scheduler(module):
         except Exception:
             pass
 
-        # 缓存请求：直接用 CachedRequestData.num_computed_tokens 判定
+        # 缓存请求：优先使用 vLLM 0.20 的 is_context_phase(req_id)。
         try:
             if hasattr(scheduler_output, "scheduled_cached_reqs"):
                 cached = scheduler_output.scheduled_cached_reqs
@@ -1086,9 +1498,22 @@ def patch_v1_scheduler(module):
                     for i, rid in enumerate(req_ids):
                         if not rid:
                             continue
+                        phase = None
                         num_computed = _safe_int(num_computed_list[i]) if i < len(num_computed_list) else None
                         num_prompt = prompt_tokens_by_req.get(rid)
+                        # Cached requests can still be context/prefill chunks.
+                        # Prefer the scheduled token range over output token count;
+                        # a request may already have output tokens while more
+                        # prompt/context work is still being drained.
                         phase = _phase_from_counts(num_computed, num_prompt)
+                        if phase is None:
+                            try:
+                                if hasattr(cached, "is_context_phase"):
+                                    phase = "prefill" if cached.is_context_phase(rid) else "decode"
+                            except Exception:
+                                phase = None
+                        if phase is None and rid in output_tokens_by_req:
+                            phase = "prefill" if output_tokens_by_req.get(rid, 0) == 0 else "decode"
                         if phase:
                             phase_by_req[rid] = phase
         except Exception:
@@ -1193,6 +1618,8 @@ def patch_v1_scheduler(module):
                         "phase_by_req": scheduled_phase_by_req,
                         "dispatch_key": dispatch_key,
                         "event": "step_ready",
+                        "num_computed_by_req": _extract_scheduler_step_maps(scheduler_output)[0],
+                        "scheduled_tokens_by_req": _extract_scheduler_step_maps(scheduler_output)[1],
                         "timestamp_ns": time.time_ns(),
                     }
                 )
@@ -1226,63 +1653,50 @@ def patch_v1_executor(module):
     cls = module.MultiprocExecutor
     # logger.info(f">>> [HOOK] Patching Executor: {cls}")
 
-    def execute_model_wrapper(original_func):
-        def wrapper(self, scheduler_output, *args, **kwargs):
-            # --- [开始采集] ---
-            req_ids = _extract_req_ids_from_scheduler_output(scheduler_output)
-            dispatch_key = _make_dispatch_key(scheduler_output)
-
-            # 发送数据
-            if req_ids:
-                TraceSender.emit(
-                    event_type="req_scheduler_out_rpc",
-                    payload={
-                        "req_ids": req_ids,
-                        "dispatch_key": dispatch_key,
-                        "event": "execute_start", # 代表 RPC 发送前一瞬间
-                        "batch_size": len(req_ids),
-                        "timestamp_ns": time.time_ns()
-                    }
-                )
-            # --- [结束采集] ---
-
-            return original_func(self, scheduler_output, *args, **kwargs)
-        return wrapper
-
-    apply_method_patch(cls, "execute_model", execute_model_wrapper)
+    apply_method_patch(cls, "execute_model", _make_scheduler_out_rpc_wrapper)
 
 
 @register_hook("vllm.v1.executor.abstract")
 def patch_v1_uniproc_executor(module):
-    target_cls = None
+    target_classes = []
     for candidate in ["UniProcExecutor", "Executor"]:
-        if hasattr(module, candidate):
-            target_cls = getattr(module, candidate)
-            break
-
-    if target_cls is None:
+        cls = getattr(module, candidate, None)
+        if cls is not None:
+            target_classes.append(cls)
+    if not target_classes:
         return
 
-    def execute_model_wrapper(original_func):
-        def wrapper(self, scheduler_output, *args, **kwargs):
-            req_ids = _extract_req_ids_from_scheduler_output(scheduler_output)
-            dispatch_key = _make_dispatch_key(scheduler_output)
+    for target_cls in target_classes:
+        apply_method_patch(target_cls, "execute_model", _make_scheduler_out_rpc_wrapper)
 
-            if req_ids:
-                TraceSender.emit(
-                    event_type="req_scheduler_out_rpc",
-                    payload={
-                        "req_ids": req_ids,
-                        "dispatch_key": dispatch_key,
-                        "event": "execute_start",
-                        "batch_size": len(req_ids),
-                        "timestamp_ns": time.time_ns()
-                    }
-                )
-            return original_func(self, scheduler_output, *args, **kwargs)
-        return wrapper
 
-    apply_method_patch(target_cls, "execute_model", execute_model_wrapper)
+def _patch_executor_module(module, candidate_names):
+    target_classes = []
+    for candidate in candidate_names:
+        cls = getattr(module, candidate, None)
+        if cls is not None:
+            target_classes.append(cls)
+    if not target_classes:
+        return
+
+    for target_cls in target_classes:
+        apply_method_patch(target_cls, "execute_model", _make_scheduler_out_rpc_wrapper)
+
+
+@register_hook("vllm.v1.executor.uniproc_executor")
+def patch_v1_uniproc_executor_impl(module):
+    _patch_executor_module(
+        module,
+        ["UniProcExecutor", "ExecutorWithExternalLauncher"],
+    )
+
+
+@register_hook("vllm.v1.executor.ray_executor")
+def patch_v1_ray_executor(module):
+    _patch_executor_module(
+        module,
+        ["RayDistributedExecutor"],
+    )
 
 
 @register_hook("vllm.v1.worker.gpu_worker")
@@ -1393,9 +1807,21 @@ def patch_worker_base(module):
 #     ...
 
 
+def _patch_already_loaded_modules():
+    for module_name, hook_func in list(HOOK_REGISTRY.items()):
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        try:
+            hook_func(module)
+        except Exception as exc:
+            logger.exception("Failed to patch already loaded module %s: %s", module_name, exc)
+
+
 #整个程序的入口，一旦执行了这个insert的进程都会在每次import的时候自动执行上方的find_spec
 #如果find_spec返回成功则执行exec_module方法
 if not _SKIP_TRACE_BOOTSTRAP:
+    _patch_already_loaded_modules()
     sys.meta_path.insert(0, VllmUniversalPatcher())
     logger.info(">>> [TRACE SYSTEM] VllmUniversalPatcher installed. Ready to intercept.")
 else:

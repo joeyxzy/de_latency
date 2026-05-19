@@ -72,6 +72,7 @@ def describe_gpu_phase(phase_name):
         "Bookkeep": ("Bookkeeping/Sync", "python", "cyan"),
         "Draft": ("Draft", "python", "yellow"),
         "EPLB": ("EPLB", "python", "rail_idle"),
+        "ModelRunnerOutput": ("Model Runner Output", "python", "rail_response"),
     }
     return styles.get(
         phase_name,
@@ -459,6 +460,41 @@ def normalize_payload_request_fields(payload):
 
     return payload
 
+def canonicalize_payload_request_fields(payload, resolve_request_id):
+    if not isinstance(payload, dict):
+        return payload
+
+    if "request_id" in payload:
+        payload["request_id"] = resolve_request_id(payload.get("request_id"))
+    if "req_id" in payload:
+        payload["req_id"] = resolve_request_id(payload.get("req_id"))
+    if "request_name" in payload:
+        payload["request_name"] = resolve_request_id(payload.get("request_name"))
+    if "external_request_id" in payload:
+        payload["external_request_id"] = resolve_request_id(payload.get("external_request_id"))
+    if "req_ids" in payload:
+        payload["req_ids"] = [
+            rid for rid in (resolve_request_id(item) for item in payload.get("req_ids", []))
+            if rid
+        ]
+
+    phase_by_req = payload.get("phase_by_req")
+    if isinstance(phase_by_req, dict):
+        merged_phase_by_req = {}
+        for rid, phase in phase_by_req.items():
+            canonical = resolve_request_id(rid)
+            if canonical:
+                merged_phase_by_req[canonical] = phase
+        payload["phase_by_req"] = merged_phase_by_req
+
+    req_events = payload.get("req_events")
+    if isinstance(req_events, list):
+        for update in req_events:
+            if isinstance(update, dict) and "req_id" in update:
+                update["req_id"] = resolve_request_id(update.get("req_id"))
+
+    return payload
+
 def normalize_req_event_type(raw_type):
     if raw_type is None:
         return None
@@ -593,6 +629,108 @@ def assign_non_overlapping_lanes(intervals, start_key="start_ns", end_key="end_n
     for original_idx, lane_idx in assignments:
         lane_by_original[original_idx] = lane_idx
     return lane_by_original, len(lane_ends)
+
+
+def build_phase_merged_dispatch_intervals(intervals, merge_gap_ns=1_000_000):
+    """Build request-view phase bands from per-step dispatch intervals.
+
+    The raw per-step intervals intentionally keep PP pipeline overlap.  For the
+    request timeline, however, those overlaps make one request fan out into
+    multiple visual dispatch lanes.  Merge same-phase intervals into wall-clock
+    bands and keep the detailed per-step/rank view on worker lanes.
+    """
+    grouped = defaultdict(list)
+    for interval in intervals:
+        start_ns = to_ns(interval.get("start_ns"))
+        end_ns = to_ns(interval.get("end_ns"))
+        if start_ns is None or end_ns is None or end_ns <= start_ns:
+            continue
+        phase = interval.get("phase") or "unknown"
+        item = dict(interval)
+        item["start_ns"] = start_ns
+        item["end_ns"] = end_ns
+        item["phase"] = phase
+        grouped[phase].append(item)
+
+    merged = []
+    for phase, items in grouped.items():
+        items.sort(key=lambda item: (item["start_ns"], item["end_ns"]))
+        current = None
+        current_keys = []
+        current_batch_req_ids = set()
+        current_rpc_wait_ns_values = []
+
+        def _finish_current():
+            if current is None:
+                return
+            keys = list(dict.fromkeys(current_keys))
+            current["duration_ns"] = current["end_ns"] - current["start_ns"]
+            current["dispatch_key"] = keys[0] if len(keys) == 1 else f"{len(keys)} dispatches"
+            current["dispatch_keys"] = keys[:16]
+            current["dispatch_key_count"] = len(keys)
+            current["batch_req_ids"] = sorted(current_batch_req_ids)
+            if current_rpc_wait_ns_values:
+                current["max_rpc_to_worker_queue_ns"] = max(current_rpc_wait_ns_values)
+            merged.append(current)
+
+        for item in items:
+            dispatch_key = item.get("dispatch_key")
+            rpc_start_ns = to_ns(item.get("rpc_start_ns"))
+            worker_start_ns = to_ns(item.get("worker_start_ns"))
+            rpc_wait_ns = None
+            if rpc_start_ns is not None and worker_start_ns is not None:
+                rpc_wait_ns = max(0, worker_start_ns - rpc_start_ns)
+
+            if current is None or item["start_ns"] > current["end_ns"] + merge_gap_ns:
+                _finish_current()
+                current = {
+                    "start_ns": item["start_ns"],
+                    "end_ns": item["end_ns"],
+                    "phase": phase,
+                    "start_source": "phase_merged_worker_execute_model",
+                    "step_count": 0,
+                    "worker_span_count": 0,
+                }
+                current_keys = []
+                current_batch_req_ids = set()
+                current_rpc_wait_ns_values = []
+            else:
+                current["end_ns"] = max(current["end_ns"], item["end_ns"])
+
+            current["step_count"] += 1
+            current["worker_span_count"] += int(item.get("worker_span_count") or 0)
+            if dispatch_key:
+                current_keys.append(dispatch_key)
+            for req_id in item.get("batch_req_ids") or []:
+                if req_id:
+                    current_batch_req_ids.add(req_id)
+            if rpc_wait_ns is not None:
+                current_rpc_wait_ns_values.append(rpc_wait_ns)
+
+        _finish_current()
+
+    return sorted(merged, key=lambda item: (item["start_ns"], item["end_ns"], item["phase"]))
+
+
+def build_raw_dispatch_display_intervals(intervals):
+    """Normalize per-dispatch request intervals for request-lane display."""
+    display = []
+    for interval in intervals:
+        start_ns = to_ns(interval.get("start_ns"))
+        end_ns = to_ns(interval.get("end_ns"))
+        if start_ns is None or end_ns is None or end_ns <= start_ns:
+            continue
+        item = dict(interval)
+        item["start_ns"] = start_ns
+        item["end_ns"] = end_ns
+        item["duration_ns"] = end_ns - start_ns
+        item["phase"] = item.get("phase") or "unknown"
+        item["step_count"] = 1
+        dispatch_key = item.get("dispatch_key")
+        item["dispatch_keys"] = [dispatch_key] if dispatch_key else []
+        item["dispatch_key_count"] = 1 if dispatch_key else 0
+        display.append(item)
+    return sorted(display, key=lambda item: (item["start_ns"], item["end_ns"], item["phase"]))
 
 
 def _dispatch_key_matches(dispatch_key, interval):
@@ -1390,6 +1528,7 @@ def process_logs(input_file, output_file):
     worker_span_mono_to_wall_offsets = []
     ebpf_sched_latency_events = []
     req_name_map = {}
+    req_id_aliases = {}
     
     # 辅助字典：存储 Kernel 信息
     all_kernels_map = {}
@@ -1453,8 +1592,19 @@ def process_logs(input_file, output_file):
             continue
         rid = payload.get("request_id") or payload.get("req_id")
         rname = payload.get("request_name")
+        external_rid = payload.get("external_request_id")
+        if rid and external_rid and external_rid != rid:
+            req_id_aliases[rid] = external_rid
+            req_name_map[external_rid] = external_rid
+        elif rid and rname and rname != rid:
+            req_id_aliases[rid] = rname
+            req_name_map.setdefault(rname, rname)
         if rid and rname:
-            req_name_map[rid] = rname
+            # Client-side events can reveal the stable external request id before
+            # EngineCore later logs the internal suffixed id as request_name. Keep
+            # the external name once discovered so lifecycle and worker phases join.
+            if rid not in req_name_map or req_name_map[rid] == rid or rname != rid:
+                req_name_map[rid] = rname
         # 兜底：确保 payload 里有 timestamp_ns
         if 'timestamp_ns' not in payload and ts:
             payload['timestamp_ns'] = ts
@@ -1588,6 +1738,52 @@ def process_logs(input_file, output_file):
         elif src == 'ebpf':
             if etype == 'sched_latency':
                 ebpf_sched_latency_events.append(payload)
+
+    def _resolve_request_alias(rid):
+        rid = normalize_request_id(rid)
+        if not rid:
+            return rid
+        seen = set()
+        while rid in req_id_aliases and rid not in seen:
+            seen.add(rid)
+            nxt = normalize_request_id(req_id_aliases.get(rid))
+            if not nxt:
+                break
+            rid = nxt
+        return rid
+
+    def _canonicalize_event_payloads(events):
+        for ev in events:
+            payload = ev.get("payload") if isinstance(ev, dict) else None
+            canonicalize_payload_request_fields(payload, _resolve_request_alias)
+
+    for _events in (
+        worker_events,
+        scheduler_events,
+        req_metric_events,
+        coroutine_events,
+        coroutine_exec_events,
+        output_socket_sched_events,
+        output_socket_exec_events,
+        output_handler_sched_events,
+        output_handler_exec_events,
+        req_stage_events,
+        enginecore_loop_events,
+        pp_comm_events,
+        thread_role_events,
+        execute_model_span,
+    ):
+        _canonicalize_event_payloads(_events)
+
+    canonical_req_name_map = {}
+    for rid, name in req_name_map.items():
+        canonical_rid = _resolve_request_alias(rid)
+        canonical_name = _resolve_request_alias(name)
+        if canonical_rid:
+            canonical_req_name_map[canonical_rid] = canonical_name or canonical_rid
+    req_name_map = canonical_req_name_map
+    if req_id_aliases:
+        print(f"Canonicalized {len(req_id_aliases)} internal request ids to external request ids.")
 
     if zero_kernel_records:
         zero_kernel_count_by_pid = defaultdict(int)
@@ -2011,16 +2207,22 @@ def process_logs(input_file, output_file):
                 pp_comm_attr_stats["overlap_attributed"] += 1
         else:
             pp_comm_attr_stats["unattributed"] += 1
-        if op == "send_tensor_dict":
+        if op in ("send_tensor_dict", "send_tensor", "isend_tensor_dict_launch"):
             flow_key = (dispatch_key, pp_rank, peer_rank)
             pp_comm_flow_points[flow_key]["send"] = (start_ns, pid, tid)
-        elif op == "recv_tensor_dict":
+        elif op in ("recv_tensor_dict", "recv_tensor", "irecv_tensor_dict_launch"):
             flow_key = (dispatch_key, peer_rank, pp_rank)
             pp_comm_flow_points[flow_key]["recv"] = (start_ns, pid, tid)
         interval = {
             "start_ns": start_ns,
             "end_ns": end_ns,
             "op": op,
+            "async_phase": payload.get("async_phase"),
+            "comm_id": payload.get("comm_id"),
+            "handle_index": payload.get("handle_index"),
+            "launch_start_ns": payload.get("launch_start_ns"),
+            "launch_end_ns": payload.get("launch_end_ns"),
+            "async_elapsed_ns": payload.get("async_elapsed_ns"),
             "dispatch_key": dispatch_key,
             "ranks": ranks,
             "peer_rank": payload.get("peer_rank"),
@@ -2052,6 +2254,11 @@ def process_logs(input_file, output_file):
                 "peer_rank": payload.get("peer_rank"),
                 "src": payload.get("src"),
                 "dst": payload.get("dst"),
+                "comm_id": payload.get("comm_id"),
+                "async_phase": payload.get("async_phase"),
+                "handle_index": payload.get("handle_index"),
+                "handle_count": payload.get("handle_count"),
+                "async_elapsed_ns": payload.get("async_elapsed_ns"),
                 "tensor_count": payload.get("tensor_count"),
                 "tensor_bytes": payload.get("tensor_bytes"),
             },
@@ -2409,7 +2616,44 @@ def process_logs(input_file, output_file):
     )
 
     # 3.5 每次调度执行区间：
-    # 用 req_scheduler_out_rpc 作为步开始，用 req_step_ready 作为步结束；
+    # vLLM 0.20 的 async PP 会提前提交多个未来 step，req_scheduler_out_rpc
+    # 更接近 RPC/队列提交点，不再可靠代表 worker 实际执行开始。request 级
+    # dispatch 可视化以 scheduler_output/dispatch_key 为 join 单位：request 归属来自
+    # scheduler out/ready 的 req_ids，worker 执行窗口来自同 dispatch_key 下所有
+    # GPUModelRunner.execute_model 的最早开始和最晚结束。这里刻意不按 worker
+    # payload.req_ids 再过滤 request，因为 PP/异步路径里 worker 上下文字段可能不完整
+    # 或展示被截断；dispatch_key 才是同一 scheduler_output 的稳定连接键。
+    worker_exec_window_by_dispatch = {}
+    grouped_worker_spans_by_dispatch = defaultdict(list)
+    for span in generated_dispatch_slices:
+        dispatch_key = span.get("dispatch_key")
+        start_ns = to_ns(span.get("start"))
+        end_ns = to_ns(span.get("end"))
+        if not dispatch_key or start_ns is None or end_ns is None or end_ns <= start_ns:
+            continue
+        grouped_worker_spans_by_dispatch[dispatch_key].append(span)
+
+    for dispatch_key, spans in grouped_worker_spans_by_dispatch.items():
+        starts = [to_ns(item.get("start")) for item in spans]
+        ends = [to_ns(item.get("end")) for item in spans]
+        starts = [value for value in starts if value is not None]
+        ends = [value for value in ends if value is not None]
+        if not starts or not ends:
+            continue
+        worker_exec_window_by_dispatch[dispatch_key] = {
+            "start_ns": min(starts),
+            "end_ns": max(ends),
+            "span_count": len(spans),
+            "total_span_count": len(spans),
+            "boundary_policy": "all_pp_all_tp_execute_model",
+            "pids": sorted({
+                item.get("pid") for item in spans if item.get("pid") is not None
+            }),
+            "tids": sorted({
+                item.get("tid") for item in spans if item.get("tid") is not None
+            }),
+        }
+
     # phase 优先来自 req_step_ready.phase_by_req，缺失时回退到 req_metrics_events 的 phase 队列。
     pending_dispatch_start = defaultdict(deque)
 
@@ -2438,6 +2682,7 @@ def process_logs(input_file, output_file):
                 if rid:
                     pending_dispatch_start[rid].append({
                         "start_ns": ts_ns,
+                        "rpc_start_ns": ts_ns,
                         "dispatch_key": dispatch_key,
                         "batch_req_ids": batch_req_ids,
                     })
@@ -2457,10 +2702,35 @@ def process_logs(input_file, output_file):
             start_item = _pop_dispatch_start_for_ready(rid, ready_dispatch_key)
             if start_item is None:
                 continue
-            start_ns = start_item.get("start_ns")
+            dispatch_key = ready_dispatch_key or start_item.get("dispatch_key")
+            worker_window = worker_exec_window_by_dispatch.get(dispatch_key)
+            rpc_start_ns = to_ns(start_item.get("rpc_start_ns") or start_item.get("start_ns"))
+            start_ns = to_ns(start_item.get("start_ns"))
+            end_ns = ts_ns
+            start_source = "scheduler_out_rpc"
+            end_source = "scheduler_step_ready"
+            worker_start_ns = None
+            worker_end_ns = None
+            worker_span_count = 0
+            worker_span_count_total = 0
+            worker_boundary_policy = None
+
+            if worker_window:
+                worker_start_ns = to_ns(worker_window.get("start_ns"))
+                worker_end_ns = to_ns(worker_window.get("end_ns"))
+                worker_span_count = worker_window.get("span_count", 0)
+                worker_span_count_total = worker_window.get("total_span_count", worker_span_count)
+                worker_boundary_policy = worker_window.get("boundary_policy")
+                if worker_start_ns is not None:
+                    start_ns = worker_start_ns
+                    start_source = "worker_execute_model_min"
+                if worker_end_ns is not None:
+                    end_ns = worker_end_ns
+                    end_source = "worker_execute_model_max"
+
             if start_ns is None:
                 continue
-            if ts_ns <= start_ns:
+            if end_ns <= start_ns:
                 continue
 
             phase = phase_by_req.get(rid)
@@ -2474,14 +2744,23 @@ def process_logs(input_file, output_file):
                 if phase_hint_queue_by_req[rid] and phase_hint_queue_by_req[rid][0] == phase:
                     phase_hint_queue_by_req[rid].popleft()
 
-            dur_ns = ts_ns - start_ns
+            dur_ns = end_ns - start_ns
             req_dispatch_intervals_map[rid].append({
                 "start_ns": start_ns,
-                "end_ns": ts_ns,
+                "end_ns": end_ns,
                 "phase": phase,
                 "duration_ns": dur_ns,
-                "dispatch_key": ready_dispatch_key or start_item.get("dispatch_key"),
+                "dispatch_key": dispatch_key,
                 "batch_req_ids": start_item.get("batch_req_ids", []),
+                "rpc_start_ns": rpc_start_ns,
+                "scheduler_ready_ns": ts_ns,
+                "start_source": start_source,
+                "end_source": end_source,
+                "worker_start_ns": worker_start_ns,
+                "worker_end_ns": worker_end_ns,
+                "worker_span_count": worker_span_count,
+                "worker_span_count_total": worker_span_count_total,
+                "worker_boundary_policy": worker_boundary_policy,
             })
             req_dispatch_phase_ns[rid][phase] += dur_ns
             req_dispatch_phase_count[rid][phase] += 1
@@ -2489,6 +2768,47 @@ def process_logs(input_file, output_file):
     unmatched_dispatch = sum(len(q) for q in pending_dispatch_start.values())
     if unmatched_dispatch > 0:
         print(f"  [warn] 存在 {unmatched_dispatch} 个未闭合 dispatch 起点（可能是日志截断或进程中止）")
+
+    # Newer vLLM paths can surface the same scheduler step through multiple
+    # executor wrappers.  Keep the visual/event detail, but compute per-request
+    # phase totals from de-duplicated wall-clock intervals so parallel/duplicate
+    # decode windows are not charged multiple times to one request.
+    deduped_dispatch_intervals_map = defaultdict(list)
+    for rid, intervals in req_dispatch_intervals_map.items():
+        seen = set()
+        for interval in sorted(intervals, key=lambda x: (x.get("start_ns") or 0, x.get("end_ns") or 0)):
+            start_ns = to_ns(interval.get("start_ns"))
+            end_ns = to_ns(interval.get("end_ns"))
+            if start_ns is None or end_ns is None or end_ns <= start_ns:
+                continue
+            phase = interval.get("phase") or "unknown"
+            dispatch_key = interval.get("dispatch_key")
+            dedupe_key = (phase, dispatch_key, start_ns, end_ns)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            item = dict(interval)
+            item["start_ns"] = start_ns
+            item["end_ns"] = end_ns
+            item["phase"] = phase
+            item["duration_ns"] = end_ns - start_ns
+            deduped_dispatch_intervals_map[rid].append(item)
+
+    req_dispatch_intervals_map = deduped_dispatch_intervals_map
+    req_dispatch_phase_ns = defaultdict(lambda: defaultdict(int))
+    req_dispatch_phase_count = defaultdict(lambda: defaultdict(int))
+    for rid, intervals in req_dispatch_intervals_map.items():
+        spans_by_phase = defaultdict(list)
+        dispatch_keys_by_phase = defaultdict(set)
+        for interval in intervals:
+            phase = interval.get("phase") or "unknown"
+            spans_by_phase[phase].append((interval["start_ns"], interval["end_ns"]))
+            dispatch_keys_by_phase[phase].add(
+                interval.get("dispatch_key") or (interval["start_ns"], interval["end_ns"])
+            )
+        for phase, spans in spans_by_phase.items():
+            req_dispatch_phase_ns[rid][phase] = sum_interval_pairs(merge_intervals(spans))
+            req_dispatch_phase_count[rid][phase] = len(dispatch_keys_by_phase[phase])
 
     # Derive vLLM queue intervals from the canonical dispatch sequence.
     # This keeps queue slices in the gaps between dispatch slices and prevents
@@ -3149,6 +3469,9 @@ def process_logs(input_file, output_file):
         "Postprocess": "postprocess",
         "Sample": "sampling",
         "Bookkeep": "bookkeeping_sync",
+        "Draft": "draft",
+        "EPLB": "eplb",
+        "ModelRunnerOutput": "model_runner_output",
     }
     compute_breakdown = {
         "version": 4,
@@ -3550,6 +3873,9 @@ def process_logs(input_file, output_file):
             "postprocess",
             "sampling",
             "bookkeeping_sync",
+            "draft",
+            "eplb",
+            "model_runner_output",
             "pp_gap",
             "other_prefill_exec",
         ]
@@ -3572,6 +3898,9 @@ def process_logs(input_file, output_file):
                 "postprocess",
                 "sampling",
                 "bookkeeping_sync",
+                "draft",
+                "eplb",
+                "model_runner_output",
                 "pp_gap",
                 "other_exec",
                 "tail_transport",
@@ -3641,6 +3970,9 @@ def process_logs(input_file, output_file):
             "postprocess",
             "sampling",
             "bookkeeping_sync",
+            "draft",
+            "eplb",
+            "model_runner_output",
             "pp_gap",
             "other_exec",
             "tail_transport",
@@ -3742,7 +4074,8 @@ def process_logs(input_file, output_file):
     for req_index, rid in enumerate(sorted_req_ids, start=1):
         lane_tids = build_request_lane_tids(req_index)
         dispatch_intervals = list(req_dispatch_intervals_map.get(rid, []))
-        dispatch_lane_indices, dispatch_lane_count = assign_non_overlapping_lanes(dispatch_intervals)
+        dispatch_display_intervals = build_raw_dispatch_display_intervals(dispatch_intervals)
+        dispatch_lane_indices, dispatch_lane_count = assign_non_overlapping_lanes(dispatch_display_intervals)
         pp_gap_intervals = _request_pp_gap_intervals(rid)
         pp_gap_lane_indices, pp_gap_lane_count = assign_non_overlapping_lanes(pp_gap_intervals)
         lane_names = {
@@ -3833,7 +4166,7 @@ def process_logs(input_file, output_file):
                 cname="good",
             ))
 
-        for dispatch_idx, d in enumerate(dispatch_intervals):
+        for dispatch_idx, d in enumerate(dispatch_display_intervals):
             if d["end_ns"] <= d["start_ns"]:
                 continue
             dispatch_lane_idx = dispatch_lane_indices[dispatch_idx] if dispatch_idx < len(dispatch_lane_indices) else 0
@@ -3863,8 +4196,28 @@ def process_logs(input_file, output_file):
                     "request_id": rid,
                     "phase": phase,
                     "dispatch_key": d.get("dispatch_key"),
+                    "dispatch_keys": d.get("dispatch_keys"),
+                    "dispatch_key_count": d.get("dispatch_key_count"),
+                    "step_count": d.get("step_count"),
                     "batch_req_count": len(d.get("batch_req_ids") or []),
                     "duration_ms": round((d["end_ns"] - d["start_ns"]) / 1e6, 3),
+                    "start_source": d.get("start_source"),
+                    "end_source": d.get("end_source"),
+                    "scheduler_ready_lag_ms": (
+                        round((d["scheduler_ready_ns"] - d["worker_end_ns"]) / 1e6, 3)
+                        if d.get("scheduler_ready_ns") is not None and d.get("worker_end_ns") is not None
+                        else None
+                    ),
+                    "rpc_to_worker_queue_ms": (
+                        round(d["max_rpc_to_worker_queue_ns"] / 1e6, 3)
+                        if d.get("max_rpc_to_worker_queue_ns") is not None
+                        else round((d["worker_start_ns"] - d["rpc_start_ns"]) / 1e6, 3)
+                        if d.get("worker_start_ns") is not None and d.get("rpc_start_ns") is not None
+                        else None
+                    ),
+                    "worker_span_count": d.get("worker_span_count"),
+                    "worker_span_count_total": d.get("worker_span_count_total"),
+                    "worker_boundary_policy": d.get("worker_boundary_policy"),
                 },
                 cname=d_color,
             ))

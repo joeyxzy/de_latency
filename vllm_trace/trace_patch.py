@@ -136,6 +136,31 @@ def get_arg_value(func, arg_name, args, kwargs):
         return None
 
 
+def filter_supported_kwargs(func, candidate_kwargs):
+    if not candidate_kwargs:
+        return {}
+    try:
+        sig = inspect.signature(func)
+    except Exception:
+        return {
+            key: value
+            for key, value in candidate_kwargs.items()
+            if value is not None
+        }
+    params = sig.parameters
+    accepts_var_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in params.values()
+    )
+    filtered = {}
+    for key, value in candidate_kwargs.items():
+        if value is None:
+            continue
+        if accepts_var_kwargs or key in params:
+            filtered[key] = value
+    return filtered
+
+
 def emit_stage_duration(stage, start_ns, end_ns, request_id=None, request_name=None, extra=None):
     """Emit a per-request stage duration event for generate->enqueue breakdown."""
     if not ENABLE_REQ_STAGE_TIMING:
@@ -564,13 +589,26 @@ def _chunk_output_handler_slices(engine_outputs, chunk_size):
     return tuple(slices)
 
 
-def _record_output_handler_iteration_stats(logger_manager, outputs, iteration_stats):
+def _record_output_handler_iteration_stats(logger_manager, outputs, iteration_stats, mm_cache_stats=None):
     if logger_manager is None:
         return
     scheduler_stats = getattr(outputs, "scheduler_stats", None)
-    mm_cache_stats = getattr(outputs, "mm_cache_stats", None)
+    if mm_cache_stats is None:
+        mm_cache_stats = getattr(outputs, "mm_cache_stats", None)
+    engine_idx = getattr(outputs, "engine_index", None)
 
     if hasattr(logger_manager, "record"):
+        try:
+            if engine_idx is not None:
+                logger_manager.record(
+                    engine_idx=engine_idx,
+                    scheduler_stats=scheduler_stats,
+                    iteration_stats=iteration_stats,
+                    mm_cache_stats=mm_cache_stats,
+                )
+                return
+        except TypeError:
+            pass
         try:
             logger_manager.record(
                 scheduler_stats,
@@ -920,11 +958,19 @@ def patch_vllm():
     try:
         from vllm.v1.engine import async_llm as async_llm_module
         AsyncLLM = async_llm_module.AsyncLLM
-        from vllm.v1.engine.processor import Processor
+        try:
+            from vllm.v1.engine.input_processor import InputProcessor as Processor
+            process_inputs_stage_name = "input_processor.process_inputs"
+        except ImportError:
+            from vllm.v1.engine.processor import Processor
+            process_inputs_stage_name = "processor.process_inputs"
         from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
         from vllm.v1.engine import core_client as core_client_module
         _process_utility_output = core_client_module._process_utility_output
-        from vllm.entrypoints.utils import _validate_truncation_size
+        try:
+            from vllm.entrypoints.utils import _validate_truncation_size
+        except ImportError:
+            _validate_truncation_size = None
         from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
         patch_logger.info("[VLLM_PATCH] Successfully imported AsyncLLM.")
     except ImportError:
@@ -943,8 +989,12 @@ def patch_vllm():
         return getattr(func, "_de_latency_req_stage_wrapped", False)
 
     output_chunk_size = getattr(async_llm_module, "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", None)
+    if output_chunk_size is None:
+        envs_module = getattr(async_llm_module, "envs", None)
+        output_chunk_size = getattr(envs_module, "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", None)
     iteration_stats_cls = getattr(async_llm_module, "IterationStats", None)
     async_llm_logger = getattr(async_llm_module, "logger", patch_logger)
+    stream_finished_sentinel = getattr(async_llm_module, "STREAM_FINISHED", None)
 
     # 1) Patch AsyncLLM._run_output_handler: generate() 早期初始化阶段
     if hasattr(AsyncLLM, "_run_output_handler"):
@@ -988,6 +1038,10 @@ def patch_vllm():
                     output_processor = self.output_processor
                     log_stats = getattr(self, "log_stats", False)
                     logger_manager = getattr(self, "logger_manager", None)
+                    renderer = getattr(self, "renderer", None)
+                    if not hasattr(self, "_logger_ref"):
+                        self._logger_ref = [logger_manager]
+                    logger_ref = getattr(self, "_logger_ref", [logger_manager])
 
                     async def output_handler():
                         try:
@@ -1015,20 +1069,39 @@ def patch_vllm():
                                         if idx + 1 < len(output_slices):
                                             await asyncio.sleep(0)
 
-                                        await engine_core.abort_requests_async(
-                                            processed_outputs.reqs_to_abort,
-                                        )
+                                        if getattr(processed_outputs, "reqs_to_abort", None):
+                                            await engine_core.abort_requests_async(
+                                                processed_outputs.reqs_to_abort,
+                                            )
                                 finally:
                                     _clear_output_handler_round_state()
 
+                                if hasattr(output_processor, "update_scheduler_stats"):
+                                    output_processor.update_scheduler_stats(
+                                        getattr(outputs, "scheduler_stats", None)
+                                    )
+
+                                active_logger_manager = logger_ref[0] if logger_ref else logger_manager
+                                mm_cache_stats = None
+                                if renderer is not None and hasattr(renderer, "stat_mm_cache"):
+                                    try:
+                                        mm_cache_stats = renderer.stat_mm_cache()
+                                    except Exception:
+                                        mm_cache_stats = None
+                                if mm_cache_stats is not None:
+                                    try:
+                                        setattr(outputs, "mm_cache_stats", mm_cache_stats)
+                                    except Exception:
+                                        pass
                                 _record_output_handler_iteration_stats(
-                                    logger_manager,
+                                    active_logger_manager,
                                     outputs,
                                     iteration_stats,
+                                    mm_cache_stats=mm_cache_stats,
                                 )
 
                         except Exception as e:
-                            async_llm_logger.exception("Engine output handler hit an error.")
+                            async_llm_logger.exception("AsyncLLM output_handler failed.")
                             output_processor.propagate_error(e)
 
                     self.output_handler = asyncio.create_task(output_handler())
@@ -1117,7 +1190,7 @@ def patch_vllm():
             OutputProcessor.process_outputs = _mark_patched(patched_process_outputs)
             patch_logger.info("[VLLM_PATCH] Patched OutputProcessor.process_outputs.")
 
-    # 2) Patch Processor.process_inputs: 输入处理/分词阶段
+    # 2) Patch InputProcessor/Processor.process_inputs: 输入处理/分词阶段
     if hasattr(Processor, "process_inputs"):
         original_process_inputs = Processor.process_inputs
         if not _is_patched(original_process_inputs):
@@ -1130,7 +1203,7 @@ def patch_vllm():
                     return original_process_inputs(self, *args, **kwargs)
                 finally:
                     emit_stage_duration(
-                        stage="processor.process_inputs",
+                        stage=process_inputs_stage_name,
                         start_ns=start_ns,
                         end_ns=time.time_ns(),
                         request_id=request_id,
@@ -1138,7 +1211,7 @@ def patch_vllm():
                     )
 
             Processor.process_inputs = _mark_patched(patched_process_inputs)
-            patch_logger.info("[VLLM_PATCH] Patched Processor.process_inputs.")
+            patch_logger.info(f"[VLLM_PATCH] Patched {Processor.__name__}.process_inputs.")
 
     # 3) Patch OutputProcessor.add_request: 本进程入输出处理队列阶段
     if hasattr(OutputProcessor, "add_request"):
@@ -1238,9 +1311,19 @@ def patch_vllm():
             utility_results = self.utility_results
             outputs_queue = self.outputs_queue
             output_handler = getattr(self.__class__, "process_engine_outputs", None)
-            _self_ref = weakref.ref(self) if output_handler else None
             output_socket = resources.output_socket
             assert output_socket is not None
+            notification_callback_handler = getattr(
+                self.__class__,
+                "eep_process_engine_core_notification",
+                None,
+            )
+            eep_notification_call_id = getattr(
+                core_client_module,
+                "EEP_NOTIFICATION_CALL_ID",
+                None,
+            )
+            _self_ref = weakref.ref(self) if (output_handler or notification_callback_handler) else None
 
             async def process_outputs_socket():
                 try:
@@ -1250,7 +1333,23 @@ def patch_vllm():
                         resources.validate_alive(frames)
                         outputs = decoder.decode(frames)
                         if outputs.utility_output:
-                            _process_utility_output(outputs.utility_output, utility_results)
+                            if (
+                                eep_notification_call_id is not None
+                                and getattr(outputs.utility_output, "call_id", None) == eep_notification_call_id
+                                and notification_callback_handler is not None
+                            ):
+                                assert _self_ref is not None
+                                _self = _self_ref()
+                                if not _self:
+                                    return
+                                if outputs.utility_output.result is None:
+                                    continue
+                                notification_data = outputs.utility_output.result.result
+                                asyncio.create_task(
+                                    notification_callback_handler(_self, notification_data)
+                                )
+                            else:
+                                _process_utility_output(outputs.utility_output, utility_results)
                             continue
 
                         req_ids, process_seq = _begin_output_socket_process_outputs(outputs)
@@ -1371,6 +1470,10 @@ def patch_vllm():
         trace_headers = get_arg_value(original_generate, "trace_headers", args, kwargs)
         priority = get_arg_value(original_generate, "priority", args, kwargs)
         data_parallel_rank = get_arg_value(original_generate, "data_parallel_rank", args, kwargs)
+        tokenization_kwargs = get_arg_value(original_generate, "tokenization_kwargs", args, kwargs)
+        prompt_text = get_arg_value(original_generate, "prompt_text", args, kwargs)
+        reasoning_ended = get_arg_value(original_generate, "reasoning_ended", args, kwargs)
+        reasoning_parser_kwargs = get_arg_value(original_generate, "reasoning_parser_kwargs", args, kwargs)
         request_name = get_arg_value(original_generate, "request_name", args, kwargs)
         if request_name is None:
             request_name = request_id
@@ -1411,9 +1514,10 @@ def patch_vllm():
             },
         )
 
+        q = None
         try:
             if (self.vllm_config.cache_config.kv_sharing_fast_prefill
-                    and sampling_params.prompt_logprobs):
+                    and getattr(sampling_params, "prompt_logprobs", None)):
                 raise ValueError(
                     "--kv-sharing-fast-prefill produces incorrect logprobs for "
                     "prompt tokens, please disable it when the requests need "
@@ -1421,26 +1525,53 @@ def patch_vllm():
 
             context_tokens = bind_request_context(request_id, request_name)
             try:
-                self._run_output_handler()
-
-                tokenization_kwargs = {}
-                truncate_prompt_tokens = sampling_params.truncate_prompt_tokens
-                _validate_truncation_size(
-                    self.model_config.max_model_len,
-                    truncate_prompt_tokens,
-                    tokenization_kwargs,
+                add_request_kwargs = filter_supported_kwargs(
+                    original_add_request,
+                    {
+                        "lora_request": lora_request,
+                        "trace_headers": trace_headers,
+                        "priority": priority,
+                        "tokenization_kwargs": tokenization_kwargs,
+                        "data_parallel_rank": data_parallel_rank,
+                        "prompt_text": prompt_text,
+                        "reasoning_ended": reasoning_ended,
+                        "reasoning_parser_kwargs": reasoning_parser_kwargs,
+                    },
                 )
-
+                try:
+                    add_request_params = inspect.signature(original_add_request).parameters
+                except Exception:
+                    add_request_params = {}
+                if (
+                    tokenization_kwargs is None
+                    and _validate_truncation_size is not None
+                    and "tokenization_kwargs" in add_request_params
+                ):
+                    tokenization_kwargs = {}
+                    truncate_prompt_tokens = getattr(sampling_params, "truncate_prompt_tokens", None)
+                    _validate_truncation_size(
+                        self.model_config.max_model_len,
+                        truncate_prompt_tokens,
+                        tokenization_kwargs,
+                    )
+                    add_request_kwargs["tokenization_kwargs"] = tokenization_kwargs
                 q = await self.add_request(
                     request_id,
                     prompt,
                     sampling_params,
-                    lora_request=lora_request,
-                    trace_headers=trace_headers,
-                    priority=priority,
-                    tokenization_kwargs=tokenization_kwargs,
-                    data_parallel_rank=data_parallel_rank,
+                    **add_request_kwargs,
                 )
+                internal_request_id = getattr(q, "request_id", request_id)
+                if internal_request_id and str(internal_request_id) != str(request_id):
+                    remember_request_name(internal_request_id, request_name)
+                    emit_stage_duration(
+                        stage="async_llm.generate_wrapper_setup",
+                        start_ns=wrapper_start_ns,
+                        end_ns=ts_ns,
+                        request_id=internal_request_id,
+                        request_name=request_name,
+                        extra={"external_request_id": request_id},
+                    )
             finally:
                 reset_request_context(context_tokens)
 
@@ -1449,6 +1580,8 @@ def patch_vllm():
                 task = asyncio.current_task()
                 task_id = id(task) if task is not None else current_task_id
                 task_name = task.get_name() if (task is not None and hasattr(task, "get_name")) else current_task_name
+                consume_request_id = getattr(q, "request_id", request_id)
+                consume_request_name = remember_request_name(consume_request_id, request_name)
 
                 exec_start_ns = time.time_ns()
                 ready_since_ns = getattr(q, "_de_latency_ready_since_ns", None)
@@ -1462,8 +1595,8 @@ def patch_vllm():
                         ready_ts_ns=ready_since_ns,
                         run_ts_ns=exec_start_ns,
                         queue_ns=exec_start_ns - ready_since_ns,
-                        request_id=request_id,
-                        request_name=request_name,
+                        request_id=consume_request_id,
+                        request_name=consume_request_name,
                         task_id=task_id,
                         task_name=task_name,
                         task_kind="generate_consume",
@@ -1473,20 +1606,25 @@ def patch_vllm():
                 except Exception:
                     pass
 
-                finished = out.finished
+                finished = getattr(out, "finished", False)
                 exec_end_ns = time.time_ns()
                 emit_coroutine_exec_slice(
                     start_ns=exec_start_ns,
                     end_ns=exec_end_ns,
-                    request_id=request_id,
-                    request_name=request_name,
+                    request_id=consume_request_id,
+                    request_name=consume_request_name,
                     task_id=task_id,
                     task_name=task_name,
                     task_kind="generate_consume",
                 )
-                yield out
+                if stream_finished_sentinel is None or out is not stream_finished_sentinel:
+                    yield out
         except (asyncio.CancelledError, GeneratorExit):
-            await self.abort(request_id)
+            abort_id = getattr(q, "request_id", request_id)
+            try:
+                await self.abort(abort_id, internal=(q is not None))
+            except TypeError:
+                await self.abort(abort_id)
             if self.log_requests:
                 logging.getLogger("vllm.v1.engine.async_llm").info(
                     "Request %s aborted.", request_id)
@@ -1502,7 +1640,13 @@ def patch_vllm():
                     "Request %s failed (bad request).", request_id)
             raise
         except Exception as e:
-            await self.abort(request_id)
+            if q is not None:
+                try:
+                    await self.abort(q.request_id, internal=True)
+                except TypeError:
+                    await self.abort(q.request_id)
+            else:
+                await self.abort(request_id)
             if self.log_requests:
                 logging.getLogger("vllm.v1.engine.async_llm").info(
                     "Request %s failed.", request_id)
@@ -1526,8 +1670,13 @@ def patch_vllm():
                     "timestamp_ns": ts_ns_end,
                 },
             )
+            if q is not None and hasattr(q, "close"):
+                try:
+                    q.close()
+                except Exception:
+                    pass
 
-    AsyncLLM.generate = patched_generate
+    AsyncLLM.generate = _mark_patched(patched_generate)
     AsyncLLM._de_latency_req_stage_patch_installed = True
     patch_logger.info("[VLLM_PATCH] Request stage patch applied successfully!")
 
