@@ -41,6 +41,20 @@ def create_flow_event(ph, ts, pid, tid, corr_id):
     }
 
 
+def emit_thread_name_once(trace_events, emitted_keys, pid, tid, name):
+    key = (pid, tid, name)
+    if key in emitted_keys:
+        return
+    emitted_keys.add(key)
+    trace_events.append({
+        "name": "thread_name",
+        "ph": "M",
+        "pid": pid,
+        "tid": tid,
+        "args": {"name": name},
+    })
+
+
 def build_request_lane_tids(req_index):
     # Keep queue/exec producers on dedicated lanes to avoid Perfetto hiding
     # overlapping slices on the same request track.
@@ -69,6 +83,7 @@ def describe_gpu_phase(phase_name):
         "Forward": ("Model Forward", "python", "olive"),
         "Postprocess": ("Postprocess", "python", "rail_load"),
         "Sample": ("Sampling", "python", "mauve"),
+        "GPUModelRunner sample_tokens": ("GPUModelRunner sample_tokens", "python", "mauve"),
         "Bookkeep": ("Bookkeeping/Sync", "python", "cyan"),
         "Draft": ("Draft", "python", "yellow"),
         "EPLB": ("EPLB", "python", "rail_idle"),
@@ -486,6 +501,25 @@ def canonicalize_payload_request_fields(payload, resolve_request_id):
             if canonical:
                 merged_phase_by_req[canonical] = phase
         payload["phase_by_req"] = merged_phase_by_req
+
+    phase_reason_by_req = payload.get("phase_reason_by_req")
+    if isinstance(phase_reason_by_req, dict):
+        merged_phase_reason_by_req = {}
+        for rid, reason in phase_reason_by_req.items():
+            canonical = resolve_request_id(rid)
+            if canonical:
+                merged_phase_reason_by_req[canonical] = reason
+        payload["phase_reason_by_req"] = merged_phase_reason_by_req
+
+    decode_step_by_req = payload.get("decode_step_by_req")
+    if isinstance(decode_step_by_req, dict):
+        merged_decode_step_by_req = {}
+        for rid, step in decode_step_by_req.items():
+            canonical = resolve_request_id(rid)
+            step_int = to_int(step)
+            if canonical and step_int is not None:
+                merged_decode_step_by_req[canonical] = step_int
+        payload["decode_step_by_req"] = merged_decode_step_by_req
 
     req_events = payload.get("req_events")
     if isinstance(req_events, list):
@@ -1003,6 +1037,7 @@ def build_pp_gap_dispatch_breakdown(dispatches, phase_intervals_by_name, step_ex
         rows.append({
             "dispatch_key": dispatch_key,
             "phase": dispatch.get("phase"),
+            "decode_step": dispatch.get("decode_step"),
             "start_ns": d_start,
             "end_ns": d_end,
             "duration_ns": d_end - d_start,
@@ -1149,7 +1184,7 @@ def render_compute_breakdown_svg(svg_path, ttft_components_ms, tpot_components_m
         ("worker_preprocess", "#59A14F", "Worker Preprocess"),
         ("model_forward", "#4E79A7", "Model Forward"),
         ("postprocess", "#9C755F", "Postprocess"),
-        ("sampling", "#B07AA1", "Sampling"),
+        ("sampling", "#B07AA1", "GPUModelRunner sample_tokens"),
         ("bookkeeping_sync", "#76B7B2", "Bookkeeping / Sync"),
         ("pp_gap", "#F28E2B", "PP Gap"),
         ("other_exec", "#EDC948", "Other Exec"),
@@ -1321,7 +1356,7 @@ def render_request_breakdown_svg(svg_path, rid, request_name, ttft_entry, tpot_e
             "worker_preprocess": "Worker Preprocess",
             "model_forward": "Model Forward",
             "postprocess": "Postprocess",
-            "sampling": "Sampling",
+            "sampling": "GPUModelRunner sample_tokens",
             "bookkeeping_sync": "Bookkeeping / Sync",
             "pp_gap": "PP Gap",
             "other_exec": "Other Exec",
@@ -1940,13 +1975,21 @@ def process_logs(input_file, output_file):
                     })
                 
                 # 画一个透明容器（浅灰色背景）
+                class_path = payload.get("class_path", "") or ""
+                if "gpu.model_runner" in class_path:
+                    event_name = "GPUModelRunner (V2).execute_model"
+                elif "gpu_model_runner" in class_path:
+                    event_name = "GPUModelRunner (V1).execute_model"
+                else:
+                    event_name = "Step Execution"
                 trace_events.append(create_perfetto_event(
-                    name="Step Execution", cat="worker", ph="X",
+                    name=event_name, cat="worker", ph="X",
                     ts=t_start, dur=t_end - t_start,
                     pid=pid, tid=tid,
                     args={
                         "req_ids": "\n".join(req_ids),
                         "batch_size": batch_size,
+                        "class_path": class_path,
                         "dispatch_key": dispatch_key,
                         "dp_rank": ranks.get("dp"),
                         "pp_rank": ranks.get("pp"),
@@ -2678,6 +2721,9 @@ def process_logs(input_file, output_file):
         if ev_type == "req_scheduler_out_rpc":
             dispatch_key = p.get("dispatch_key")
             batch_req_ids = list(p.get("req_ids", []))
+            decode_step_by_req = p.get("decode_step_by_req")
+            if not isinstance(decode_step_by_req, dict):
+                decode_step_by_req = {}
             for rid in p.get("req_ids", []):
                 if rid:
                     pending_dispatch_start[rid].append({
@@ -2685,6 +2731,7 @@ def process_logs(input_file, output_file):
                         "rpc_start_ns": ts_ns,
                         "dispatch_key": dispatch_key,
                         "batch_req_ids": batch_req_ids,
+                        "decode_step": to_int(decode_step_by_req.get(rid)),
                     })
             continue
 
@@ -2695,6 +2742,12 @@ def process_logs(input_file, output_file):
         phase_by_req = p.get("phase_by_req")
         if not isinstance(phase_by_req, dict):
             phase_by_req = {}
+        phase_reason_by_req = p.get("phase_reason_by_req")
+        if not isinstance(phase_reason_by_req, dict):
+            phase_reason_by_req = {}
+        decode_step_by_req = p.get("decode_step_by_req")
+        if not isinstance(decode_step_by_req, dict):
+            decode_step_by_req = {}
 
         for rid in p.get("req_ids", []):
             if not rid:
@@ -2734,21 +2787,32 @@ def process_logs(input_file, output_file):
                 continue
 
             phase = phase_by_req.get(rid)
+            phase_reason = phase_reason_by_req.get(rid)
             if phase not in ("prefill", "decode"):
                 if phase_hint_queue_by_req[rid]:
                     phase = phase_hint_queue_by_req[rid].popleft()
+                    phase_reason = "req_metrics_events_fallback"
                 else:
                     phase = "unknown"
+                    phase_reason = "missing_phase"
             else:
                 # 若 hint 队列头和当前 phase 一致，则消费掉，保持两路数据大致对齐。
                 if phase_hint_queue_by_req[rid] and phase_hint_queue_by_req[rid][0] == phase:
                     phase_hint_queue_by_req[rid].popleft()
+
+            decode_step = None
+            if phase == "decode":
+                decode_step = to_int(decode_step_by_req.get(rid))
+                if decode_step is None:
+                    decode_step = to_int(start_item.get("decode_step"))
 
             dur_ns = end_ns - start_ns
             req_dispatch_intervals_map[rid].append({
                 "start_ns": start_ns,
                 "end_ns": end_ns,
                 "phase": phase,
+                "phase_reason": phase_reason,
+                "decode_step": decode_step,
                 "duration_ns": dur_ns,
                 "dispatch_key": dispatch_key,
                 "batch_req_ids": start_item.get("batch_req_ids", []),
@@ -2795,6 +2859,18 @@ def process_logs(input_file, output_file):
             deduped_dispatch_intervals_map[rid].append(item)
 
     req_dispatch_intervals_map = deduped_dispatch_intervals_map
+    for rid, intervals in req_dispatch_intervals_map.items():
+        next_decode_step = 1
+        for interval in sorted(intervals, key=lambda x: (x["start_ns"], x["end_ns"])):
+            if interval.get("phase") != "decode":
+                continue
+            decode_step = to_int(interval.get("decode_step"))
+            if decode_step is None or decode_step <= 0:
+                interval["decode_step"] = next_decode_step
+                next_decode_step += 1
+            else:
+                interval["decode_step"] = decode_step
+                next_decode_step = max(next_decode_step, decode_step + 1)
     req_dispatch_phase_ns = defaultdict(lambda: defaultdict(int))
     req_dispatch_phase_count = defaultdict(lambda: defaultdict(int))
     for rid, intervals in req_dispatch_intervals_map.items():
@@ -3056,16 +3132,57 @@ def process_logs(input_file, output_file):
     print(f"Linking Runtime events ({len(cupti_events)}) to Dispatch Slices...")
     # 按时间排序 Runtime 事件
     cupti_events.sort(key=lambda x: x['start_ns'])
+
+    cupti_api_lane_ends_by_pid = defaultdict(list)
+    cupti_api_lane_names_emitted = set()
+    cupti_kernel_flow_id_by_obj = {}
+    cupti_next_flow_id = 1_000_000_000
+
+    def allocate_cupti_api_tid(pid, start_ns, end_ns, raw_tid):
+        tid = to_int(raw_tid)
+        if tid is not None and tid > 0:
+            return tid
+
+        # Older logs did not persist CUpti_ActivityAPI.threadId, so every API
+        # call landed on tid=0. Split those records into virtual lanes to keep
+        # Perfetto from dropping partially-overlapping complete events.
+        lanes = cupti_api_lane_ends_by_pid[pid]
+        lane_idx = None
+        for idx, lane_end in enumerate(lanes):
+            if start_ns >= lane_end:
+                lane_idx = idx
+                break
+        if lane_idx is None:
+            lane_idx = len(lanes)
+            lanes.append(end_ns)
+        else:
+            lanes[lane_idx] = end_ns
+
+        virtual_tid = 10_000_000 + lane_idx
+        emit_thread_name_once(
+            trace_events,
+            cupti_api_lane_names_emitted,
+            pid,
+            virtual_tid,
+            f"CUPTI API lane {lane_idx + 1} (tid unknown)",
+        )
+        return virtual_tid
+
+    def next_cupti_flow_id():
+        nonlocal cupti_next_flow_id
+        flow_id = cupti_next_flow_id
+        cupti_next_flow_id += 1
+        return flow_id
     
     for rt in cupti_events:
         rt_start = rt['start_ns']
         rt_end = rt['end_ns']
-        rt_tid = rt['tid']
-        rt_pid = rt.get('pid')  # 直接从 payload 获取 pid
+        rt_pid = rt.get('pid')
         
         # 如果 payload 里没存 pid，尝试从生成的 slice 里找（备选方案）
         if not rt_pid and generated_dispatch_slices:
             rt_pid = generated_dispatch_slices[0]['pid']
+        rt_tid = allocate_cupti_api_tid(rt_pid, rt_start, rt_end, rt.get('tid'))
 
         corr_id = rt.get('correlationId')
         func_name = rt.get('name', 'cuda_runtime')
@@ -3074,7 +3191,6 @@ def process_logs(input_file, output_file):
         # DP 多进程下必须用 (pid, correlationId) 做键，避免一个 runtime
         # 错连到另一个 EngineCore 进程的 GPU kernel。
         runtime_corr_key = cupti_corr_key(rt, corr_id=corr_id, pid_override=rt_pid)
-        runtime_flow_id = cupti_flow_id(rt, corr_id=corr_id, pid_override=rt_pid)
         runtime_flow_debug_key = cupti_flow_debug_key(
             rt,
             corr_id=corr_id,
@@ -3097,11 +3213,18 @@ def process_logs(input_file, output_file):
             pid=rt_pid, tid=rt_tid, args=args
         ))
         
-        # 画 Flow 线 (Runtime -> Kernel)
-        # 哪怕是 CUDAGraph，只要有 correlationId，就尝试连线
-        has_eager_kernel = any(k.get('start_ns', 0) > 0 for k in kernels)
-        if has_eager_kernel:
-            trace_events.append(create_flow_event("s", rt_start, rt_pid, rt_tid, runtime_flow_id))
+        # 画 Flow 线 (Runtime -> Kernel)。一个 runtime correlation 可能对应
+        # CUDA Graph replay 的数百个 kernel；Perfetto 要求每条 flow 的 id 只
+        # 对应一对 start/finish，因此这里为每个 kernel 单独分配 flow id。
+        for k in kernels:
+            if k.get('start_ns', 0) <= 0:
+                continue
+            kernel_obj_id = id(k)
+            if kernel_obj_id in cupti_kernel_flow_id_by_obj:
+                continue
+            flow_id = next_cupti_flow_id()
+            cupti_kernel_flow_id_by_obj[kernel_obj_id] = flow_id
+            trace_events.append(create_flow_event("s", rt_start, rt_pid, rt_tid, flow_id))
 
     # --- 5. 画 GPU Kernel ---
     print(f"Processing Eager Kernels ({len(eager_kernels)})...")
@@ -3163,13 +3286,14 @@ def process_logs(input_file, output_file):
         })
 
         # Flow 终点
-        if corr_id:
+        flow_id = cupti_kernel_flow_id_by_obj.get(id(k))
+        if flow_id is not None:
             trace_events.append(create_flow_event(
                 "f",
                 start,
                 gpu_pid,
                 stream,
-                cupti_flow_id(k, corr_id=corr_id, pid_override=source_pid),
+                flow_id,
             ))
 
     print(f"Processing Request Metric Events ({len(req_metric_events)})...")
@@ -3468,6 +3592,7 @@ def process_logs(input_file, output_file):
         "Forward": "model_forward",
         "Postprocess": "postprocess",
         "Sample": "sampling",
+        "GPUModelRunner sample_tokens": "sampling",
         "Bookkeep": "bookkeeping_sync",
         "Draft": "draft",
         "EPLB": "eplb",
@@ -4195,6 +4320,8 @@ def process_logs(input_file, output_file):
                 args={
                     "request_id": rid,
                     "phase": phase,
+                    "phase_reason": d.get("phase_reason"),
+                    "decode_step": d.get("decode_step"),
                     "dispatch_key": d.get("dispatch_key"),
                     "dispatch_keys": d.get("dispatch_keys"),
                     "dispatch_key_count": d.get("dispatch_key_count"),

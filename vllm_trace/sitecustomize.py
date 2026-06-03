@@ -102,7 +102,6 @@ GPU_PHASE_NAME_ALIASES = {
     "Preprocess": "Preprocess",
     "Forward": "Forward",
     "Postprocess": "Postprocess",
-    "Sample": "Sample",
     "Bookkeep": "Bookkeep",
     "Draft": "Draft",
     "EPLB": "EPLB",
@@ -110,7 +109,6 @@ GPU_PHASE_NAME_ALIASES = {
     "gpu_model_runner: preprocess": "Preprocess",
     "gpu_model_runner: forward": "Forward",
     "gpu_model_runner: postprocess": "Postprocess",
-    "gpu_model_runner: sample": "Sample",
     "gpu_model_runner: bookkeep": "Bookkeep",
     "gpu_model_runner: draft": "Draft",
     "gpu_model_runner: eplb": "EPLB",
@@ -519,7 +517,19 @@ def _refresh_gpu_exec_context(ctx):
 def _build_gpu_exec_context(runner, scheduler_output=None, method_name=None):
     summary = _summarize_scheduler_output(scheduler_output)
     ranks = _get_parallel_rank_info(runner)
-    dispatch_key = _make_dispatch_key(scheduler_output)
+
+    if scheduler_output is not None:
+        dispatch_key = _make_dispatch_key(scheduler_output)
+    else:
+        dispatch_key = None
+        existing = _current_gpu_exec_context()
+        if existing is not None:
+            dispatch_key = existing.get("dispatch_key")
+            if not summary.get("req_ids"):
+                summary["req_ids"] = existing.get("req_ids", [])
+        if not dispatch_key:
+            dispatch_key = _make_dispatch_key(scheduler_output)
+
     ctx = {
         "runner": runner,
         "pid": os.getpid(),
@@ -1344,6 +1354,7 @@ def patch_gpu_model_runner(module):
                         "batch_size": ctx.get("batch_size", 0),
                         "input_type": ctx.get("input_type", "unknown"),
                         "hooked_method": original_func.__name__,
+                        "class_path": "vllm.v1.worker.gpu_model_runner.GPUModelRunner",
                         "req_ids": list(ctx.get("req_ids", [])),
                         "input_batch_req_ids": list(ctx.get("input_batch_req_ids", [])),
                         "dispatch_key": ctx.get("dispatch_key"),
@@ -1362,6 +1373,7 @@ def patch_gpu_model_runner(module):
     elif hasattr(cls, "sample_tokens"):
         def sample_tokens_wrapper(original_func):
             def wrapper(self, *args, **kwargs):
+                start_ns = time.time_ns()
                 start_mono = int(time.clock_gettime_ns(time.CLOCK_MONOTONIC))
                 scheduler_output = _extract_scheduler_output_from_runner_state(self)
                 ctx = _build_gpu_exec_context(
@@ -1375,9 +1387,26 @@ def patch_gpu_model_runner(module):
                 finally:
                     ctx = _pop_gpu_exec_context() or ctx
                     ctx = _refresh_gpu_exec_context(ctx)
+                    end_ns = time.time_ns()
                     end_mono = int(time.clock_gettime_ns(time.CLOCK_MONOTONIC))
                     req_ids = list(ctx.get("req_ids", []))
                     if req_ids:
+                        TraceSender.emit(
+                            event_type="gpu_phase_span",
+                            payload={
+                                "phase": "GPUModelRunner sample_tokens",
+                                "pid": ctx.get("pid", os.getpid()),
+                                "tid": ctx.get("tid", _get_native_tid()),
+                                "req_ids": req_ids,
+                                "ranks": dict(ctx.get("ranks", {})),
+                                "dispatch_key": ctx.get("dispatch_key"),
+                                "batch_size": ctx.get("batch_size", 0),
+                                "input_type": ctx.get("input_type", "unknown"),
+                                "method_name": original_func.__name__,
+                                "start_ns": start_ns,
+                                "end_ns": end_ns,
+                            },
+                        )
                         TraceSender.emit(
                             event_type="worker_model_execute_span",
                             payload={
@@ -1389,6 +1418,7 @@ def patch_gpu_model_runner(module):
                                 "batch_size": ctx.get("batch_size", 0),
                                 "input_type": ctx.get("input_type", "unknown"),
                                 "hooked_method": original_func.__name__,
+                                "class_path": "vllm.v1.worker.gpu_model_runner.GPUModelRunner",
                                 "start_ns": start_mono,
                                 "end_ns": end_mono,
                                 "duration_us": (end_mono - start_mono) // 1000,
@@ -1398,6 +1428,147 @@ def patch_gpu_model_runner(module):
 
         if apply_method_patch(cls, "sample_tokens", sample_tokens_wrapper):
             cls._de_latency_sample_tokens_patch_installed = True
+
+@register_hook("vllm.v1.worker.gpu.model_runner")
+def patch_v2_gpu_model_runner(module):
+    """
+    针对 vLLM V2 GPU Worker (vllm/v1/worker/gpu/model_runner.py) 的插桩。
+    V2 没有 record_function_or_nullcontext，不产生 gpu_phase_span。
+    只 patch execute_model 和 sample_tokens，产出 gpu_execute_model +
+    worker_model_execute_span 两个事件。
+    """
+    if not hasattr(module, "GPUModelRunner"):
+        logger.warning(f"GPUModelRunner not found in {module.__name__}")
+        return
+
+    cls = module.GPUModelRunner
+    logger.info(f">>> [HOOK] Patching V2 GPUModelRunner: {cls}")
+
+    # ---- execute_model --------------------------------------------------
+    def v2_execute_model_wrapper(original_func):
+        sig = inspect.signature(original_func)
+
+        def wrapper(self, *args, **kwargs):
+            scheduler_output = None
+            try:
+                bound_args = sig.bind(self, *args, **kwargs)
+                bound_args.apply_defaults()
+                scheduler_output = bound_args.arguments.get("scheduler_output")
+            except Exception:
+                pass
+
+            start_ns = time.time_ns()
+            ctx = _build_gpu_exec_context(
+                self,
+                scheduler_output=scheduler_output,
+                method_name=original_func.__name__,
+            )
+            # V2 的 ExecuteModelState 不含 scheduler_output，
+            # 把 ctx 关键字段暂存到 self 上，供 sample_tokens 使用。
+            self._de_v2_dispatch_key = ctx.get("dispatch_key")
+            self._de_v2_req_ids = list(ctx.get("req_ids", []))
+            self._de_v2_ranks = dict(ctx.get("ranks", {}))
+            self._de_v2_batch_size = ctx.get("batch_size", 0)
+
+            _push_gpu_exec_context(ctx)
+            try:
+                return original_func(self, *args, **kwargs)
+            finally:
+                end_ns = time.time_ns()
+                ctx = _pop_gpu_exec_context() or ctx
+                ctx = _refresh_gpu_exec_context(ctx)
+                TraceSender.emit(
+                    event_type="gpu_execute_model",
+                    payload={
+                        "pid": ctx.get("pid", os.getpid()),
+                        "tid": ctx.get("tid", _get_native_tid()),
+                        "ranks": dict(ctx.get("ranks", {})),
+                        "batch_size": ctx.get("batch_size", 0),
+                        "input_type": ctx.get("input_type", "unknown"),
+                        "hooked_method": original_func.__name__,
+                        "class_path": "vllm.v1.worker.gpu.model_runner.GPUModelRunner",
+                        "req_ids": list(ctx.get("req_ids", [])),
+                        "input_batch_req_ids": list(ctx.get("input_batch_req_ids", [])),
+                        "dispatch_key": ctx.get("dispatch_key"),
+                        "start_ns": start_ns,
+                        "end_ns": end_ns,
+                    },
+                )
+
+        return wrapper
+
+    if apply_method_patch(cls, "execute_model", v2_execute_model_wrapper):
+        cls._de_latency_v2_execute_model_patch_installed = True
+
+    # ---- sample_tokens --------------------------------------------------
+    if getattr(cls, "_de_latency_v2_sample_tokens_patch_installed", False):
+        logger.info(">>> [HOOK] GPUModelRunner.sample_tokens patch already installed")
+    elif hasattr(cls, "sample_tokens"):
+        def v2_sample_tokens_wrapper(original_func):
+            def wrapper(self, *args, **kwargs):
+                start_ns = time.time_ns()
+                start_mono = int(time.clock_gettime_ns(time.CLOCK_MONOTONIC))
+                dispatch_key = getattr(self, "_de_v2_dispatch_key", None)
+                req_ids = getattr(self, "_de_v2_req_ids", [])
+                ranks = getattr(self, "_de_v2_ranks", {})
+                batch_size = getattr(self, "_de_v2_batch_size", 0)
+                ctx = {
+                    "dispatch_key": dispatch_key,
+                    "req_ids": req_ids,
+                    "ranks": ranks,
+                    "batch_size": batch_size,
+                    "pid": os.getpid(),
+                    "tid": _get_native_tid(),
+                    "input_type": "unknown",
+                    "method_name": original_func.__name__,
+                    "runner": self,
+                }
+                _push_gpu_exec_context(ctx)
+                try:
+                    return original_func(self, *args, **kwargs)
+                finally:
+                    ctx = _pop_gpu_exec_context() or ctx
+                    end_ns = time.time_ns()
+                    end_mono = int(time.clock_gettime_ns(time.CLOCK_MONOTONIC))
+                    actual_req_ids = list(ctx.get("req_ids", req_ids))
+                    if actual_req_ids:
+                        TraceSender.emit(
+                            event_type="gpu_phase_span",
+                            payload={
+                                "phase": "GPUModelRunner sample_tokens",
+                                "pid": ctx.get("pid", os.getpid()),
+                                "tid": ctx.get("tid", _get_native_tid()),
+                                "req_ids": actual_req_ids,
+                                "ranks": dict(ctx.get("ranks", ranks)),
+                                "dispatch_key": ctx.get("dispatch_key", dispatch_key),
+                                "batch_size": ctx.get("batch_size", batch_size),
+                                "input_type": ctx.get("input_type", "unknown"),
+                                "method_name": original_func.__name__,
+                                "start_ns": start_ns,
+                                "end_ns": end_ns,
+                            },
+                        )
+                        TraceSender.emit(
+                            event_type="worker_model_execute_span",
+                            payload={
+                                "req_ids": actual_req_ids,
+                                "pid": ctx.get("pid", os.getpid()),
+                                "tid": ctx.get("tid", _get_native_tid()),
+                                "dispatch_key": ctx.get("dispatch_key", dispatch_key),
+                                "ranks": dict(ctx.get("ranks", ranks)),
+                                "batch_size": ctx.get("batch_size", batch_size),
+                                "input_type": ctx.get("input_type", "unknown"),
+                                "hooked_method": original_func.__name__,
+                                "class_path": "vllm.v1.worker.gpu.model_runner.GPUModelRunner",
+                                "start_ns": start_mono,
+                                "end_ns": end_mono,
+                                "duration_us": (end_mono - start_mono) // 1000,
+                            },
+                        )
+            return wrapper
+
+        if apply_method_patch(cls, "sample_tokens", v2_sample_tokens_wrapper):
+            cls._de_latency_v2_sample_tokens_patch_installed = True
 
 @register_hook("vllm.v1.core.sched.scheduler") 
 def patch_v1_scheduler(module):
@@ -1436,23 +1607,25 @@ def patch_v1_scheduler(module):
             return None
         return "prefill" if num_computed_tokens < num_prompt_tokens else "decode"
 
-    def _build_scheduled_phase_map(scheduler_obj, scheduler_output) -> Dict[str, str]:
-        """
-        为当前调度步构建 req_id -> phase 映射。
-        vLLM 0.20 的调度语义以 context/generation 区分请求阶段：
-        新请求或 cached.is_context_phase(req_id) 为 prefill，否则为 decode。
-        旧版缺少该信息时，再回退到 num_computed_tokens < num_prompt_tokens。
-        """
-        phase_by_req = {}
+    def _collect_scheduler_request_token_state(scheduler_obj):
         prompt_tokens_by_req = {}
         output_tokens_by_req = {}
+
+        def _rid_keys(rid):
+            keys = []
+            for key in [rid] + _normalize_req_ids(rid):
+                if key and key not in keys:
+                    keys.append(key)
+            return keys
 
         try:
             req_map = getattr(scheduler_obj, "requests", {}) or {}
             for rid, req in req_map.items():
+                rid_keys = _rid_keys(rid)
                 npt = _safe_int(getattr(req, "num_prompt_tokens", None))
-                if rid and npt is not None:
-                    prompt_tokens_by_req[rid] = npt
+                if npt is not None:
+                    for key in rid_keys:
+                        prompt_tokens_by_req[key] = npt
                 notok = _safe_int(
                     getattr(req, "num_output_tokens", None),
                 )
@@ -1460,31 +1633,43 @@ def patch_v1_scheduler(module):
                     getattr(req, "num_output_placeholders", None),
                     0,
                 )
-                if rid and notok is not None:
-                    output_tokens_by_req[rid] = notok + (placeholders or 0)
+                if notok is not None:
+                    for key in rid_keys:
+                        output_tokens_by_req[key] = notok + (placeholders or 0)
         except Exception:
             pass
 
-        # 新请求在 vLLM 0.20 的 compute_iteration_details 中总是 context。
+        return prompt_tokens_by_req, output_tokens_by_req
+
+    def _build_scheduled_phase_map(scheduler_obj, scheduler_output):
+        """
+        为当前调度步构建 req_id -> phase 映射。
+        vLLM 0.20 的调度语义以 context/generation 区分请求阶段：
+        新请求或 cached.is_context_phase(req_id) 为 prefill，否则为 decode。
+        旧版缺少该信息时，再回退到 num_computed_tokens < num_prompt_tokens。
+        """
+        phase_by_req = {}
+        phase_reason_by_req = {}
+        prompt_tokens_by_req, output_tokens_by_req = (
+            _collect_scheduler_request_token_state(scheduler_obj)
+        )
+
+        # 新请求：使用 scheduler_output 自身的静态数据判断 phase，
+        # 不依赖 _collect_scheduler_request_token_state 的 live 状态，
+        # 避免异步调度时下一轮 schedule() 修改了 live 状态导致误判。
         try:
             if hasattr(scheduler_output, "scheduled_new_reqs"):
                 for req in scheduler_output.scheduled_new_reqs:
                     rid = getattr(req, "request_id", None) or getattr(req, "req_id", None)
                     if not rid:
                         continue
-                    output_tokens = output_tokens_by_req.get(rid)
-                    if output_tokens == 0 or output_tokens is None:
-                        phase_by_req[rid] = "prefill"
-                        continue
                     num_computed = _safe_int(getattr(req, "num_computed_tokens", None))
-                    num_prompt = prompt_tokens_by_req.get(rid)
-                    if num_prompt is None:
-                        prompt_ids = getattr(req, "prompt_token_ids", None)
-                        if prompt_ids is not None:
-                            num_prompt = _safe_int(len(prompt_ids))
+                    prompt_ids = getattr(req, "prompt_token_ids", None)
+                    num_prompt = _safe_int(len(prompt_ids)) if prompt_ids is not None else None
                     phase = _phase_from_counts(num_computed, num_prompt)
                     if phase:
                         phase_by_req[rid] = phase
+                        phase_reason_by_req[rid] = "new_req_static_token_counts"
         except Exception:
             pass
 
@@ -1501,25 +1686,54 @@ def patch_v1_scheduler(module):
                         phase = None
                         num_computed = _safe_int(num_computed_list[i]) if i < len(num_computed_list) else None
                         num_prompt = prompt_tokens_by_req.get(rid)
-                        # Cached requests can still be context/prefill chunks.
-                        # Prefer the scheduled token range over output token count;
-                        # a request may already have output tokens while more
-                        # prompt/context work is still being drained.
-                        phase = _phase_from_counts(num_computed, num_prompt)
+                        # vLLM's scheduler owns the context/generation state.
+                        # Token counts are only a fallback: async PP can enqueue
+                        # later SchedulerOutputs while earlier context work is
+                        # still draining on downstream PP stages.
+                        try:
+                            if hasattr(cached, "is_context_phase"):
+                                phase = "prefill" if cached.is_context_phase(rid) else "decode"
+                                phase_reason_by_req[rid] = "cached_is_context_phase"
+                        except Exception:
+                            phase = None
                         if phase is None:
-                            try:
-                                if hasattr(cached, "is_context_phase"):
-                                    phase = "prefill" if cached.is_context_phase(rid) else "decode"
-                            except Exception:
-                                phase = None
+                            phase = _phase_from_counts(num_computed, num_prompt)
+                            if phase:
+                                phase_reason_by_req[rid] = "cached_token_counts_fallback"
                         if phase is None and rid in output_tokens_by_req:
                             phase = "prefill" if output_tokens_by_req.get(rid, 0) == 0 else "decode"
+                            phase_reason_by_req[rid] = "cached_output_tokens_fallback"
                         if phase:
                             phase_by_req[rid] = phase
         except Exception:
             pass
 
-        return phase_by_req
+        return phase_by_req, phase_reason_by_req
+
+    def _build_decode_step_map(
+        scheduler_obj,
+        scheduler_output,
+        phase_by_req: Dict[str, str],
+    ) -> Dict[str, int]:
+        """Return req_id -> 1-based decode dispatch index for this step."""
+        decode_step_by_req = {}
+        prompt_tokens_by_req, _ = _collect_scheduler_request_token_state(scheduler_obj)
+        num_computed_by_req, _ = _extract_scheduler_step_maps(scheduler_output)
+
+        for rid in _extract_req_ids_from_scheduler_output(scheduler_output):
+            if not rid or phase_by_req.get(rid) != "decode":
+                continue
+
+            num_computed = _safe_int(num_computed_by_req.get(rid))
+            num_prompt = _safe_int(prompt_tokens_by_req.get(rid))
+            if num_computed is None or num_prompt is None:
+                continue
+
+            step = num_computed - num_prompt + 1
+            if step > 0:
+                decode_step_by_req[rid] = step
+
+        return decode_step_by_req
 
     #这个函数帮助我们将update_from_output函数返回的dict[int, EngineCoreOutputs]中的每个req的时间戳事件提取出来
     def extract_events_from_results(results_dict: Dict[int, Any], scheduled_phase_by_req: Dict[str, str]) -> List[Dict]:
@@ -1585,7 +1799,15 @@ def patch_v1_scheduler(module):
 
     def update_from_output_wrapper(original_func):
         def wrapper(self, scheduler_output, model_output):
-            scheduled_phase_by_req = _build_scheduled_phase_map(self, scheduler_output)
+            scheduled_phase_by_req, phase_reason_by_req = _build_scheduled_phase_map(
+                self,
+                scheduler_output,
+            )
+            decode_step_by_req = _build_decode_step_map(
+                self,
+                scheduler_output,
+                scheduled_phase_by_req,
+            )
             dispatch_key = _make_dispatch_key(
                 scheduler_output,
                 phase_by_req=scheduled_phase_by_req,
@@ -1616,6 +1838,8 @@ def patch_v1_scheduler(module):
                     payload={
                         "req_ids": req_ids,
                         "phase_by_req": scheduled_phase_by_req,
+                        "phase_reason_by_req": phase_reason_by_req,
+                        "decode_step_by_req": decode_step_by_req,
                         "dispatch_key": dispatch_key,
                         "event": "step_ready",
                         "num_computed_by_req": _extract_scheduler_step_maps(scheduler_output)[0],
