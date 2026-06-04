@@ -2829,6 +2829,10 @@ def process_logs(input_file, output_file):
             if end_ns <= start_ns:
                 continue
 
+            span = request_spans.get(rid)
+            if span and end_ns > span.get("end_ns", 0):
+                continue
+
             phase = phase_by_req.get(rid)
             phase_reason = phase_reason_by_req.get(rid)
             if phase not in ("prefill", "decode"):
@@ -3502,6 +3506,11 @@ def process_logs(input_file, output_file):
         group_key, _dp_rank = worker_group_key(payload, tid)
         worker_tids_by_group[group_key].add(tid)
         for rid in req_ids:
+            lc = request_spans.get(rid)
+            if lc and global_mono_to_wall_offset is not None:
+                span_start_wall = span_start + global_mono_to_wall_offset
+                if span_start_wall > lc.get("end_ns", 0):
+                    continue
             req_windows_by_group[group_key][rid].append((span_start, span_end))
             req_groups[rid].add(group_key)
 
