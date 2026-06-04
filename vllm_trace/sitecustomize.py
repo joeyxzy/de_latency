@@ -97,6 +97,70 @@ class TraceSender:
                 pass
 
 
+# ---------------------------------------------------------------------------
+# GPU-side batch marker via de_marker kernel in libtracer.so
+#   libtracer.so 已由 LD_PRELOAD 注入本进程，其符号在全局符号表中。
+#   通过 dlopen(NULL) + dlsym("de_marker_push") 直取，无需任何路径依赖。
+# ---------------------------------------------------------------------------
+import ctypes
+
+_marker_fn = None
+_marker_init_ok = False
+_marker_dbg_cnt = 0
+_marker_dbg_path = "/tmp/de_marker_debug.log"
+
+def _marker_dbg(msg):
+    global _marker_dbg_cnt
+    _marker_dbg_cnt += 1
+    if _marker_dbg_cnt <= 20 or _marker_dbg_cnt % 500 == 0:
+        try:
+            with open(_marker_dbg_path, "a") as f:
+                f.write(f"[marker #{_marker_dbg_cnt}] {msg}\n")
+        except Exception:
+            pass
+
+_marker_dbg(f"init pid={os.getpid()}")
+try:
+    _libdl = ctypes.CDLL("libdl.so.2")
+    _libdl.dlopen.restype = ctypes.c_void_p
+    _libdl.dlopen.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    _libdl.dlsym.restype = ctypes.c_void_p
+    _libdl.dlsym.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
+    RTLD_LAZY = 1
+    _global_handle = _libdl.dlopen(None, RTLD_LAZY)
+    if not _global_handle:
+        _marker_dbg("init FAIL dlopen(NULL) returned NULL")
+    else:
+        _fn_addr = _libdl.dlsym(_global_handle, b"de_marker_push")
+        if not _fn_addr:
+            _marker_dbg("init FAIL dlsym(de_marker_push) returned NULL")
+        else:
+            _PROT = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p)
+            _marker_fn = _PROT(_fn_addr)
+            _marker_init_ok = True
+            _marker_dbg(f"init OK dlsym found de_marker_push")
+except Exception as e:
+    _marker_dbg(f"init FAIL exception: {e}")
+
+
+def _de_gpu_mark(stream, role, dispatch_key):
+    if not _marker_init_ok:
+        _marker_dbg(f"call SKIP: init failed role={role} dk={dispatch_key}")
+        return
+    if dispatch_key is None:
+        _marker_dbg(f"call SKIP: dispatch_key=None role={role}")
+        return
+    try:
+        stream_ptr = int(stream.cuda_stream)
+    except Exception as e:
+        _marker_dbg(f"call FAIL cuda_stream attr: {e} role={role} dk={dispatch_key} stream_type={type(stream).__name__}")
+        return
+    meta = f"{role}|{dispatch_key}".encode()
+    ret = _marker_fn(stream_ptr, meta)
+    _marker_dbg(f"call ret={ret} role={role} dk={dispatch_key} stream={stream_ptr:#x}")
+
+
 _GPU_EXEC_CONTEXT = threading.local()
 GPU_PHASE_NAME_ALIASES = {
     "Preprocess": "Preprocess",
@@ -1338,11 +1402,22 @@ def patch_gpu_model_runner(module):
                 scheduler_output=scheduler_output,
                 method_name=original_func.__name__,
             )
+            self._de_v1_dispatch_key = ctx.get("dispatch_key")
             _push_gpu_exec_context(ctx)
+            try:
+                import torch
+                _de_gpu_mark(torch.cuda.current_stream(), "exec_start", ctx.get("dispatch_key"))
+            except Exception:
+                pass
             try:
                 return original_func(self, *args, **kwargs)
             finally:
                 end_ns = time.time_ns()
+                try:
+                    import torch
+                    _de_gpu_mark(torch.cuda.current_stream(), "exec_end", ctx.get("dispatch_key"))
+                except Exception:
+                    pass
                 ctx = _pop_gpu_exec_context() or ctx
                 ctx = _refresh_gpu_exec_context(ctx)
                 TraceSender.emit(
@@ -1381,10 +1456,24 @@ def patch_gpu_model_runner(module):
                     scheduler_output=scheduler_output,
                     method_name=original_func.__name__,
                 )
+                if scheduler_output is None:
+                    dk = getattr(self, "_de_v1_dispatch_key", None)
+                    if dk:
+                        ctx["dispatch_key"] = dk
                 _push_gpu_exec_context(ctx)
+                try:
+                    import torch
+                    _de_gpu_mark(torch.cuda.current_stream(), "sample_start", ctx.get("dispatch_key"))
+                except Exception:
+                    pass
                 try:
                     return original_func(self, *args, **kwargs)
                 finally:
+                    try:
+                        import torch
+                        _de_gpu_mark(torch.cuda.current_stream(), "sample_end", ctx.get("dispatch_key"))
+                    except Exception:
+                        pass
                     ctx = _pop_gpu_exec_context() or ctx
                     ctx = _refresh_gpu_exec_context(ctx)
                     end_ns = time.time_ns()
@@ -1472,9 +1561,19 @@ def patch_v2_gpu_model_runner(module):
 
             _push_gpu_exec_context(ctx)
             try:
+                import torch
+                _de_gpu_mark(torch.cuda.current_stream(), "exec_start", ctx.get("dispatch_key"))
+            except Exception:
+                pass
+            try:
                 return original_func(self, *args, **kwargs)
             finally:
                 end_ns = time.time_ns()
+                try:
+                    import torch
+                    _de_gpu_mark(torch.cuda.current_stream(), "exec_end", ctx.get("dispatch_key"))
+                except Exception:
+                    pass
                 ctx = _pop_gpu_exec_context() or ctx
                 ctx = _refresh_gpu_exec_context(ctx)
                 TraceSender.emit(
@@ -1525,8 +1624,18 @@ def patch_v2_gpu_model_runner(module):
                 }
                 _push_gpu_exec_context(ctx)
                 try:
+                    import torch
+                    _de_gpu_mark(torch.cuda.current_stream(), "sample_start", dispatch_key)
+                except Exception:
+                    pass
+                try:
                     return original_func(self, *args, **kwargs)
                 finally:
+                    try:
+                        import torch
+                        _de_gpu_mark(torch.cuda.current_stream(), "sample_end", dispatch_key)
+                    except Exception:
+                        pass
                     ctx = _pop_gpu_exec_context() or ctx
                     end_ns = time.time_ns()
                     end_mono = int(time.clock_gettime_ns(time.CLOCK_MONOTONIC))

@@ -5,6 +5,7 @@
 #include <sys/syscall.h>
 #include <pthread.h>
 #include <map>
+#include <unordered_map>
 #include <vector>
 #include <mutex>
 #include <climits>
@@ -128,6 +129,10 @@ static volatile bool g_send_thread_stop = false;
 
 static int g_cupti_start_delay_sec = 15;
 static pthread_t g_cupti_delay_thread;
+
+static std::atomic<uint32_t> g_marker_seq{0};
+static std::unordered_map<uint32_t, std::string> g_marker_map;
+static std::mutex g_marker_map_mutex;
 
 static unsigned int g_enabled_activity_kinds = 0;
 #define ACTIVITY_KIND_KERNEL              (1u << 0)
@@ -574,6 +579,13 @@ static bool record_to_json(const UnifiedTraceRecord *rec, char *buf, size_t bufs
                 ",\"deviceId\":%u,\"contextId\":%u,\"streamId\":%u,\"value\":%u",
                 rec->deviceId, rec->contextId, rec->streamId, rec->memset_value);
             break;
+        case RECORD_TYPE_MARKER:
+            len += snprintf(buf + len, bufsz - len,
+                ",\"deviceId\":%u,\"contextId\":%u,\"streamId\":%u",
+                rec->deviceId, rec->contextId, rec->streamId);
+            if (rec->name[0])
+                len += snprintf(buf + len, bufsz - len, ",\"name\":\"%s\"", rec->name);
+            break;
         case RECORD_TYPE_DRIVER:
         case RECORD_TYPE_RUNTIME:
             len += snprintf(buf + len, bufsz - len, ",\"cbid\":%u", rec->cbid);
@@ -876,6 +888,7 @@ static const char *record_type_str(uint32_t t) {
         case RECORD_TYPE_MEMSET: return "memset";
         case RECORD_TYPE_DRIVER: return "driver";
         case RECORD_TYPE_RUNTIME: return "runtime";
+        case RECORD_TYPE_MARKER: return "marker";
         default: return "unknown";
     }
 }
@@ -986,6 +999,47 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
             case CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL:
             case CUPTI_ACTIVITY_KIND_KERNEL: {
                 auto *k = (CUpti_ActivityKernel4 *)record;
+                if (strstr(k->name, "de_marker") != NULL) {
+                    // 1. 先发一份普通 kernel 记录，保留在 GPU 时间轴上可见
+                    UnifiedTraceRecord kern_copy = {};
+                    kern_copy.type     = RECORD_TYPE_KERNEL;
+                    kern_copy.start_ns = k->start;
+                    kern_copy.end_ns   = k->end;
+                    kern_copy.correlationId = k->correlationId;
+                    kern_copy.deviceId      = k->deviceId;
+                    kern_copy.contextId     = k->contextId;
+                    kern_copy.streamId      = k->streamId;
+                    kern_copy.pid           = getpid();
+                    strncpy(kern_copy.name, k->name, sizeof(kern_copy.name) - 1);
+                    kern_copy.gridX  = k->gridX;  kern_copy.gridY  = k->gridY;  kern_copy.gridZ  = k->gridZ;
+                    kern_copy.blockX = k->blockX; kern_copy.blockY = k->blockY; kern_copy.blockZ = k->blockZ;
+                    kern_copy.staticSharedMemory  = k->staticSharedMemory;
+                    kern_copy.dynamicSharedMemory = k->dynamicSharedMemory;
+                    send_record_payload(&kern_copy);
+
+                    // 2. 再发一份 marker 记录，携带 metadata 用于批次定界
+                    rec.type     = RECORD_TYPE_MARKER;
+                    rec.start_ns = k->start;
+                    rec.end_ns   = k->end;
+                    rec.streamId = k->streamId;
+                    rec.deviceId = k->deviceId;
+                    rec.contextId = k->contextId;
+                    rec.pid      = getpid();
+                    {
+                        std::lock_guard<std::mutex> lk(g_marker_map_mutex);
+                        auto it = g_marker_map.find(k->gridX);
+                        if (it != g_marker_map.end()) {
+                            strncpy(rec.name, it->second.c_str(), sizeof(rec.name) - 1);
+                            g_marker_map.erase(it);
+                        }
+                    }
+                    if (rec.name[0]) {
+                        record_valid = true;
+                    } else {
+                        record_valid = false;
+                    }
+                    break;
+                }
                 rec.type = RECORD_TYPE_KERNEL;
                 rec.start_ns = k->start;
                 rec.end_ns = k->end;
@@ -1094,6 +1148,22 @@ static void *cupti_delayed_enable_thread(void *) {
         tracer_log("[delay] CUPTI enable failed");
     }
     return NULL;
+}
+
+// --- GPU-side batch marker kernel and export ---
+extern "C" __global__ void de_marker() {}
+
+extern "C" int de_marker_push(void* stream_ptr, const char* meta) {
+    if (meta == nullptr) return -1;
+    uint32_t id = g_marker_seq.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(g_marker_map_mutex);
+        g_marker_map[id] = std::string(meta);
+    }
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (s == nullptr) s = 0;
+    de_marker<<<id, 1, 0, s>>>();
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
 //__attribute__((constructor))保证这个共享库在被加载到任何一个进程时，initCuptiTracer函数会被自动调用

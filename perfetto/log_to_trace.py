@@ -1754,7 +1754,7 @@ def process_logs(input_file, output_file):
                 and end_ns > cupti_nonzero_max_end_by_pid[pid]
             ):
                 cupti_nonzero_max_end_by_pid[pid] = end_ns
-            if etype in ['runtime', 'driver']:
+            if etype in ['runtime', 'driver', 'marker']:
                 cupti_events.append(payload)
                 if etype == 'runtime':
                     runtime_name_by_corr[
@@ -2697,6 +2697,41 @@ def process_logs(input_file, output_file):
             }),
         }
 
+    gpu_batch_by_dispatch = {}
+    marker_events = [ev for ev in cupti_events if ev.get("type") == "marker"]
+    if marker_events:
+        markers_by_dk = defaultdict(lambda: defaultdict(list))
+        for m in marker_events:
+            meta = m.get("name", "")
+            parts = meta.split("|", 1)
+            if len(parts) != 2:
+                continue
+            role, dk = parts
+            markers_by_dk[dk][role].append(m)
+        for dk, roles in markers_by_dk.items():
+            starts = []
+            ends   = []
+            for role in ("exec_start", "sample_start"):
+                for m in roles.get(role, []):
+                    v = m.get("start_ns", 0)
+                    if v > 0:
+                        starts.append(v)
+            for role in ("exec_end", "sample_end"):
+                for m in roles.get(role, []):
+                    v = m.get("end_ns", 0)
+                    if v > 0:
+                        ends.append(v)
+            if starts and ends:
+                gpu_start = min(starts)
+                gpu_end   = max(ends)
+                if gpu_end > gpu_start:
+                    gpu_batch_by_dispatch[dk] = {
+                        "gpu_start_ns": gpu_start,
+                        "gpu_end_ns":   gpu_end,
+                        "exec_markers": len(roles.get("exec_start", [])) + len(roles.get("exec_end", [])),
+                        "samp_markers": len(roles.get("sample_start", [])) + len(roles.get("sample_end", [])),
+                    }
+
     # phase 优先来自 req_step_ready.phase_by_req，缺失时回退到 req_metrics_events 的 phase 队列。
     pending_dispatch_start = defaultdict(deque)
 
@@ -2774,6 +2809,14 @@ def process_logs(input_file, output_file):
                 worker_span_count = worker_window.get("span_count", 0)
                 worker_span_count_total = worker_window.get("total_span_count", worker_span_count)
                 worker_boundary_policy = worker_window.get("boundary_policy")
+
+            gpu_window = gpu_batch_by_dispatch.get(dispatch_key)
+            if gpu_window:
+                start_ns = gpu_window["gpu_start_ns"]
+                end_ns   = gpu_window["gpu_end_ns"]
+                start_source = "gpu_marker"
+                end_source   = "gpu_marker"
+            elif worker_window:
                 if worker_start_ns is not None:
                     start_ns = worker_start_ns
                     start_source = "worker_execute_model_min"

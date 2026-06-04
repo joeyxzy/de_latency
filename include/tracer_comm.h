@@ -10,6 +10,7 @@ typedef enum {
     RECORD_TYPE_RUNTIME,
     RECORD_TYPE_DRIVER,
     RECORD_TYPE_MEMSET,
+    RECORD_TYPE_MARKER,           // GPU-side batch marker (de_marker kernel)
     // We still need a few types for internal communication
     RECORD_TYPE_METADATA_TID_MAP, // For sending the TID mapping
     RECORD_TYPE_METADATA_FLUSH_COMPLETE // To signal the end of data
