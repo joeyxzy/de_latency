@@ -143,6 +143,10 @@ try:
 except Exception as e:
     _marker_dbg(f"init FAIL exception: {e}")
 
+# 调度器 → executor.sample_tokens 的 dispatch_key 传递桥梁
+# EngineCore 主循环是单线程的，模块级变量安全
+_de_sched_dispatch_key = None
+
 
 def _de_gpu_mark(stream, role, dispatch_key):
     if not _marker_init_ok:
@@ -781,6 +785,26 @@ def _make_scheduler_out_rpc_wrapper(original_func):
         return original_func(self, scheduler_output, *args, **kwargs)
 
     setattr(wrapper, "_de_latency_scheduler_out_rpc_patch", True)
+    return wrapper
+
+
+def _make_sample_tokens_wrapper(original_func):
+    if getattr(original_func, "_de_latency_sample_tokens_patch", False):
+        return original_func
+
+    def wrapper(self, *args, **kwargs):
+        dk = _de_sched_dispatch_key
+        if dk:
+            TraceSender.emit(
+                event_type="scheduler_sample_tokens",
+                payload={
+                    "dispatch_key": dk,
+                    "timestamp_ns": time.time_ns(),
+                },
+            )
+        return original_func(self, *args, **kwargs)
+
+    setattr(wrapper, "_de_latency_sample_tokens_patch", True)
     return wrapper
 
 
@@ -1921,6 +1945,7 @@ def patch_v1_scheduler(module):
                 scheduler_output,
                 phase_by_req=scheduled_phase_by_req,
             )
+            scheduler_before_ns = time.time_ns()
             # 1. 先执行原逻辑 (确保状态更新完毕)
             res = original_func(self, scheduler_output, model_output)
             
@@ -1954,6 +1979,7 @@ def patch_v1_scheduler(module):
                         "num_computed_by_req": _extract_scheduler_step_maps(scheduler_output)[0],
                         "scheduled_tokens_by_req": _extract_scheduler_step_maps(scheduler_output)[1],
                         "timestamp_ns": time.time_ns(),
+                        "scheduler_before_ns": scheduler_before_ns,
                     }
                 )
             try:
@@ -1977,6 +2003,53 @@ def patch_v1_scheduler(module):
     apply_method_patch(cls, "update_from_output", update_from_output_wrapper)
     apply_method_patch(cls, "add_request", add_request_wrapper)
 
+    # ---- schedule() wrapper: 调度决策耗时插桩 ----
+    if hasattr(cls, "schedule"):
+        def schedule_wrapper(original_func):
+            def wrapper(self, *args, **kwargs):
+                start_ns = time.time_ns()
+                result = original_func(self, *args, **kwargs)
+                end_ns = time.time_ns()
+                req_ids = _extract_req_ids_from_scheduler_output(result)
+                dispatch_key = _make_dispatch_key(result)
+                global _de_sched_dispatch_key
+                _de_sched_dispatch_key = dispatch_key
+                num_requests = 0
+                num_running = 0
+                num_waiting = 0
+                try:
+                    num_requests = len(self.requests)
+                except Exception:
+                    pass
+                try:
+                    num_running = len(self.running)
+                except Exception:
+                    pass
+                try:
+                    num_waiting = len(self.waiting)
+                except Exception:
+                    pass
+                TraceSender.emit(
+                    event_type="scheduler_schedule",
+                    payload={
+                        "start_ns": start_ns,
+                        "end_ns": end_ns,
+                        "duration_ns": end_ns - start_ns,
+                        "num_requests": num_requests,
+                        "num_running": num_running,
+                        "num_waiting": num_waiting,
+                        "scheduled_batch_size": len(req_ids),
+                        "total_scheduled_tokens": _safe_int(
+                            getattr(result, "total_num_scheduled_tokens", None), 0
+                        ),
+                        "timestamp_ns": end_ns,
+                        "dispatch_key": dispatch_key,
+                    },
+                )
+                return result
+            return wrapper
+        apply_method_patch(cls, "schedule", schedule_wrapper)
+
 #某些请求被调度出并rpc的时间点插桩（1.调度结束时间点 2.enginecore向worker广播的开始时间点）
 @register_hook("vllm.v1.executor.multiproc_executor")
 def patch_v1_executor(module):
@@ -1987,8 +2060,8 @@ def patch_v1_executor(module):
     # logger.info(f">>> [HOOK] Patching Executor: {cls}")
 
     apply_method_patch(cls, "execute_model", _make_scheduler_out_rpc_wrapper)
-
-
+    if hasattr(cls, "sample_tokens"):
+        apply_method_patch(cls, "sample_tokens", _make_sample_tokens_wrapper)
 @register_hook("vllm.v1.executor.abstract")
 def patch_v1_uniproc_executor(module):
     target_classes = []
@@ -2014,6 +2087,8 @@ def _patch_executor_module(module, candidate_names):
 
     for target_cls in target_classes:
         apply_method_patch(target_cls, "execute_model", _make_scheduler_out_rpc_wrapper)
+        if hasattr(target_cls, "sample_tokens"):
+            apply_method_patch(target_cls, "sample_tokens", _make_sample_tokens_wrapper)
 
 
 @register_hook("vllm.v1.executor.uniproc_executor")

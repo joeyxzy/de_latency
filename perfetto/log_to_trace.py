@@ -1547,6 +1547,8 @@ def process_logs(input_file, output_file):
     # 我们将所有事件分为三类：Worker生命周期、Scheduler、CUPTI
     worker_events = []
     scheduler_events = []
+    scheduler_schedule_events = []
+    scheduler_sample_tokens_events = []
     cupti_events = []
     req_metric_events = []
     coroutine_events = []
@@ -1658,6 +1660,10 @@ def process_logs(input_file, output_file):
                 })
             elif etype in ['req_enqueue_scheduler', 'req_scheduler_out_rpc', 'req_step_ready']:
                 scheduler_events.append({"type": etype, "payload": payload})
+            elif etype == "scheduler_schedule":
+                scheduler_schedule_events.append({"type": etype, "payload": payload})
+            elif etype == "scheduler_sample_tokens":
+                scheduler_sample_tokens_events.append({"type": etype, "payload": payload})
             elif etype=="req_metrics_events":
                 req_metric_events.append({
                     "payload": payload,
@@ -1876,6 +1882,17 @@ def process_logs(input_file, output_file):
         execute_model_span=execute_model_span,
         cupti_events=cupti_events,
     )
+    # 将新事件类型补入 origin 推断（这里直接扩展 min_ns）
+    for ev in scheduler_schedule_events:
+        p = ev.get("payload", {})
+        for k in ("start_ns", "end_ns", "timestamp_ns"):
+            v = to_ns(p.get(k))
+            if v is not None and v > 0:
+                TRACE_TS_ORIGIN_NS = v if TRACE_TS_ORIGIN_NS is None or v < TRACE_TS_ORIGIN_NS else TRACE_TS_ORIGIN_NS
+    for ev in scheduler_sample_tokens_events:
+        v = to_ns(ev.get("payload", {}).get("timestamp_ns"))
+        if v is not None and v > 0:
+            TRACE_TS_ORIGIN_NS = v if TRACE_TS_ORIGIN_NS is None or v < TRACE_TS_ORIGIN_NS else TRACE_TS_ORIGIN_NS
     if TRACE_TS_ORIGIN_NS:
         print(f"Trace time origin (wall ns): {TRACE_TS_ORIGIN_NS}")
 
@@ -3174,6 +3191,174 @@ def process_logs(input_file, output_file):
                 cname="rail_idle" if phase == "_process_input_queue" else "rail_response",
             ))
 
+    # --- 4.6b Scheduler Latency 可视化（dispatch_key 配对） ---
+    SCHEDULER_PID = 13000
+
+    schedule_by_dk = {}
+    for ev in scheduler_schedule_events:
+        p = ev.get("payload", {})
+        sn = to_ns(p.get("start_ns"))
+        en = to_ns(p.get("end_ns"))
+        dk = p.get("dispatch_key")
+        if dk and sn is not None and en is not None and en > sn:
+            schedule_by_dk[dk] = {
+                "start_ns": sn,
+                "end_ns": en,
+                "batch_size": p.get("scheduled_batch_size"),
+                "num_requests": p.get("num_requests"),
+                "num_running": p.get("num_running"),
+                "num_waiting": p.get("num_waiting"),
+            }
+
+    exec_by_dk = {}
+    for item in scheduler_events:
+        if item["type"] != "req_scheduler_out_rpc":
+            continue
+        p = item["payload"]
+        dk = p.get("dispatch_key")
+        ts = to_ns(p.get("timestamp_ns"))
+        if dk and ts is not None:
+            exec_by_dk[dk] = ts
+
+    sample_by_dk = {}
+    for ev in scheduler_sample_tokens_events:
+        p = ev.get("payload", {})
+        dk = p.get("dispatch_key")
+        ts = to_ns(p.get("timestamp_ns"))
+        if dk and ts is not None:
+            sample_by_dk[dk] = ts
+
+    step_ready_by_dk = {}
+    for item in scheduler_events:
+        if item["type"] != "req_step_ready":
+            continue
+        p = item["payload"]
+        dk = p.get("dispatch_key")
+        before_ns = to_ns(p.get("scheduler_before_ns"))
+        after_ns = to_ns(p.get("timestamp_ns"))
+        if dk and before_ns is not None and after_ns is not None and after_ns > before_ns:
+            step_ready_by_dk[dk] = {
+                "before_ns": before_ns,
+                "after_ns": after_ns,
+            }
+
+    if schedule_by_dk:
+        trace_events.append({
+            "name": "process_name",
+            "ph": "M",
+            "pid": SCHEDULER_PID,
+            "args": {"name": "Scheduler Latency"},
+        })
+        trace_events.append({
+            "name": "thread_name", "ph": "M", "pid": SCHEDULER_PID, "tid": 1,
+            "args": {"name": "Schedule"},
+        })
+        trace_events.append({
+            "name": "thread_name", "ph": "M", "pid": SCHEDULER_PID, "tid": 2,
+            "args": {"name": "Execute Model Out"},
+        })
+        trace_events.append({
+            "name": "thread_name", "ph": "M", "pid": SCHEDULER_PID, "tid": 3,
+            "args": {"name": "Sample Tokens Out"},
+        })
+        trace_events.append({
+            "name": "thread_name", "ph": "M", "pid": SCHEDULER_PID, "tid": 4,
+            "args": {"name": "Update Output"},
+        })
+
+        sched_flow_id_base = 2_000_000_000
+        sched_flow_counter = 0
+
+        for dk, sched in sorted(schedule_by_dk.items(),
+                                key=lambda x: x[1]["start_ns"]):
+            # --- Schedule bar (tid=1) ---
+            trace_events.append(create_perfetto_event(
+                name="Schedule",
+                cat="scheduler_schedule",
+                ph="X", ts=sched["start_ns"],
+                dur=sched["end_ns"] - sched["start_ns"],
+                pid=SCHEDULER_PID, tid=1,
+                args={
+                    "dispatch_key": dk,
+                    "batch_size": sched.get("batch_size"),
+                    "num_requests": sched.get("num_requests"),
+                    "num_running": sched.get("num_running"),
+                    "num_waiting": sched.get("num_waiting"),
+                    "duration_ms": round((sched["end_ns"] - sched["start_ns"]) / 1e6, 3),
+                },
+                cname="rail_response",
+            ))
+
+            # --- Execute Model Out instant point (tid=2) ---
+            exec_ts = exec_by_dk.get(dk)
+            if exec_ts is not None:
+                trace_events.append({
+                    "name": "Execute Model",
+                    "cat": "scheduler_exec_out",
+                    "ph": "i", "ts": (exec_ts - TRACE_TS_ORIGIN_NS) // 1000,
+                    "pid": SCHEDULER_PID, "tid": 2,
+                    "s": "t",
+                    "args": {"dispatch_key": dk},
+                })
+
+            # --- Sample Tokens Out instant point (tid=3) ---
+            sample_ts = sample_by_dk.get(dk)
+            if sample_ts is not None:
+                trace_events.append({
+                    "name": "Sample Tokens",
+                    "cat": "scheduler_sample_out",
+                    "ph": "i", "ts": (sample_ts - TRACE_TS_ORIGIN_NS) // 1000,
+                    "pid": SCHEDULER_PID, "tid": 3,
+                    "s": "t",
+                    "args": {"dispatch_key": dk},
+                })
+
+            # --- Update Output bar (tid=4) ---
+            sr = step_ready_by_dk.get(dk)
+            if not sr:
+                continue
+            trace_events.append(create_perfetto_event(
+                name="Update Output",
+                cat="scheduler_update_output",
+                ph="X", ts=sr["before_ns"],
+                dur=sr["after_ns"] - sr["before_ns"],
+                pid=SCHEDULER_PID, tid=4,
+                args={
+                    "dispatch_key": dk,
+                    "duration_ms": round((sr["after_ns"] - sr["before_ns"]) / 1e6, 3),
+                },
+                cname="olive",
+            ))
+
+            # --- Flow arrows: schedule → exec → sample → update ---
+            flow_points = [(1, sched["end_ns"])]
+            if exec_ts is not None:
+                flow_points.append((2, exec_ts))
+            if sample_ts is not None:
+                flow_points.append((3, sample_ts))
+            flow_points.append((4, sr["before_ns"]))
+            flow_points.sort(key=lambda x: x[1])
+
+            for i in range(len(flow_points) - 1):
+                sched_flow_counter += 1
+                flow_id = sched_flow_id_base + sched_flow_counter
+                src_tid, src_ts_ns = flow_points[i]
+                dst_tid, dst_ts_ns = flow_points[i + 1]
+                trace_events.append({
+                    "name": "sched_flow",
+                    "cat": "flow",
+                    "ph": "s", "pid": SCHEDULER_PID, "tid": src_tid,
+                    "ts": (src_ts_ns - TRACE_TS_ORIGIN_NS) // 1000,
+                    "id": flow_id,
+                })
+                trace_events.append({
+                    "name": "sched_flow",
+                    "cat": "flow",
+                    "ph": "f", "pid": SCHEDULER_PID, "tid": dst_tid,
+                    "ts": (dst_ts_ns - TRACE_TS_ORIGIN_NS) // 1000,
+                    "id": flow_id,
+                    "bp": "e",
+                })
 
     # --- 4. CUPTI 关联 (使用生成的 Dispatch Slices) ---
     print(f"Linking Runtime events ({len(cupti_events)}) to Dispatch Slices...")
