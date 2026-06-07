@@ -20,6 +20,7 @@
 #include <sys/un.h>
 #include <atomic>
 #include <string>
+#include <ctime>
 #include <stdint.h>
 #include <cuda.h>
 #include <cupti.h>
@@ -62,7 +63,7 @@ void tracer_log(const char* format, ...) {
     }                                                                   \
   } while (0)
 
-#define BUF_SIZE (256 * 1024)
+#define BUF_SIZE (1 * 1024 * 1024)
 #define ALIGN_SIZE (8)
 #define ALIGN_BUFFER(buffer, align)                                            \
   (((uintptr_t) (buffer) & ((align)-1)) ? ((buffer) + (align) - ((uintptr_t) (buffer) & ((align)-1))) : (buffer))
@@ -117,10 +118,13 @@ static char g_control_socket_path[CONTROL_SOCKET_PATH_MAX] = {0};
 static int g_control_poll_timeout_ms = 500;
 static int g_control_backlog = 8;
 
-#define SEND_RING_SIZE 4096
+#define SEND_RING_SIZE (64 * 1024)
 static UnifiedTraceRecord *g_send_ring[SEND_RING_SIZE];
 static volatile unsigned int g_send_ring_head = 0;
 static volatile unsigned int g_send_ring_tail = 0;
+static std::atomic<unsigned long long> g_ring_dropped{0};
+static std::atomic<unsigned long long> g_zmq_send_dropped{0};
+static std::atomic<unsigned long long> g_cupti_driver_dropped{0};
 static pthread_mutex_t g_send_ring_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_send_ring_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t g_send_thread;
@@ -151,7 +155,10 @@ static bool disable_activity_kinds_locked(unsigned int kinds, const char *phase)
 
 static bool ring_push(UnifiedTraceRecord *rec) {
     unsigned int next_tail = (g_send_ring_tail + 1) % SEND_RING_SIZE;
-    if (next_tail == g_send_ring_head) return false;
+    if (next_tail == g_send_ring_head) {
+        g_ring_dropped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     g_send_ring[g_send_ring_tail] = rec;
     g_send_ring_tail = next_tail;
     return true;
@@ -604,9 +611,42 @@ static bool record_to_json(const UnifiedTraceRecord *rec, char *buf, size_t bufs
     return (size_t)len < bufsz;
 }
 
+static bool _zmq_send_with_retry(void *sock, const char *buf, size_t len) {
+    int retries = g_zmq_send_retry;
+    for (int i = 0; i <= retries; i++) {
+        int rc = zmq_send(sock, buf, len, ZMQ_DONTWAIT);
+        if (rc >= 0) return true;
+        if (errno == EAGAIN) {
+            if (i < retries) {
+                usleep(g_zmq_send_retry_us);
+                continue;
+            }
+            g_zmq_send_dropped.fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    }
+    return false;
+}
+
+static void _report_drop_stats() {
+    static time_t last_report = 0;
+    time_t now = time(NULL);
+    if (now - last_report >= 10) {
+        last_report = now;
+        unsigned long long rd = g_ring_dropped.exchange(0, std::memory_order_relaxed);
+        unsigned long long sd = g_zmq_send_dropped.exchange(0, std::memory_order_relaxed);
+        unsigned long long cd = g_cupti_driver_dropped.exchange(0, std::memory_order_relaxed);
+        if (rd || sd || cd) {
+            tracer_log("[drop_stats] ring_dropped=%llu zmq_dropped=%llu cupti_dropped=%llu",
+                       rd, sd, cd);
+        }
+    }
+}
+
 static void *send_thread_main(void *) {
     g_send_thread_running = true;
-    tracer_log("[send_thread] started");
+    tracer_log("[send_thread] started (ring=%u entries, zmq_retry=%d/%d us)",
+               SEND_RING_SIZE, g_zmq_send_retry, g_zmq_send_retry_us);
 
     while (!g_send_thread_stop) {
         UnifiedTraceRecord *rec = NULL;
@@ -621,23 +661,24 @@ static void *send_thread_main(void *) {
         pthread_mutex_unlock(&g_send_ring_mutex);
 
         if (rec) {
-            char buf[2048];
+            char buf[8192];
             if (g_zmq_push && record_to_json(rec, buf, sizeof(buf))) {
                 std::lock_guard<std::mutex> lock(g_zmq_send_mutex);
-                zmq_send(g_zmq_push, buf, strlen(buf), ZMQ_DONTWAIT);
+                _zmq_send_with_retry(g_zmq_push, buf, strlen(buf));
             }
             free(rec);
         }
+        _report_drop_stats();
     }
 
     pthread_mutex_lock(&g_send_ring_mutex);
     UnifiedTraceRecord *rec;
     while ((rec = ring_pop()) != NULL) {
         pthread_mutex_unlock(&g_send_ring_mutex);
-        char buf[2048];
+        char buf[8192];
         if (g_zmq_push && record_to_json(rec, buf, sizeof(buf))) {
             std::lock_guard<std::mutex> lock(g_zmq_send_mutex);
-            zmq_send(g_zmq_push, buf, strlen(buf), ZMQ_DONTWAIT);
+            _zmq_send_with_retry(g_zmq_push, buf, strlen(buf));
         }
         free(rec);
         pthread_mutex_lock(&g_send_ring_mutex);
@@ -645,7 +686,8 @@ static void *send_thread_main(void *) {
     pthread_mutex_unlock(&g_send_ring_mutex);
 
     g_send_thread_running = false;
-    tracer_log("[send_thread] stopped");
+    tracer_log("[send_thread] stopped ring_dropped=%llu zmq_dropped=%llu cupti_dropped=%llu",
+               g_ring_dropped.load(), g_zmq_send_dropped.load(), g_cupti_driver_dropped.load());
     return NULL;
 }
 
@@ -1121,8 +1163,9 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
     CUptiResult drop_status = cuptiActivityGetNumDroppedRecords(ctx, streamId, &dropped);
     if (drop_status == CUPTI_SUCCESS) {
         if (dropped > 0) {
-            tracer_log("Warning: CUPTI dropped %zu activity records (streamId=%u).",
-                       dropped, streamId);
+            g_cupti_driver_dropped.fetch_add(dropped, std::memory_order_relaxed);
+            tracer_log("Warning: CUPTI dropped %zu activity records (streamId=%u) total=%llu.",
+                       dropped, streamId, g_cupti_driver_dropped.load());
         }
     } else if (drop_status != CUPTI_ERROR_INVALID_PARAMETER) {
         const char *errstr = NULL;
