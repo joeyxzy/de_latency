@@ -32,6 +32,12 @@ def parse_args():
         help="Only applies to CUPTI off.",
     )
     parser.add_argument("--timeout", type=float, default=2.0, help="Socket timeout in seconds.")
+    parser.add_argument(
+        "--markers-only",
+        choices=["on", "off"],
+        default=None,
+        help="Enable/disable CUPTI markers-only mode (only collect de_marker events to reduce log size).",
+    )
     return parser.parse_args()
 
 
@@ -299,6 +305,11 @@ def main():
         overall_failures += len(failures)
 
     if args.tool in {"all", "cupti"}:
+        if args.markers_only is not None:
+            markers_cmd = f"markers_only {args.markers_only}"
+            results, failures = run_cupti(state, markers_cmd, args.timeout)
+            print_results(f"cupti markers_only={args.markers_only}:", results, failures)
+            overall_failures += len(failures)
         cupti_command = args.command
         if args.command == "off" and args.mode == "fast":
             cupti_command = "off fast"

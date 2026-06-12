@@ -108,6 +108,7 @@ static int g_zmq_send_retry_us = 50;
 static int g_flush_after_sync_api = 0;
 static bool g_activity_callbacks_registered = false;
 static std::atomic<bool> g_cupti_enabled{false};
+static std::atomic<bool> g_cupti_markers_only{false};
 static std::atomic<unsigned long long> g_cupti_generation{0};
 static pthread_t g_control_thread;
 static std::atomic<bool> g_control_thread_started{false};
@@ -433,6 +434,14 @@ static bool cupti_enable_locked(const char *reason) {
     if (kinds == 0) {
         kinds = g_default_activity_kinds;
     }
+    if (g_cupti_markers_only.load()) {
+        unsigned int orig = kinds;
+        kinds &= (ACTIVITY_KIND_KERNEL | ACTIVITY_KIND_CONCURRENT_KERNEL);
+        if (kinds != orig) {
+            tracer_log("[%s] markers_only active: activity kinds reduced from 0x%x to 0x%x",
+                       phase, orig, kinds);
+        }
+    }
     tracer_log("[%s] Enabling activity kinds mask=0x%x", phase, kinds);
 
     ok = enable_activity_kinds_locked(kinds, phase);
@@ -739,9 +748,10 @@ static std::string build_status_response_locked(const char *prefix) {
     char buf[512];
     snprintf(buf,
              sizeof(buf),
-             "%s state=%s generation=%llu subscriber=%s activity_callbacks=%s pid=%d socket=%s\n",
+             "%s state=%s markers_only=%s generation=%llu subscriber=%s activity_callbacks=%s pid=%d socket=%s\n",
              prefix ? prefix : "ok",
              g_cupti_enabled.load() ? "on" : "off",
+             g_cupti_markers_only.load() ? "yes" : "no",
              (unsigned long long)g_cupti_generation.load(),
              g_subscriber != NULL ? "yes" : "no",
              g_activity_callbacks_registered ? "yes" : "no",
@@ -775,6 +785,24 @@ static std::string handle_control_command(const std::string &command) {
         }
         return build_status_response_locked(
             cupti_flush_locked("control:flush") ? "ok" : "error=flush_failed");
+    }
+    if (command == "markers_only on") {
+        g_cupti_markers_only.store(true);
+        disable_activity_kinds_locked(
+            ACTIVITY_KIND_DRIVER | ACTIVITY_KIND_RUNTIME |
+            ACTIVITY_KIND_MEMCPY | ACTIVITY_KIND_MEMSET,
+            "markers_only_on");
+        tracer_log("[control] markers_only enabled (non-kernel activity kinds disabled)");
+        return build_status_response_locked("ok");
+    }
+    if (command == "markers_only off") {
+        g_cupti_markers_only.store(false);
+        enable_activity_kinds_locked(
+            ACTIVITY_KIND_DRIVER | ACTIVITY_KIND_RUNTIME |
+            ACTIVITY_KIND_MEMCPY | ACTIVITY_KIND_MEMSET,
+            "markers_only_off");
+        tracer_log("[control] markers_only disabled (all activity kinds restored)");
+        return build_status_response_locked("ok");
     }
     return std::string("error=unknown_command\n");
 }
@@ -1037,6 +1065,23 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
         UnifiedTraceRecord rec = {}; // Zero-initialize
         rec.pid = getpid();
         bool record_valid = true;
+
+        // markers-only 模式：CUPTI 驱动层已禁用 runtime/driver/memcpy/memset，
+        // 此处作为安全网二次过滤，跳过非 de_marker 的 kernel 记录。
+        if (g_cupti_markers_only.load()) {
+            bool is_marker_kernel = false;
+            if (record->kind == CUPTI_ACTIVITY_KIND_KERNEL ||
+                record->kind == CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL) {
+                auto *k = (CUpti_ActivityKernel4 *)record;
+                if (strstr(k->name, "de_marker") != NULL) {
+                    is_marker_kernel = true;
+                }
+            }
+            if (!is_marker_kernel) {
+                continue;
+            }
+        }
+
         switch (record->kind) {
             case CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL:
             case CUPTI_ACTIVITY_KIND_KERNEL: {
@@ -1217,6 +1262,8 @@ void initCuptiTracer() {
     g_control_poll_timeout_ms = read_env_int("TRACER_CUPTI_CONTROL_POLL_TIMEOUT_MS", 500, 50, 60000);
     g_flush_after_sync_api = read_env_bool("TRACER_CUPTI_FLUSH_AFTER_SYNC_API", 0);
     g_cupti_start_delay_sec = read_env_int("TRACER_CUPTI_START_DELAY_SEC", 15, 0, 300);
+    g_cupti_markers_only.store(
+        read_env_bool("TRACER_CUPTI_MARKERS_ONLY", 0));
     g_enabled_activity_kinds = parse_activity_kinds_env();
     tracer_log("[INIT] Activity kinds mask=0x%x", g_enabled_activity_kinds);
     init_zmq_from_env();

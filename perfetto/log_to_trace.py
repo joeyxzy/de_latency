@@ -724,12 +724,20 @@ def build_phase_merged_dispatch_intervals(intervals, merge_gap_ns=1_000_000):
                     "start_source": "phase_merged_worker_execute_model",
                     "step_count": 0,
                     "worker_span_count": 0,
+                    "gpu_marker_start_ns": item.get("gpu_marker_start_ns"),
+                    "gpu_marker_end_ns": item.get("gpu_marker_end_ns"),
                 }
                 current_keys = []
                 current_batch_req_ids = set()
                 current_rpc_wait_ns_values = []
             else:
                 current["end_ns"] = max(current["end_ns"], item["end_ns"])
+                if item.get("gpu_marker_start_ns") is not None:
+                    if current.get("gpu_marker_start_ns") is None or item["gpu_marker_start_ns"] < current["gpu_marker_start_ns"]:
+                        current["gpu_marker_start_ns"] = item["gpu_marker_start_ns"]
+                if item.get("gpu_marker_end_ns") is not None:
+                    if current.get("gpu_marker_end_ns") is None or item["gpu_marker_end_ns"] > current["gpu_marker_end_ns"]:
+                        current["gpu_marker_end_ns"] = item["gpu_marker_end_ns"]
 
             current["step_count"] += 1
             current["worker_span_count"] += int(item.get("worker_span_count") or 0)
@@ -2884,6 +2892,8 @@ def process_logs(input_file, output_file):
                 "scheduler_ready_ns": ts_ns,
                 "start_source": start_source,
                 "end_source": end_source,
+                "gpu_marker_start_ns": gpu_window.get("gpu_start_ns") if gpu_window else None,
+                "gpu_marker_end_ns": gpu_window.get("gpu_end_ns") if gpu_window else None,
                 "worker_start_ns": worker_start_ns,
                 "worker_end_ns": worker_end_ns,
                 "worker_span_count": worker_span_count,
@@ -3429,6 +3439,18 @@ def process_logs(input_file, output_file):
             pid_override=rt_pid,
         )
         kernels = all_kernels_map.get(runtime_corr_key, [])
+        # correlationId 是 32-bit 计数器，高负载下会回绕，导致同一 (pid, corrId)
+        # 匹配到属于不同 launch epoch 的 kernel。用时间窗口过滤：
+        # GPU kernel 的 start_ns 必须在 CPU launch 之后（允许 1s 时钟偏差），
+        # 且在合理的 launch→execute 延迟内（最大 30s）。
+        _MAX_GPU_CLOCK_DRIFT_NS   = 1_000_000_000   # 1 second
+        _MAX_GPU_LAUNCH_LATENCY_NS = 30_000_000_000  # 30 seconds
+        if kernels and rt_start is not None:
+            kernels = [
+                k for k in kernels
+                if (k.get("start_ns") or 0) >= (int(rt_start) - _MAX_GPU_CLOCK_DRIFT_NS)
+                and (k.get("start_ns") or 0) <= (int(rt_start) + _MAX_GPU_LAUNCH_LATENCY_NS)
+            ]
         k_names = [k.get('name', 'unknown') for k in kernels]
         
         args = {
@@ -4563,10 +4585,13 @@ def process_logs(input_file, output_file):
                     "dispatch_keys": d.get("dispatch_keys"),
                     "dispatch_key_count": d.get("dispatch_key_count"),
                     "step_count": d.get("step_count"),
+                    "batch_req_ids": d.get("batch_req_ids", []),
                     "batch_req_count": len(d.get("batch_req_ids") or []),
                     "duration_ms": round((d["end_ns"] - d["start_ns"]) / 1e6, 3),
                     "start_source": d.get("start_source"),
                     "end_source": d.get("end_source"),
+                    "gpu_marker_start_ns": d.get("gpu_marker_start_ns"),
+                    "gpu_marker_end_ns": d.get("gpu_marker_end_ns"),
                     "scheduler_ready_lag_ms": (
                         round((d["scheduler_ready_ns"] - d["worker_end_ns"]) / 1e6, 3)
                         if d.get("scheduler_ready_ns") is not None and d.get("worker_end_ns") is not None
