@@ -74,6 +74,7 @@ def build_request_lane_tids(req_index):
         "stage": base + 12,
         "task": base + 13,
         "pp_gap": base + 14,
+        "gpu_queue": base + 15,
     }
 
 
@@ -1182,13 +1183,15 @@ def render_compute_breakdown_svg(svg_path, ttft_components_ms, tpot_components_m
     ttft_order = [
         ("preprocess", "#4E79A7", "Preprocess"),
         ("enginecore_queue", "#F28E2B", "EngineCore Queue"),
-        ("vllm_queue", "#E15759", "vLLM Queue"),
+        ("cpu_queue", "#E15759", "CPU Sched Queue"),
+        ("gpu_queue", "#FF9D4D", "GPU Dispatch Queue"),
         ("prefill_exec", "#76B7B2", "Prefill Exec"),
         ("postprocess_transport", "#59A14F", "Postprocess / Transport"),
         ("other_gap", "#BAB0AC", "Other Gap"),
     ]
     tpot_order = [
-        ("vllm_scheduling_wait", "#E15759", "vLLM Scheduling Wait"),
+        ("cpu_scheduling_wait", "#E15759", "CPU Scheduling Wait"),
+        ("gpu_queue", "#FF9D4D", "GPU Dispatch Queue"),
         ("worker_preprocess", "#59A14F", "Worker Preprocess"),
         ("model_forward", "#4E79A7", "Model Forward"),
         ("postprocess", "#9C755F", "Postprocess"),
@@ -1325,7 +1328,8 @@ def render_request_breakdown_svg(svg_path, rid, request_name, ttft_entry, tpot_e
         ttft_colors = {
             "preprocess": "#4E79A7",
             "enginecore_queue": "#F28E2B",
-            "vllm_queue": "#E15759",
+            "cpu_queue": "#E15759",
+            "gpu_queue": "#FF9D4D",
             "prefill_exec": "#76B7B2",
             "postprocess_transport": "#59A14F",
             "other_gap": "#BAB0AC",
@@ -1333,12 +1337,13 @@ def render_request_breakdown_svg(svg_path, rid, request_name, ttft_entry, tpot_e
         ttft_labels = {
             "preprocess": "Preprocess",
             "enginecore_queue": "EngineCore Queue",
-            "vllm_queue": "vLLM Queue",
+            "cpu_queue": "CPU Sched Queue",
+            "gpu_queue": "GPU Dispatch Queue",
             "prefill_exec": "Prefill Exec",
             "postprocess_transport": "Postprocess / Transport",
             "other_gap": "Other Gap",
         }
-        for key in ["preprocess", "enginecore_queue", "vllm_queue", "prefill_exec", "postprocess_transport", "other_gap"]:
+        for key in ["preprocess", "enginecore_queue", "cpu_queue", "gpu_queue", "prefill_exec", "postprocess_transport", "other_gap"]:
             ttft_rows.append({
                 "label": ttft_labels[key],
                 "value_ms": ttft_entry["components_ms"].get(key, 0.0),
@@ -1415,7 +1420,7 @@ def render_request_breakdown_svg(svg_path, rid, request_name, ttft_entry, tpot_e
         )
         row_lines, end_y = _component_rows_svg(chart_x, cursor_y + 62, chart_w, ttft_rows, max(ttft_entry["window_ms"], 1e-9))
         lines.extend(row_lines)
-        breakdown = ttft_entry.get("vllm_queue_breakdown_ms", {})
+        breakdown = ttft_entry.get("cpu_queue_breakdown_ms", {})
         lines.append(
             f'<text x="{chart_x}" y="{end_y + 18}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#374151">vLLM queue breakdown: before_first_prefill={float(breakdown.get("before_first_prefill", 0.0)):.3f} ms, between_prefills={float(breakdown.get("between_prefills", 0.0)):.3f} ms</text>'
         )
@@ -2661,9 +2666,10 @@ def process_logs(input_file, output_file):
     print("Processing Scheduler Events...")
     req_enqueue_map = {}
     queue_intervals_map = defaultdict(list)  # 可视化用（墙上时间）
-    req_vllm_queue_ns = defaultdict(int)  # 聚合统计（总排队）
-    req_vllm_queue_from_enqueue_ns = defaultdict(int)  # 初次调度等待
-    req_vllm_queue_from_step_ready_ns = defaultdict(int)  # 后续step等待
+    req_vllm_queue_ns = defaultdict(int)  # CPU 调度排队（enqueue → out_rpc 和 step_ready → out_rpc 的间隙）
+    req_vllm_queue_from_enqueue_ns = defaultdict(int)  # 初次调度等待（enqueue → out_rpc）
+    req_vllm_queue_from_step_ready_ns = defaultdict(int)  # 后续step等待（step_ready → out_rpc）
+    req_gpu_queue_ns = defaultdict(int)  # GPU 调度排队（out_rpc → GPU/Worker start）
     req_dispatch_intervals_map = defaultdict(list)  # 请求每次被调度执行的区间（out_rpc -> step_ready）
     req_dispatch_phase_ns = defaultdict(lambda: defaultdict(int))
     req_dispatch_phase_count = defaultdict(lambda: defaultdict(int))
@@ -2769,6 +2775,7 @@ def process_logs(input_file, output_file):
                 if item.get("dispatch_key") == dispatch_key:
                     del queue[idx]
                     return item
+            return None
         return queue.popleft()
 
     for item in scheduler_events_sorted:
@@ -2879,6 +2886,9 @@ def process_logs(input_file, output_file):
                     decode_step = to_int(start_item.get("decode_step"))
 
             dur_ns = end_ns - start_ns
+            gpu_queue_start_ns = rpc_start_ns if rpc_start_ns is not None else None
+            gpu_queue_end_ns = start_ns
+            gpu_queue_ns = max(0, start_ns - rpc_start_ns) if rpc_start_ns is not None else 0
             req_dispatch_intervals_map[rid].append({
                 "start_ns": start_ns,
                 "end_ns": end_ns,
@@ -2899,6 +2909,9 @@ def process_logs(input_file, output_file):
                 "worker_span_count": worker_span_count,
                 "worker_span_count_total": worker_span_count_total,
                 "worker_boundary_policy": worker_boundary_policy,
+                "gpu_queue_start_ns": gpu_queue_start_ns,
+                "gpu_queue_end_ns": gpu_queue_end_ns,
+                "gpu_queue_ns": gpu_queue_ns,
             })
             req_dispatch_phase_ns[rid][phase] += dur_ns
             req_dispatch_phase_count[rid][phase] += 1
@@ -2965,6 +2978,7 @@ def process_logs(input_file, output_file):
     # visually impossible overlap such as step_ready->out_rpc appearing inside
     # a Decode Dispatch lane.
     overlapped_dispatch_pairs = 0
+    gpu_queue_intervals_map = defaultdict(list)
     for rid, dispatches_for_req in req_dispatch_intervals_map.items():
         dispatches_sorted = sorted(
             dispatches_for_req,
@@ -2975,22 +2989,40 @@ def process_logs(input_file, output_file):
 
         enqueue_ts = to_ns(req_enqueue_map.get(rid))
         first_start = to_ns(dispatches_sorted[0].get("start_ns"))
+        first_rpc = to_ns(dispatches_sorted[0].get("rpc_start_ns"))
         if enqueue_ts is not None and first_start is not None and first_start > enqueue_ts:
-            queue_ns = first_start - enqueue_ts
-            req_vllm_queue_ns[rid] += queue_ns
-            req_vllm_queue_from_enqueue_ns[rid] += queue_ns
-            queue_intervals_map[rid].append({
-                "start_ns": enqueue_ts,
-                "end_ns": first_start,
-                "reason": "scheduled_enqueue_wait",
-                "scheduled_from": "enqueue",
-                "gap_kind": "normal_wait",
-                "next_dispatch_key": dispatches_sorted[0].get("dispatch_key"),
-            })
+            gap_end = first_start
+            rpc_end = first_rpc if first_rpc is not None and first_rpc > enqueue_ts and first_rpc < first_start else None
+            cpu_end = rpc_end if rpc_end else gap_end
+            cpu_gap_ns = max(0, cpu_end - enqueue_ts)
+            gpu_gap_ns = max(0, gap_end - cpu_end)
+            if cpu_gap_ns > 0:
+                req_vllm_queue_ns[rid] += cpu_gap_ns
+                req_vllm_queue_from_enqueue_ns[rid] += cpu_gap_ns
+                queue_intervals_map[rid].append({
+                    "start_ns": enqueue_ts,
+                    "end_ns": cpu_end,
+                    "reason": "scheduled_enqueue_wait",
+                    "scheduled_from": "enqueue",
+                    "gap_kind": "normal_wait",
+                    "next_dispatch_key": dispatches_sorted[0].get("dispatch_key"),
+                })
+            if gpu_gap_ns > 0:
+                req_gpu_queue_ns[rid] += gpu_gap_ns
+                gpu_queue_intervals_map[rid].append({
+                    "start_ns": cpu_end,
+                    "end_ns": gap_end,
+                    "duration_ns": gpu_gap_ns,
+                    "dispatch_key": dispatches_sorted[0].get("dispatch_key"),
+                    "phase": dispatches_sorted[0].get("phase", "unknown"),
+                    "start_source": "scheduler_out_rpc",
+                    "end_source": dispatches_sorted[0].get("start_source", "gpu_or_worker_start"),
+                })
 
         for prev_dispatch, next_dispatch in zip(dispatches_sorted, dispatches_sorted[1:]):
             prev_end = to_ns(prev_dispatch.get("end_ns"))
             next_start = to_ns(next_dispatch.get("start_ns"))
+            next_rpc = to_ns(next_dispatch.get("rpc_start_ns"))
             if prev_end is None or next_start is None:
                 continue
             if next_start < prev_end:
@@ -2998,24 +3030,42 @@ def process_logs(input_file, output_file):
                 continue
             if next_start == prev_end:
                 continue
-            queue_ns = next_start - prev_end
-            req_vllm_queue_ns[rid] += queue_ns
-            req_vllm_queue_from_step_ready_ns[rid] += queue_ns
-            preempt_hits = [
-                ts for ts in req_preempt_ts_by_req.get(rid, [])
-                if prev_end <= ts <= next_start
-            ]
-            gap_kind = "preempt_wait" if preempt_hits else "normal_wait"
-            queue_intervals_map[rid].append({
-                "start_ns": prev_end,
-                "end_ns": next_start,
-                "reason": "scheduled_preempt_wait" if preempt_hits else "scheduled_step_ready_wait",
-                "scheduled_from": "step_ready",
-                "gap_kind": gap_kind,
-                "preempt_ts_ns": preempt_hits,
-                "prev_dispatch_key": prev_dispatch.get("dispatch_key"),
-                "next_dispatch_key": next_dispatch.get("dispatch_key"),
-            })
+            gap_end = next_start
+            rpc_split = next_rpc if next_rpc is not None and next_rpc > prev_end and next_rpc < gap_end else None
+            cpu_end = rpc_split if rpc_split else gap_end
+            cpu_gap_ns = max(0, cpu_end - prev_end)
+            gpu_gap_ns = max(0, gap_end - cpu_end)
+
+            if cpu_gap_ns > 0:
+                req_vllm_queue_ns[rid] += cpu_gap_ns
+                req_vllm_queue_from_step_ready_ns[rid] += cpu_gap_ns
+                preempt_hits = [
+                    ts for ts in req_preempt_ts_by_req.get(rid, [])
+                    if prev_end <= ts <= cpu_end
+                ]
+                gap_kind = "preempt_wait" if preempt_hits else "normal_wait"
+                queue_intervals_map[rid].append({
+                    "start_ns": prev_end,
+                    "end_ns": cpu_end,
+                    "reason": "scheduled_preempt_wait" if preempt_hits else "scheduled_step_ready_wait",
+                    "scheduled_from": "step_ready",
+                    "gap_kind": gap_kind,
+                    "preempt_ts_ns": preempt_hits,
+                    "prev_dispatch_key": prev_dispatch.get("dispatch_key"),
+                    "next_dispatch_key": next_dispatch.get("dispatch_key"),
+                })
+
+            if gpu_gap_ns > 0:
+                req_gpu_queue_ns[rid] += gpu_gap_ns
+                gpu_queue_intervals_map[rid].append({
+                    "start_ns": cpu_end,
+                    "end_ns": gap_end,
+                    "duration_ns": gpu_gap_ns,
+                    "dispatch_key": next_dispatch.get("dispatch_key"),
+                    "phase": next_dispatch.get("phase", "unknown"),
+                    "start_source": "scheduler_out_rpc",
+                    "end_source": next_dispatch.get("start_source", "gpu_or_worker_start"),
+                })
 
     if overlapped_dispatch_pairs:
         print(
@@ -3023,8 +3073,15 @@ def process_logs(input_file, output_file):
             "已跳过对应 queue gap；建议检查 dispatch_key 或日志时序"
         )
 
+    if req_gpu_queue_ns:
+        print(f"共统计到 {len(req_gpu_queue_ns)} 个请求的 GPU 调度排队时间（out_rpc → GPU start）：")
+        for rid, lat_ns in sorted(req_gpu_queue_ns.items(), key=lambda x: x[1], reverse=True):
+            print(f"  - Request {rid}: {lat_ns / 1e6:.3f} ms")
+    else:
+        print("  未统计到 GPU 调度排队时间")
+
     if req_vllm_queue_ns:
-        print(f"共统计到 {len(req_vllm_queue_ns)} 个请求的 vLLM 内部排队时间（Dispatch gap 口径）：")
+        print(f"共统计到 {len(req_vllm_queue_ns)} 个请求的 CPU 调度排队时间（Dispatch gap 口径）：")
         for rid, lat_ns in sorted(req_vllm_queue_ns.items(), key=lambda x: x[1], reverse=True):
             enqueue_ns = req_vllm_queue_from_enqueue_ns.get(rid, 0)
             step_ready_ns = req_vllm_queue_from_step_ready_ns.get(rid, 0)
@@ -3361,14 +3418,16 @@ def process_logs(input_file, output_file):
                     "ts": (src_ts_ns - TRACE_TS_ORIGIN_NS) // 1000,
                     "id": flow_id,
                 })
-                trace_events.append({
+                flow_end = {
                     "name": "sched_flow",
                     "cat": "flow",
                     "ph": "f", "pid": SCHEDULER_PID, "tid": dst_tid,
                     "ts": (dst_ts_ns - TRACE_TS_ORIGIN_NS) // 1000,
                     "id": flow_id,
-                    "bp": "e",
-                })
+                }
+                if dst_tid != 4:
+                    flow_end["bp"] = "e"
+                trace_events.append(flow_end)
 
     # --- 4. CUPTI 关联 (使用生成的 Dispatch Slices) ---
     print(f"Linking Runtime events ({len(cupti_events)}) to Dispatch Slices...")
@@ -3824,6 +3883,7 @@ def process_logs(input_file, output_file):
         | set(req_output_handler_sched_ns.keys())
         | set(req_output_handler_exec_ns.keys())
         | set(req_vllm_queue_ns.keys())
+        | set(req_gpu_queue_ns.keys())
         | set(req_latency_map.keys())
         | set(req_stage_ns.keys())
         | set(req_dispatch_intervals_map.keys())
@@ -3871,7 +3931,7 @@ def process_logs(input_file, output_file):
         "phase_reentry_after_decode_requests": [],
     }
     ttft_component_totals_ns = defaultdict(int)
-    ttft_vllm_queue_breakdown_totals_ns = defaultdict(int)
+    ttft_cpu_queue_breakdown_totals_ns = defaultdict(int)
     ttft_prefill_exec_breakdown_totals_ns = defaultdict(int)
     ttft_req_count = 0
     tpot_component_totals_ns = defaultdict(int)
@@ -3968,15 +4028,33 @@ def process_logs(input_file, output_file):
                         enginecore_queue_end_ns = preprocess_boundary_ns
                     enginecore_queue_end_ns = max(preprocess_boundary_ns, min(enginecore_queue_end_ns, first_initial_prefill_start_ns))
 
-                    vllm_queue_before_first_prefill_ns = max(0, first_initial_prefill_start_ns - enginecore_queue_end_ns)
+                    # Split the "before first prefill" gap at rpc_start_ns
+                    first_rpc = to_ns(initial_prefill_dispatches_sorted[0].get("rpc_start_ns"))
+                    gap_total = max(0, first_initial_prefill_start_ns - enginecore_queue_end_ns)
+                    rpc_split = first_rpc if first_rpc is not None and first_rpc > enginecore_queue_end_ns and first_rpc < first_initial_prefill_start_ns else None
+                    cpu_end = rpc_split if rpc_split else first_initial_prefill_start_ns
+                    vllm_queue_before_first_prefill_ns = max(0, cpu_end - enginecore_queue_end_ns)
+                    gpu_queue_before_first_ns = max(0, first_initial_prefill_start_ns - cpu_end)
+
                     prefill_schedule_gap_ns = 0
+                    prefill_gpu_gap_ns = 0
                     for prev_dispatch, next_dispatch in zip(initial_prefill_dispatches_sorted, initial_prefill_dispatches_sorted[1:]):
                         prev_end_ns = to_ns(prev_dispatch.get("end_ns"))
                         next_start_ns = to_ns(next_dispatch.get("start_ns"))
+                        next_rpc = to_ns(next_dispatch.get("rpc_start_ns"))
                         if prev_end_ns is None or next_start_ns is None:
                             continue
-                        prefill_schedule_gap_ns += max(0, next_start_ns - prev_end_ns)
+                        if next_start_ns <= prev_end_ns:
+                            continue
+                        gap_total = next_start_ns - prev_end_ns
+                        rpc_split = next_rpc if next_rpc is not None and next_rpc > prev_end_ns and next_rpc < next_start_ns else None
+                        cpu_end_ns = rpc_split if rpc_split else next_start_ns
+                        cpu_gap_ns = max(0, cpu_end_ns - prev_end_ns)
+                        gpu_gap_ns = max(0, next_start_ns - cpu_end_ns)
+                        prefill_schedule_gap_ns += cpu_gap_ns
+                        prefill_gpu_gap_ns += gpu_gap_ns
                     vllm_queue_ns = vllm_queue_before_first_prefill_ns + prefill_schedule_gap_ns
+                    gpu_queue_ns_total = gpu_queue_before_first_ns + prefill_gpu_gap_ns
 
                     prefill_exec_ns, prefill_exec_pairs = sum_clipped_interval_items(
                         initial_prefill_dispatches_sorted,
@@ -3989,7 +4067,7 @@ def process_logs(input_file, output_file):
                     postprocess_transport_ns = max(0, ttft_end_ns - last_initial_prefill_end_ns)
                     ttft_other_gap_ns = max(
                         0,
-                        ttft_total_ns - preprocess_ns - enginecore_queue_ns - vllm_queue_ns - prefill_exec_ns - postprocess_transport_ns,
+                        ttft_total_ns - preprocess_ns - enginecore_queue_ns - vllm_queue_ns - gpu_queue_ns_total - prefill_exec_ns - postprocess_transport_ns,
                     )
 
                     prefill_pp_gap_breakdown = build_pp_gap_dispatch_breakdown(
@@ -4009,7 +4087,8 @@ def process_logs(input_file, output_file):
                     ttft_components_ns = {
                         "preprocess": preprocess_ns,
                         "enginecore_queue": enginecore_queue_ns,
-                        "vllm_queue": vllm_queue_ns,
+                        "cpu_queue": vllm_queue_ns,
+                        "gpu_queue": gpu_queue_ns_total,
                         "prefill_exec": prefill_exec_ns,
                         "postprocess_transport": postprocess_transport_ns,
                         "other_gap": ttft_other_gap_ns,
@@ -4027,14 +4106,16 @@ def process_logs(input_file, output_file):
                         "phase_reentry_after_decode": phase_reentry_after_decode,
                         "components_ns": ttft_components_ns,
                         "components_ms": normalize_component_map_ms(ttft_components_ns),
-                        "vllm_queue_breakdown_ns": {
+                        "cpu_queue_breakdown_ns": {
                             "before_first_prefill": vllm_queue_before_first_prefill_ns,
                             "between_prefills": prefill_schedule_gap_ns,
                         },
-                        "vllm_queue_breakdown_ms": {
+                        "cpu_queue_breakdown_ms": {
                             "before_first_prefill": ns_to_ms(vllm_queue_before_first_prefill_ns),
                             "between_prefills": ns_to_ms(prefill_schedule_gap_ns),
                         },
+                        "gpu_queue_ns": gpu_queue_ns_total,
+                        "gpu_queue_ms": ns_to_ms(gpu_queue_ns_total),
                         "prefill_exec_phase_ns": dict(prefill_exec_phase_ns),
                         "prefill_exec_phase_ms": normalize_component_map_ms(prefill_exec_phase_ns),
                         "pp_gap_breakdown": prefill_pp_gap_breakdown,
@@ -4042,8 +4123,8 @@ def process_logs(input_file, output_file):
                     ttft_req_count += 1
                     for key, val in ttft_components_ns.items():
                         ttft_component_totals_ns[key] += val
-                    ttft_vllm_queue_breakdown_totals_ns["before_first_prefill"] += vllm_queue_before_first_prefill_ns
-                    ttft_vllm_queue_breakdown_totals_ns["between_prefills"] += prefill_schedule_gap_ns
+                    ttft_cpu_queue_breakdown_totals_ns["before_first_prefill"] += vllm_queue_before_first_prefill_ns
+                    ttft_cpu_queue_breakdown_totals_ns["between_prefills"] += prefill_schedule_gap_ns
                     for key, val in prefill_exec_phase_ns.items():
                         ttft_prefill_exec_breakdown_totals_ns[key] += val
             else:
@@ -4142,6 +4223,21 @@ def process_logs(input_file, output_file):
                 if "pipeline_gap" in tpot_exec_phase_ns:
                     tpot_exec_phase_ns["other_exec"] += tpot_exec_phase_ns.pop("pipeline_gap")
 
+                tpot_gpu_queue_ns = 0
+                tpot_dispatches_sorted = sorted(tpot_exec_dispatches, key=lambda x: (x["start_ns"], x["end_ns"]))
+                if tpot_dispatches_sorted:
+                    first_tpot_rpc = to_ns(tpot_dispatches_sorted[0].get("rpc_start_ns"))
+                    if first_tpot_rpc is not None and first_tpot_rpc > tpot_window_start_ns and first_tpot_rpc < tpot_dispatches_sorted[0]["start_ns"]:
+                        tpot_gpu_queue_ns += tpot_dispatches_sorted[0]["start_ns"] - first_tpot_rpc
+                for prev_d, next_d in zip(tpot_dispatches_sorted, tpot_dispatches_sorted[1:]):
+                    prev_end = prev_d["end_ns"]
+                    next_start = next_d["start_ns"]
+                    next_rpc = to_ns(next_d.get("rpc_start_ns"))
+                    if prev_end is None or next_start is None or next_start <= prev_end:
+                        continue
+                    if next_rpc is not None and next_rpc > prev_end and next_rpc < next_start:
+                        tpot_gpu_queue_ns += next_start - next_rpc
+
                 tail_transport_ns = max(0, tpot_window_end_ns - last_decode_end_ns)
                 tpot_total_ns = tpot_window_end_ns - tpot_window_start_ns
                 tpot_other_gap_ns = uncovered_interval_ns(
@@ -4159,7 +4255,8 @@ def process_logs(input_file, output_file):
                     if scheduling_wait_total_ns > 0 else 0.0
                 )
                 tpot_components_ns = {
-                    "vllm_scheduling_wait": scheduling_wait_total_ns,
+                    "cpu_scheduling_wait": scheduling_wait_total_ns,
+                    "gpu_queue": tpot_gpu_queue_ns,
                     "worker_preprocess": tpot_exec_phase_ns.get("worker_preprocess", 0),
                     "model_forward": tpot_exec_phase_ns.get("model_forward", 0),
                     "postprocess": tpot_exec_phase_ns.get("postprocess", 0),
@@ -4240,15 +4337,15 @@ def process_logs(input_file, output_file):
         }
 
     ttft_avg_components_ms = {}
-    ttft_vllm_queue_breakdown_avg_ms = {}
+    ttft_cpu_queue_breakdown_avg_ms = {}
     ttft_prefill_exec_breakdown_avg_ms = {}
     if ttft_req_count > 0:
         ttft_avg_components_ms = {
             key: round(ttft_component_totals_ns.get(key, 0) / ttft_req_count / 1e6, 6)
-            for key in ["preprocess", "enginecore_queue", "vllm_queue", "prefill_exec", "postprocess_transport", "other_gap"]
+            for key in ["preprocess", "enginecore_queue", "cpu_queue", "gpu_queue", "prefill_exec", "postprocess_transport", "other_gap"]
         }
-        ttft_vllm_queue_breakdown_avg_ms = {
-            key: round(ttft_vllm_queue_breakdown_totals_ns.get(key, 0) / ttft_req_count / 1e6, 6)
+        ttft_cpu_queue_breakdown_avg_ms = {
+            key: round(ttft_cpu_queue_breakdown_totals_ns.get(key, 0) / ttft_req_count / 1e6, 6)
             for key in ["before_first_prefill", "between_prefills"]
         }
         ttft_prefill_exec_keys = [
@@ -4276,7 +4373,8 @@ def process_logs(input_file, output_file):
         tpot_avg_components_ms = {
             key: round(tpot_component_totals_ns.get(key, 0) / tpot_total_decode_steps / 1e6, 6)
             for key in [
-                "vllm_scheduling_wait",
+                "cpu_scheduling_wait",
+                "gpu_queue",
                 "worker_preprocess",
                 "model_forward",
                 "postprocess",
@@ -4295,7 +4393,7 @@ def process_logs(input_file, output_file):
     compute_breakdown["summary"] = {
         "ttft_request_count": ttft_req_count,
         "ttft_avg_components_ms": ttft_avg_components_ms,
-        "ttft_vllm_queue_breakdown_avg_ms": ttft_vllm_queue_breakdown_avg_ms,
+        "ttft_cpu_queue_breakdown_avg_ms": ttft_cpu_queue_breakdown_avg_ms,
         "ttft_prefill_exec_breakdown_avg_ms": ttft_prefill_exec_breakdown_avg_ms,
         "ttft_avg_ms": round(sum(ttft_avg_components_ms.values()), 6) if ttft_avg_components_ms else None,
         "tpot_request_count": tpot_req_count,
@@ -4316,12 +4414,12 @@ def process_logs(input_file, output_file):
             f"TTFT Avg ({ttft_req_count} reqs, compute-side): "
             f"{compute_breakdown['summary']['ttft_avg_ms']:.3f} ms"
         )
-        for key in ["preprocess", "enginecore_queue", "vllm_queue", "prefill_exec", "postprocess_transport", "other_gap"]:
+        for key in ["preprocess", "enginecore_queue", "cpu_queue", "gpu_queue", "prefill_exec", "postprocess_transport", "other_gap"]:
             print(f"  - {key}: {ttft_avg_components_ms.get(key, 0.0):.3f} ms")
         print(
-            "  - vllm_queue_breakdown: "
-            f"before_first_prefill={ttft_vllm_queue_breakdown_avg_ms.get('before_first_prefill', 0.0):.3f} ms, "
-            f"between_prefills={ttft_vllm_queue_breakdown_avg_ms.get('between_prefills', 0.0):.3f} ms"
+            "  - cpu_queue_breakdown: "
+            f"before_first_prefill={ttft_cpu_queue_breakdown_avg_ms.get('before_first_prefill', 0.0):.3f} ms, "
+            f"between_prefills={ttft_cpu_queue_breakdown_avg_ms.get('between_prefills', 0.0):.3f} ms"
         )
         if ttft_prefill_exec_breakdown_avg_ms:
             detail = ", ".join(
@@ -4348,7 +4446,8 @@ def process_logs(input_file, output_file):
             f"(denominator=decode_dispatch_count)"
         )
         for key in [
-            "vllm_scheduling_wait",
+            "cpu_scheduling_wait",
+            "gpu_queue",
             "worker_preprocess",
             "model_forward",
             "postprocess",
@@ -4465,7 +4564,7 @@ def process_logs(input_file, output_file):
         lane_names = {
             "label": f"{rid[:12]}",
             "lifecycle": f"{rid[:12]} | lifecycle",
-            "vllm_queue": f"{rid[:12]} | vllm queue",
+            "vllm_queue": f"{rid[:12]} | cpu sched queue",
             "coro_queue": f"{rid[:12]} | coroutine queue",
             "output_socket_queue": f"{rid[:12]} | output socket queue",
             "output_queue": f"{rid[:12]} | output queue",
@@ -4477,6 +4576,7 @@ def process_logs(input_file, output_file):
             "stage": f"{rid[:12]} | stage",
             "task": f"{rid[:12]} | task",
             "pp_gap": f"{rid[:12]} | pp gap",
+            "gpu_queue": f"{rid[:12]} | gpu dispatch queue",
         }
         if dispatch_lane_count > 1:
             lane_names["dispatch"] = f"{rid[:12]} | dispatch 1"
@@ -4510,6 +4610,7 @@ def process_logs(input_file, output_file):
         pp_gap_ms = _request_pp_gap_wall_ns(rid) / 1e6
         vllm_queue_from_enqueue_ms = req_vllm_queue_from_enqueue_ns.get(rid, 0) / 1e6
         vllm_queue_from_step_ready_ms = req_vllm_queue_from_step_ready_ns.get(rid, 0) / 1e6
+        gpu_queue_ms = req_gpu_queue_ns.get(rid, 0) / 1e6
         os_delay_ms = req_latency_map.get(rid, 0) / 1e6
         engine_input_queue_wait_ms = req_stage_ns.get(rid, {}).get(
             "engine_core.input_queue_wait_after_preprocess", 0) / 1e6
@@ -4537,10 +4638,11 @@ def process_logs(input_file, output_file):
                     "output_socket_exec_ms": round(output_socket_exec_ms, 3),
                     "output_handler_sched_queue_ms": round(output_handler_sched_queue_ms, 3),
                     "output_handler_exec_ms": round(output_handler_exec_ms, 3),
-                    "vllm_queue_ms": round(vllm_queue_ms, 3),
+                    "cpu_sched_queue_ms": round(vllm_queue_ms, 3),
                     "pp_gap_ms": round(pp_gap_ms, 3),
-                    "vllm_queue_from_enqueue_ms": round(vllm_queue_from_enqueue_ms, 3),
-                    "vllm_queue_from_step_ready_ms": round(vllm_queue_from_step_ready_ms, 3),
+                    "cpu_sched_queue_from_enqueue_ms": round(vllm_queue_from_enqueue_ms, 3),
+                    "cpu_sched_queue_from_step_ready_ms": round(vllm_queue_from_step_ready_ms, 3),
+                    "gpu_dispatch_queue_ms": round(gpu_queue_ms, 3),
                     "engine_input_queue_wait_ms": round(engine_input_queue_wait_ms, 3),
                     "os_sched_delay_ms": round(os_delay_ms, 3),
                     "prefill_exec_ms": round(prefill_exec_ms, 3),
@@ -4592,6 +4694,8 @@ def process_logs(input_file, output_file):
                     "end_source": d.get("end_source"),
                     "gpu_marker_start_ns": d.get("gpu_marker_start_ns"),
                     "gpu_marker_end_ns": d.get("gpu_marker_end_ns"),
+                    "gpu_queue_ns": d.get("gpu_queue_ns", 0),
+                    "rpc_start_ns": d.get("rpc_start_ns"),
                     "scheduler_ready_lag_ms": (
                         round((d["scheduler_ready_ns"] - d["worker_end_ns"]) / 1e6, 3)
                         if d.get("scheduler_ready_ns") is not None and d.get("worker_end_ns") is not None
@@ -4759,24 +4863,45 @@ def process_logs(input_file, output_file):
                     cname="cyan",
                 ))
 
+        for gq in gpu_queue_intervals_map.get(rid, []):
+            if gq["end_ns"] > gq["start_ns"]:
+                trace_events.append(create_perfetto_event(
+                    name=f"GPU Dispatch Wait ({gq.get('phase', 'unknown')})",
+                    cat="request_gpu_queue",
+                    ph="X",
+                    ts=gq["start_ns"],
+                    dur=gq["end_ns"] - gq["start_ns"],
+                    pid=REQUEST_PID,
+                    tid=lane_tids["gpu_queue"],
+                    args={
+                        "request_id": rid,
+                        "dispatch_key": gq.get("dispatch_key"),
+                        "phase": gq.get("phase"),
+                        "duration_ms": round(gq.get("duration_ns", 0) / 1e6, 3),
+                        "start_source": gq.get("start_source", "scheduler_out_rpc"),
+                        "end_source": gq.get("end_source", "gpu_or_worker_start"),
+                    },
+                    cname="lightorange",
+                ))
+
         for q in queue_intervals_map.get(rid, []):
             if q["end_ns"] > q["start_ns"]:
                 scheduled_from = q.get("scheduled_from")
                 gap_kind = q.get("gap_kind", "normal_wait")
                 if gap_kind == "preempt_wait":
-                    q_name = "vLLM Preempt Wait (explicit preempt)"
+                    q_name = "CPU Preempt Wait (explicit preempt)"
                     q_cat = "request_queue_preempt"
                     q_color = "terrible"
                 elif scheduled_from == "enqueue":
-                    q_name = "vLLM Queue Wait (scheduled-enqueue)"
+                    q_name = "CPU Sched Wait (enqueue→out_rpc)"
                     q_cat = "request_queue_scheduled_enqueue"
                     q_color = "yellow"
                 elif scheduled_from == "step_ready":
-                    q_name = "vLLM Scheduling Wait (step_ready->out_rpc)"
+                    q_name = "CPU Sched Wait (step_ready→out_rpc)"
                     q_cat = "request_queue_scheduled_step_ready"
                     q_color = "yellow"
                 else:
-                    q_name = "vLLM Queue Wait"
+                    q_name = "CPU Sched Wait"
                     q_cat = "request_queue"
                     q_color = "yellow"
                 trace_events.append(create_perfetto_event(
@@ -4849,6 +4974,7 @@ def process_logs(input_file, output_file):
             + req_output_handler_sched_ns.get(x, 0)
             + req_output_handler_exec_ns.get(x, 0)
             + req_vllm_queue_ns.get(x, 0)
+            + req_gpu_queue_ns.get(x, 0)
             + _request_pp_gap_wall_ns(x)
             + req_latency_map.get(x, 0)
         ),
@@ -4868,9 +4994,10 @@ def process_logs(input_file, output_file):
             f"output_socket_exec={req_output_socket_exec_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"output_handler_sched_queue={req_output_handler_sched_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"output_handler_exec={req_output_handler_exec_ns.get(rid, 0) / 1e6:.3f} ms, "
-            f"vllm_queue={req_vllm_queue_ns.get(rid, 0) / 1e6:.3f} ms "
+            f"cpu_sched_queue={req_vllm_queue_ns.get(rid, 0) / 1e6:.3f} ms "
             f"(scheduled-enqueue={req_vllm_queue_from_enqueue_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"scheduled-step_ready={req_vllm_queue_from_step_ready_ns.get(rid, 0) / 1e6:.3f} ms), "
+            f"gpu_queue={req_gpu_queue_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"pp_gap={pp_gap_ms:.3f} ms, "
             f"os_delay={req_latency_map.get(rid, 0) / 1e6:.3f} ms, "
             f"prefill_exec={req_dispatch_phase_ns.get(rid, {}).get('prefill', 0) / 1e6:.3f} ms, "
