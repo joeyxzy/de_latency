@@ -1087,7 +1087,18 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
             case CUPTI_ACTIVITY_KIND_KERNEL: {
                 auto *k = (CUpti_ActivityKernel4 *)record;
                 if (strstr(k->name, "de_marker") != NULL) {
-                    // 1. 先发一份普通 kernel 记录，保留在 GPU 时间轴上可见
+                    // 1. 先查 metadata，用于 kernel 名称和 marker 记录
+                    std::string meta_str;
+                    {
+                        std::lock_guard<std::mutex> lk(g_marker_map_mutex);
+                        auto it = g_marker_map.find(k->gridX);
+                        if (it != g_marker_map.end()) {
+                            meta_str = it->second;
+                            g_marker_map.erase(it);
+                        }
+                    }
+
+                    // 2. 发 kernel 记录，name 中加入 role|dispatch_key 便于观察
                     UnifiedTraceRecord kern_copy = {};
                     kern_copy.type     = RECORD_TYPE_KERNEL;
                     kern_copy.start_ns = k->start;
@@ -1097,14 +1108,19 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
                     kern_copy.contextId     = k->contextId;
                     kern_copy.streamId      = k->streamId;
                     kern_copy.pid           = getpid();
-                    strncpy(kern_copy.name, k->name, sizeof(kern_copy.name) - 1);
+                    if (meta_str.empty()) {
+                        strncpy(kern_copy.name, k->name, sizeof(kern_copy.name) - 1);
+                    } else {
+                        snprintf(kern_copy.name, sizeof(kern_copy.name),
+                                 "%s:%s", k->name, meta_str.c_str());
+                    }
                     kern_copy.gridX  = k->gridX;  kern_copy.gridY  = k->gridY;  kern_copy.gridZ  = k->gridZ;
                     kern_copy.blockX = k->blockX; kern_copy.blockY = k->blockY; kern_copy.blockZ = k->blockZ;
                     kern_copy.staticSharedMemory  = k->staticSharedMemory;
                     kern_copy.dynamicSharedMemory = k->dynamicSharedMemory;
                     send_record_payload(&kern_copy);
 
-                    // 2. 再发一份 marker 记录，携带 metadata 用于批次定界
+                    // 3. 发 marker 记录（metadata 专用于批次定界）
                     rec.type     = RECORD_TYPE_MARKER;
                     rec.start_ns = k->start;
                     rec.end_ns   = k->end;
@@ -1112,13 +1128,8 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
                     rec.deviceId = k->deviceId;
                     rec.contextId = k->contextId;
                     rec.pid      = getpid();
-                    {
-                        std::lock_guard<std::mutex> lk(g_marker_map_mutex);
-                        auto it = g_marker_map.find(k->gridX);
-                        if (it != g_marker_map.end()) {
-                            strncpy(rec.name, it->second.c_str(), sizeof(rec.name) - 1);
-                            g_marker_map.erase(it);
-                        }
+                    if (!meta_str.empty()) {
+                        strncpy(rec.name, meta_str.c_str(), sizeof(rec.name) - 1);
                     }
                     if (rec.name[0]) {
                         record_valid = true;

@@ -1183,22 +1183,16 @@ def render_compute_breakdown_svg(svg_path, ttft_components_ms, tpot_components_m
     ttft_order = [
         ("preprocess", "#4E79A7", "Preprocess"),
         ("enginecore_queue", "#F28E2B", "EngineCore Queue"),
-        ("cpu_queue", "#E15759", "CPU Sched Queue"),
-        ("gpu_queue", "#FF9D4D", "GPU Dispatch Queue"),
+        ("cpu_sched_wait", "#E15759", "CPU Sched Wait"),
+        ("gpu_dispatch_wait", "#FF9D4D", "GPU Dispatch Wait"),
         ("prefill_exec", "#76B7B2", "Prefill Exec"),
         ("postprocess_transport", "#59A14F", "Postprocess / Transport"),
         ("other_gap", "#BAB0AC", "Other Gap"),
     ]
     tpot_order = [
-        ("cpu_scheduling_wait", "#E15759", "CPU Scheduling Wait"),
-        ("gpu_queue", "#FF9D4D", "GPU Dispatch Queue"),
-        ("worker_preprocess", "#59A14F", "Worker Preprocess"),
-        ("model_forward", "#4E79A7", "Model Forward"),
-        ("postprocess", "#9C755F", "Postprocess"),
-        ("sampling", "#B07AA1", "GPUModelRunner sample_tokens"),
-        ("bookkeeping_sync", "#76B7B2", "Bookkeeping / Sync"),
-        ("pp_gap", "#F28E2B", "PP Gap"),
-        ("other_exec", "#EDC948", "Other Exec"),
+        ("cpu_queue", "#E15759", "CPU Queue"),
+        ("gpu_queue", "#FF9D4D", "GPU Queue"),
+        ("decode_exec", "#4E79A7", "Decode Exec"),
         ("tail_transport", "#86BCB6", "Tail Transport"),
         ("other_gap", "#BAB0AC", "Other Gap"),
     ]
@@ -1328,8 +1322,8 @@ def render_request_breakdown_svg(svg_path, rid, request_name, ttft_entry, tpot_e
         ttft_colors = {
             "preprocess": "#4E79A7",
             "enginecore_queue": "#F28E2B",
-            "cpu_queue": "#E15759",
-            "gpu_queue": "#FF9D4D",
+            "cpu_sched_wait": "#E15759",
+            "gpu_dispatch_wait": "#FF9D4D",
             "prefill_exec": "#76B7B2",
             "postprocess_transport": "#59A14F",
             "other_gap": "#BAB0AC",
@@ -1337,13 +1331,13 @@ def render_request_breakdown_svg(svg_path, rid, request_name, ttft_entry, tpot_e
         ttft_labels = {
             "preprocess": "Preprocess",
             "enginecore_queue": "EngineCore Queue",
-            "cpu_queue": "CPU Sched Queue",
-            "gpu_queue": "GPU Dispatch Queue",
+            "cpu_sched_wait": "CPU Sched Wait",
+            "gpu_dispatch_wait": "GPU Dispatch Wait",
             "prefill_exec": "Prefill Exec",
             "postprocess_transport": "Postprocess / Transport",
             "other_gap": "Other Gap",
         }
-        for key in ["preprocess", "enginecore_queue", "cpu_queue", "gpu_queue", "prefill_exec", "postprocess_transport", "other_gap"]:
+        for key in ["preprocess", "enginecore_queue", "cpu_sched_wait", "gpu_dispatch_wait", "prefill_exec", "postprocess_transport", "other_gap"]:
             ttft_rows.append({
                 "label": ttft_labels[key],
                 "value_ms": ttft_entry["components_ms"].get(key, 0.0),
@@ -1353,41 +1347,20 @@ def render_request_breakdown_svg(svg_path, rid, request_name, ttft_entry, tpot_e
     tpot_rows = []
     if tpot_entry:
         tpot_colors = {
-            "vllm_scheduling_wait": "#E15759",
-            "worker_preprocess": "#59A14F",
-            "model_forward": "#4E79A7",
-            "postprocess": "#9C755F",
-            "sampling": "#B07AA1",
-            "bookkeeping_sync": "#76B7B2",
-            "pp_gap": "#F28E2B",
-            "other_exec": "#EDC948",
+            "cpu_queue": "#E15759",
+            "gpu_queue": "#FF9D4D",
+            "decode_exec": "#4E79A7",
             "tail_transport": "#86BCB6",
             "other_gap": "#BAB0AC",
         }
         tpot_labels = {
-            "vllm_scheduling_wait": "vLLM Scheduling Wait",
-            "worker_preprocess": "Worker Preprocess",
-            "model_forward": "Model Forward",
-            "postprocess": "Postprocess",
-            "sampling": "GPUModelRunner sample_tokens",
-            "bookkeeping_sync": "Bookkeeping / Sync",
-            "pp_gap": "PP Gap",
-            "other_exec": "Other Exec",
+            "cpu_queue": "CPU Queue",
+            "gpu_queue": "GPU Queue",
+            "decode_exec": "Decode Exec",
             "tail_transport": "Tail Transport",
             "other_gap": "Other Gap",
         }
-        for key in [
-            "vllm_scheduling_wait",
-            "worker_preprocess",
-            "model_forward",
-            "postprocess",
-            "sampling",
-            "bookkeeping_sync",
-            "pp_gap",
-            "other_exec",
-            "tail_transport",
-            "other_gap",
-        ]:
+        for key in ["cpu_queue", "gpu_queue", "decode_exec", "tail_transport", "other_gap"]:
             tpot_rows.append({
                 "label": tpot_labels[key],
                 "value_ms": tpot_entry["components_ms_per_token"].get(key, 0.0),
@@ -1420,32 +1393,16 @@ def render_request_breakdown_svg(svg_path, rid, request_name, ttft_entry, tpot_e
         )
         row_lines, end_y = _component_rows_svg(chart_x, cursor_y + 62, chart_w, ttft_rows, max(ttft_entry["window_ms"], 1e-9))
         lines.extend(row_lines)
-        breakdown = ttft_entry.get("cpu_queue_breakdown_ms", {})
-        lines.append(
-            f'<text x="{chart_x}" y="{end_y + 18}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#374151">vLLM queue breakdown: before_first_prefill={float(breakdown.get("before_first_prefill", 0.0)):.3f} ms, between_prefills={float(breakdown.get("between_prefills", 0.0)):.3f} ms</text>'
-        )
-        prefill_phase = ttft_entry.get("prefill_exec_phase_ms", {})
-        lines.append(
-            f'<text x="{chart_x}" y="{end_y + 40}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#374151">prefill exec wall breakdown: forward={float(prefill_phase.get("model_forward", 0.0)):.3f} ms, pp_gap={float(prefill_phase.get("pp_gap", 0.0)):.3f} ms, other_exec={float(prefill_phase.get("other_prefill_exec", 0.0)):.3f} ms</text>'
-        )
-        cursor_y = end_y + 78
+        cursor_y = end_y + 22
 
     if tpot_entry:
         lines.append(f'<text x="48" y="{cursor_y}" font-size="22" font-family="Helvetica, Arial, sans-serif" font-weight="700" fill="#111827">TPOT</text>')
         lines.append(
             f'<text x="48" y="{cursor_y + 24}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#4B5563">avg={tpot_entry["avg_ms_per_token"]:.3f} ms/token, decode_dispatch_count={tpot_entry.get("decode_dispatch_count", 0)}, start_rule={_svg_escape(tpot_entry.get("tpot_start_rule"))}, end_rule={_svg_escape(tpot_entry.get("tpot_end_rule"))}</text>'
         )
-        lines.append(
-            f'<text x="48" y="{cursor_y + 46}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#4B5563">scheduling_wait_total={float(tpot_entry.get("scheduling_wait_total_ms", 0.0)):.3f} ms, exec_total={float(tpot_entry.get("exec_total_ms", 0.0)):.3f} ms, tail_transport={float(tpot_entry.get("tail_transport_ms", 0.0)):.3f} ms</text>'
-        )
-        row_lines, end_y = _component_rows_svg(chart_x, cursor_y + 62, chart_w, tpot_rows, max(tpot_entry["avg_ms_per_token"], 1e-9))
+        row_lines, end_y = _component_rows_svg(chart_x, cursor_y + 46, chart_w, tpot_rows, max(tpot_entry["avg_ms_per_token"], 1e-9))
         lines.extend(row_lines)
-        sched = tpot_entry.get("scheduling_wait_breakdown_ms", {})
-        sched_ratio = tpot_entry.get("scheduling_wait_breakdown_ratio", {})
-        lines.append(
-            f'<text x="{chart_x}" y="{end_y + 18}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#374151">scheduling wait breakdown: normal_gap={float(sched.get("normal_gap", 0.0)):.3f} ms ({float(sched_ratio.get("normal_gap_pct", 0.0)):.1f}%), preempt_gap={float(sched.get("preempt_gap", 0.0)):.3f} ms ({float(sched_ratio.get("preempt_gap_pct", 0.0)):.1f}%)</text>'
-        )
-        cursor_y = end_y + 40
+        cursor_y = end_y + 22
 
     if not ttft_entry and not tpot_entry:
         lines.append('<text x="48" y="118" font-size="18" font-family="Helvetica, Arial, sans-serif" fill="#6B7280">No compute-side TTFT/TPOT breakdown available for this request.</text>')
@@ -3931,8 +3888,6 @@ def process_logs(input_file, output_file):
         "phase_reentry_after_decode_requests": [],
     }
     ttft_component_totals_ns = defaultdict(int)
-    ttft_cpu_queue_breakdown_totals_ns = defaultdict(int)
-    ttft_prefill_exec_breakdown_totals_ns = defaultdict(int)
     ttft_req_count = 0
     tpot_component_totals_ns = defaultdict(int)
     tpot_req_count = 0
@@ -3988,25 +3943,6 @@ def process_logs(input_file, output_file):
         if ttft_start_ns is not None and initial_prefill_dispatches and first_generate_consume_end_ns is not None:
             ttft_end_ns = first_generate_consume_end_ns
             if ttft_end_ns > ttft_start_ns:
-                enginecore_queue_intervals = [
-                    s for s in req_stage_intervals.get(rid, [])
-                    if s.get("stage") == "engine_core.input_queue_wait_after_preprocess"
-                ]
-                enginecore_queue_ns, _enginecore_queue_pairs = sum_clipped_interval_items(
-                    enginecore_queue_intervals,
-                    ttft_start_ns,
-                    ttft_end_ns,
-                )
-                enginecore_queue_start_ns = None
-                enginecore_queue_end_ns = None
-                for s in sorted(enginecore_queue_intervals, key=lambda x: (x["start_ns"], x["end_ns"])):
-                    span = clip_interval(s.get("start_ns"), s.get("end_ns"), ttft_start_ns, ttft_end_ns)
-                    if not span:
-                        continue
-                    if enginecore_queue_start_ns is None:
-                        enginecore_queue_start_ns = span[0]
-                    enginecore_queue_end_ns = span[1]
-
                 initial_prefill_dispatches_sorted = sorted(
                     initial_prefill_dispatches,
                     key=lambda x: (x["start_ns"], x["end_ns"]),
@@ -4016,28 +3952,47 @@ def process_logs(input_file, output_file):
                 if first_initial_prefill_start_ns is None or last_initial_prefill_end_ns is None:
                     compute_breakdown["skipped_requests"]["ttft_missing"].append(rid)
                 else:
+                    enginecore_queue_intervals = [
+                        s for s in req_stage_intervals.get(rid, [])
+                        if s.get("stage") == "engine_core.input_queue_wait_after_preprocess"
+                    ]
+                    enginecore_queue_ns, _engcore_q_pairs = sum_clipped_interval_items(
+                        enginecore_queue_intervals,
+                        ttft_start_ns,
+                        ttft_end_ns,
+                    )
+                    enginecore_queue_start_ns = None
+                    enginecore_queue_end_ns = None
+                    for s in sorted(enginecore_queue_intervals, key=lambda x: (x["start_ns"], x["end_ns"])):
+                        span = clip_interval(s.get("start_ns"), s.get("end_ns"), ttft_start_ns, ttft_end_ns)
+                        if not span:
+                            continue
+                        if enginecore_queue_start_ns is None:
+                            enginecore_queue_start_ns = span[0]
+                        enginecore_queue_end_ns = span[1]
+
+                    enqueue_ns = to_ns(req_enqueue_map.get(rid))
                     preprocess_boundary_ns = enginecore_queue_start_ns
                     if preprocess_boundary_ns is None:
-                        enqueue_ns = to_ns(req_enqueue_map.get(rid))
-                        candidates = [val for val in [enqueue_ns, first_initial_prefill_start_ns, ttft_end_ns] if val is not None]
-                        preprocess_boundary_ns = min(candidates) if candidates else ttft_start_ns
+                        preprocess_boundary_ns = enqueue_ns if enqueue_ns is not None else first_initial_prefill_start_ns
                     preprocess_boundary_ns = max(ttft_start_ns, min(preprocess_boundary_ns, ttft_end_ns))
                     preprocess_ns = max(0, preprocess_boundary_ns - ttft_start_ns)
 
-                    if enginecore_queue_end_ns is None:
-                        enginecore_queue_end_ns = preprocess_boundary_ns
-                    enginecore_queue_end_ns = max(preprocess_boundary_ns, min(enginecore_queue_end_ns, first_initial_prefill_start_ns))
+                    cpu_sched_start = enqueue_ns if enqueue_ns is not None else (enginecore_queue_end_ns or preprocess_boundary_ns)
+                    cpu_sched_start = max(cpu_sched_start, preprocess_boundary_ns)
+                    cpu_sched_wait_ns = 0
+                    gpu_dispatch_wait_ns = 0
 
-                    # Split the "before first prefill" gap at rpc_start_ns
                     first_rpc = to_ns(initial_prefill_dispatches_sorted[0].get("rpc_start_ns"))
-                    gap_total = max(0, first_initial_prefill_start_ns - enginecore_queue_end_ns)
-                    rpc_split = first_rpc if first_rpc is not None and first_rpc > enginecore_queue_end_ns and first_rpc < first_initial_prefill_start_ns else None
-                    cpu_end = rpc_split if rpc_split else first_initial_prefill_start_ns
-                    vllm_queue_before_first_prefill_ns = max(0, cpu_end - enginecore_queue_end_ns)
-                    gpu_queue_before_first_ns = max(0, first_initial_prefill_start_ns - cpu_end)
+                    first_start = initial_prefill_dispatches_sorted[0]["start_ns"]
 
-                    prefill_schedule_gap_ns = 0
-                    prefill_gpu_gap_ns = 0
+                    if first_rpc is not None and first_rpc > cpu_sched_start:
+                        cpu_sched_wait_ns += first_rpc - cpu_sched_start
+                        if first_start is not None and first_start > first_rpc:
+                            gpu_dispatch_wait_ns += first_start - first_rpc
+                    elif first_start is not None and first_start > cpu_sched_start:
+                        gpu_dispatch_wait_ns += first_start - cpu_sched_start
+
                     for prev_dispatch, next_dispatch in zip(initial_prefill_dispatches_sorted, initial_prefill_dispatches_sorted[1:]):
                         prev_end_ns = to_ns(prev_dispatch.get("end_ns"))
                         next_start_ns = to_ns(next_dispatch.get("start_ns"))
@@ -4046,15 +4001,12 @@ def process_logs(input_file, output_file):
                             continue
                         if next_start_ns <= prev_end_ns:
                             continue
-                        gap_total = next_start_ns - prev_end_ns
-                        rpc_split = next_rpc if next_rpc is not None and next_rpc > prev_end_ns and next_rpc < next_start_ns else None
-                        cpu_end_ns = rpc_split if rpc_split else next_start_ns
-                        cpu_gap_ns = max(0, cpu_end_ns - prev_end_ns)
-                        gpu_gap_ns = max(0, next_start_ns - cpu_end_ns)
-                        prefill_schedule_gap_ns += cpu_gap_ns
-                        prefill_gpu_gap_ns += gpu_gap_ns
-                    vllm_queue_ns = vllm_queue_before_first_prefill_ns + prefill_schedule_gap_ns
-                    gpu_queue_ns_total = gpu_queue_before_first_ns + prefill_gpu_gap_ns
+                        if next_rpc is not None and next_rpc > prev_end_ns:
+                            cpu_sched_wait_ns += next_rpc - prev_end_ns
+                            if next_start_ns > next_rpc:
+                                gpu_dispatch_wait_ns += next_start_ns - next_rpc
+                        else:
+                            gpu_dispatch_wait_ns += next_start_ns - prev_end_ns
 
                     prefill_exec_ns, prefill_exec_pairs = sum_clipped_interval_items(
                         initial_prefill_dispatches_sorted,
@@ -4067,28 +4019,14 @@ def process_logs(input_file, output_file):
                     postprocess_transport_ns = max(0, ttft_end_ns - last_initial_prefill_end_ns)
                     ttft_other_gap_ns = max(
                         0,
-                        ttft_total_ns - preprocess_ns - enginecore_queue_ns - vllm_queue_ns - gpu_queue_ns_total - prefill_exec_ns - postprocess_transport_ns,
+                        ttft_total_ns - preprocess_ns - enginecore_queue_ns - cpu_sched_wait_ns - gpu_dispatch_wait_ns - prefill_exec_ns - postprocess_transport_ns,
                     )
-
-                    prefill_pp_gap_breakdown = build_pp_gap_dispatch_breakdown(
-                        initial_prefill_dispatches_sorted,
-                        request_phase_intervals,
-                        request_step_execution_intervals,
-                        phase_component_map=phase_exec_name_map,
-                    )
-                    prefill_exec_phase_ns = defaultdict(int)
-                    for key, value in prefill_pp_gap_breakdown.get("wall_components_ns", {}).items():
-                        prefill_exec_phase_ns[key] += value
-                    if "other_compute" in prefill_exec_phase_ns:
-                        prefill_exec_phase_ns["other_prefill_exec"] += prefill_exec_phase_ns.pop("other_compute")
-                    if "pipeline_gap" in prefill_exec_phase_ns:
-                        prefill_exec_phase_ns["other_prefill_exec"] += prefill_exec_phase_ns.pop("pipeline_gap")
 
                     ttft_components_ns = {
                         "preprocess": preprocess_ns,
                         "enginecore_queue": enginecore_queue_ns,
-                        "cpu_queue": vllm_queue_ns,
-                        "gpu_queue": gpu_queue_ns_total,
+                        "cpu_sched_wait": cpu_sched_wait_ns,
+                        "gpu_dispatch_wait": gpu_dispatch_wait_ns,
                         "prefill_exec": prefill_exec_ns,
                         "postprocess_transport": postprocess_transport_ns,
                         "other_gap": ttft_other_gap_ns,
@@ -4106,27 +4044,10 @@ def process_logs(input_file, output_file):
                         "phase_reentry_after_decode": phase_reentry_after_decode,
                         "components_ns": ttft_components_ns,
                         "components_ms": normalize_component_map_ms(ttft_components_ns),
-                        "cpu_queue_breakdown_ns": {
-                            "before_first_prefill": vllm_queue_before_first_prefill_ns,
-                            "between_prefills": prefill_schedule_gap_ns,
-                        },
-                        "cpu_queue_breakdown_ms": {
-                            "before_first_prefill": ns_to_ms(vllm_queue_before_first_prefill_ns),
-                            "between_prefills": ns_to_ms(prefill_schedule_gap_ns),
-                        },
-                        "gpu_queue_ns": gpu_queue_ns_total,
-                        "gpu_queue_ms": ns_to_ms(gpu_queue_ns_total),
-                        "prefill_exec_phase_ns": dict(prefill_exec_phase_ns),
-                        "prefill_exec_phase_ms": normalize_component_map_ms(prefill_exec_phase_ns),
-                        "pp_gap_breakdown": prefill_pp_gap_breakdown,
                     }
                     ttft_req_count += 1
                     for key, val in ttft_components_ns.items():
                         ttft_component_totals_ns[key] += val
-                    ttft_cpu_queue_breakdown_totals_ns["before_first_prefill"] += vllm_queue_before_first_prefill_ns
-                    ttft_cpu_queue_breakdown_totals_ns["between_prefills"] += prefill_schedule_gap_ns
-                    for key, val in prefill_exec_phase_ns.items():
-                        ttft_prefill_exec_breakdown_totals_ns[key] += val
             else:
                 compute_breakdown["skipped_requests"]["ttft_missing"].append(rid)
         else:
@@ -4185,50 +4106,24 @@ def process_logs(input_file, output_file):
                     merge_overlaps=True,
                 )
 
-                post_start_queue_intervals = [
-                    q for q in queue_intervals
-                    if q.get("phase") in ("prefill", "decode")
-                ]
-                scheduling_wait_normal_ns = 0
-                scheduling_wait_preempt_ns = 0
-                scheduling_wait_preempt_events = []
+                cpu_queue_ns = 0
                 tpot_queue_pairs = []
-                for q in post_start_queue_intervals:
+                for q in queue_intervals:
                     span = clip_interval(q.get("start_ns"), q.get("end_ns"), tpot_window_start_ns, tpot_exec_end_ns)
                     if not span:
                         continue
                     start_ns, end_ns = span
                     tpot_queue_pairs.append(span)
-                    preempt_hits = [
-                        ts for ts in q.get("preempt_ts_ns", [])
-                        if start_ns <= ts <= end_ns
-                    ]
-                    if q.get("gap_kind") == "preempt_wait" and preempt_hits:
-                        scheduling_wait_preempt_ns += end_ns - start_ns
-                        scheduling_wait_preempt_events.extend(preempt_hits)
-                    else:
-                        scheduling_wait_normal_ns += end_ns - start_ns
-
-                tpot_pp_gap_breakdown = build_pp_gap_dispatch_breakdown(
-                    tpot_exec_dispatches,
-                    request_phase_intervals,
-                    request_step_execution_intervals,
-                    phase_component_map=phase_exec_name_map,
-                )
-                tpot_exec_phase_ns = defaultdict(int)
-                for key, value in tpot_pp_gap_breakdown.get("wall_components_ns", {}).items():
-                    tpot_exec_phase_ns[key] += value
-                if "other_compute" in tpot_exec_phase_ns:
-                    tpot_exec_phase_ns["other_exec"] += tpot_exec_phase_ns.pop("other_compute")
-                if "pipeline_gap" in tpot_exec_phase_ns:
-                    tpot_exec_phase_ns["other_exec"] += tpot_exec_phase_ns.pop("pipeline_gap")
+                    cpu_queue_ns += end_ns - start_ns
 
                 tpot_gpu_queue_ns = 0
+                tpot_gpu_queue_pairs = []
                 tpot_dispatches_sorted = sorted(tpot_exec_dispatches, key=lambda x: (x["start_ns"], x["end_ns"]))
                 if tpot_dispatches_sorted:
                     first_tpot_rpc = to_ns(tpot_dispatches_sorted[0].get("rpc_start_ns"))
                     if first_tpot_rpc is not None and first_tpot_rpc > tpot_window_start_ns and first_tpot_rpc < tpot_dispatches_sorted[0]["start_ns"]:
                         tpot_gpu_queue_ns += tpot_dispatches_sorted[0]["start_ns"] - first_tpot_rpc
+                        tpot_gpu_queue_pairs.append((first_tpot_rpc, tpot_dispatches_sorted[0]["start_ns"]))
                 for prev_d, next_d in zip(tpot_dispatches_sorted, tpot_dispatches_sorted[1:]):
                     prev_end = prev_d["end_ns"]
                     next_start = next_d["start_ns"]
@@ -4237,33 +4132,19 @@ def process_logs(input_file, output_file):
                         continue
                     if next_rpc is not None and next_rpc > prev_end and next_rpc < next_start:
                         tpot_gpu_queue_ns += next_start - next_rpc
+                        tpot_gpu_queue_pairs.append((next_rpc, next_start))
 
-                tail_transport_ns = max(0, tpot_window_end_ns - last_decode_end_ns)
                 tpot_total_ns = tpot_window_end_ns - tpot_window_start_ns
+                tail_transport_ns = max(0, tpot_window_end_ns - last_decode_end_ns)
                 tpot_other_gap_ns = uncovered_interval_ns(
                     tpot_window_start_ns,
                     tpot_window_end_ns,
-                    tpot_queue_pairs + tpot_exec_pairs + [(last_decode_end_ns, tpot_window_end_ns)],
-                )
-                scheduling_wait_total_ns = scheduling_wait_normal_ns + scheduling_wait_preempt_ns
-                scheduling_wait_normal_pct = (
-                    scheduling_wait_normal_ns * 100.0 / scheduling_wait_total_ns
-                    if scheduling_wait_total_ns > 0 else 0.0
-                )
-                scheduling_wait_preempt_pct = (
-                    scheduling_wait_preempt_ns * 100.0 / scheduling_wait_total_ns
-                    if scheduling_wait_total_ns > 0 else 0.0
+                    tpot_queue_pairs + tpot_gpu_queue_pairs + tpot_exec_pairs + [(last_decode_end_ns, tpot_window_end_ns)],
                 )
                 tpot_components_ns = {
-                    "cpu_scheduling_wait": scheduling_wait_total_ns,
+                    "cpu_queue": cpu_queue_ns,
                     "gpu_queue": tpot_gpu_queue_ns,
-                    "worker_preprocess": tpot_exec_phase_ns.get("worker_preprocess", 0),
-                    "model_forward": tpot_exec_phase_ns.get("model_forward", 0),
-                    "postprocess": tpot_exec_phase_ns.get("postprocess", 0),
-                    "sampling": tpot_exec_phase_ns.get("sampling", 0),
-                    "bookkeeping_sync": tpot_exec_phase_ns.get("bookkeeping_sync", 0),
-                    "pp_gap": tpot_exec_phase_ns.get("pp_gap", 0),
-                    "other_exec": tpot_exec_phase_ns.get("other_exec", 0),
+                    "decode_exec": tpot_exec_ns,
                     "tail_transport": tail_transport_ns,
                     "other_gap": tpot_other_gap_ns,
                 }
@@ -4279,43 +4160,13 @@ def process_logs(input_file, output_file):
                     "decode_dispatch_count": decode_steps,
                     "tpot_start_rule": "initial_prefill_end",
                     "tpot_end_rule": "last_generate_consume_end",
-                    "last_decode_end_ns": last_decode_end_ns,
-                    "last_decode_end_ms": ns_to_ms(last_decode_end_ns),
                     "exec_total_ns": tpot_exec_ns,
                     "exec_total_ms": ns_to_ms(tpot_exec_ns),
-                    "recompute_prefill_exec_ns": tpot_recompute_prefill_exec_ns,
-                    "recompute_prefill_exec_ms": ns_to_ms(tpot_recompute_prefill_exec_ns),
-                    "decode_exec_ns": tpot_decode_exec_ns,
-                    "decode_exec_ms": ns_to_ms(tpot_decode_exec_ns),
-                    "scheduling_wait_total_ns": scheduling_wait_total_ns,
-                    "scheduling_wait_total_ms": ns_to_ms(scheduling_wait_total_ns),
-                    "tail_transport_ns": tail_transport_ns,
-                    "tail_transport_ms": ns_to_ms(tail_transport_ns),
+                    "decode_exec_ns": tpot_exec_ns,
+                    "decode_exec_ms": ns_to_ms(tpot_exec_ns),
                     "components_ns_total": tpot_components_ns,
                     "components_ms_total": normalize_component_map_ms(tpot_components_ns),
                     "components_ms_per_token": tpot_components_ms_per_token,
-                    "exec_phase_ns": dict(tpot_exec_phase_ns),
-                    "exec_phase_ms": normalize_component_map_ms(tpot_exec_phase_ns),
-                    "pp_gap_breakdown": tpot_pp_gap_breakdown,
-                    "scheduling_wait_breakdown_ns": {
-                        "normal_gap": scheduling_wait_normal_ns,
-                        "preempt_gap": scheduling_wait_preempt_ns,
-                        "total": scheduling_wait_total_ns,
-                    },
-                    "scheduling_wait_breakdown_ms": {
-                        "normal_gap": ns_to_ms(scheduling_wait_normal_ns),
-                        "preempt_gap": ns_to_ms(scheduling_wait_preempt_ns),
-                        "total": ns_to_ms(scheduling_wait_total_ns),
-                    },
-                    "scheduling_wait_breakdown_ratio": {
-                        "normal_gap_pct": round(scheduling_wait_normal_pct, 6),
-                        "preempt_gap_pct": round(scheduling_wait_preempt_pct, 6),
-                    },
-                    "scheduling_wait_classification": {
-                        "policy": "explicit_req_preempt_events_only",
-                        "preempt_event_count": len(scheduling_wait_preempt_events),
-                        "preempt_ts_ns": scheduling_wait_preempt_events,
-                    },
                     "avg_ms_per_token": round(tpot_total_ns / decode_steps / 1e6, 6),
                     "denominator_kind": "decode_dispatch_count",
                     "phase_reentry_after_decode": phase_reentry_after_decode,
@@ -4337,64 +4188,21 @@ def process_logs(input_file, output_file):
         }
 
     ttft_avg_components_ms = {}
-    ttft_cpu_queue_breakdown_avg_ms = {}
-    ttft_prefill_exec_breakdown_avg_ms = {}
     if ttft_req_count > 0:
         ttft_avg_components_ms = {
             key: round(ttft_component_totals_ns.get(key, 0) / ttft_req_count / 1e6, 6)
-            for key in ["preprocess", "enginecore_queue", "cpu_queue", "gpu_queue", "prefill_exec", "postprocess_transport", "other_gap"]
-        }
-        ttft_cpu_queue_breakdown_avg_ms = {
-            key: round(ttft_cpu_queue_breakdown_totals_ns.get(key, 0) / ttft_req_count / 1e6, 6)
-            for key in ["before_first_prefill", "between_prefills"]
-        }
-        ttft_prefill_exec_keys = [
-            "worker_preprocess",
-            "model_forward",
-            "postprocess",
-            "sampling",
-            "bookkeeping_sync",
-            "draft",
-            "eplb",
-            "model_runner_output",
-            "pp_gap",
-            "other_prefill_exec",
-        ]
-        ttft_prefill_exec_keys.extend(
-            sorted(set(ttft_prefill_exec_breakdown_totals_ns.keys()) - set(ttft_prefill_exec_keys))
-        )
-        ttft_prefill_exec_breakdown_avg_ms = {
-            key: round(ttft_prefill_exec_breakdown_totals_ns.get(key, 0) / ttft_req_count / 1e6, 6)
-            for key in ttft_prefill_exec_keys
-            if ttft_prefill_exec_breakdown_totals_ns.get(key, 0) > 0 or key == "pp_gap"
+            for key in ["preprocess", "enginecore_queue", "cpu_sched_wait", "gpu_dispatch_wait", "prefill_exec", "postprocess_transport", "other_gap"]
         }
     tpot_avg_components_ms = {}
     if tpot_total_decode_steps > 0:
         tpot_avg_components_ms = {
             key: round(tpot_component_totals_ns.get(key, 0) / tpot_total_decode_steps / 1e6, 6)
-            for key in [
-                "cpu_scheduling_wait",
-                "gpu_queue",
-                "worker_preprocess",
-                "model_forward",
-                "postprocess",
-                "sampling",
-                "bookkeeping_sync",
-                "draft",
-                "eplb",
-                "model_runner_output",
-                "pp_gap",
-                "other_exec",
-                "tail_transport",
-                "other_gap",
-            ]
+            for key in ["cpu_queue", "gpu_queue", "decode_exec", "tail_transport", "other_gap"]
         }
 
     compute_breakdown["summary"] = {
         "ttft_request_count": ttft_req_count,
         "ttft_avg_components_ms": ttft_avg_components_ms,
-        "ttft_cpu_queue_breakdown_avg_ms": ttft_cpu_queue_breakdown_avg_ms,
-        "ttft_prefill_exec_breakdown_avg_ms": ttft_prefill_exec_breakdown_avg_ms,
         "ttft_avg_ms": round(sum(ttft_avg_components_ms.values()), 6) if ttft_avg_components_ms else None,
         "tpot_request_count": tpot_req_count,
         "tpot_total_decode_steps": tpot_total_decode_steps,
@@ -4414,28 +4222,8 @@ def process_logs(input_file, output_file):
             f"TTFT Avg ({ttft_req_count} reqs, compute-side): "
             f"{compute_breakdown['summary']['ttft_avg_ms']:.3f} ms"
         )
-        for key in ["preprocess", "enginecore_queue", "cpu_queue", "gpu_queue", "prefill_exec", "postprocess_transport", "other_gap"]:
+        for key in ["preprocess", "enginecore_queue", "cpu_sched_wait", "gpu_dispatch_wait", "prefill_exec", "postprocess_transport", "other_gap"]:
             print(f"  - {key}: {ttft_avg_components_ms.get(key, 0.0):.3f} ms")
-        print(
-            "  - cpu_queue_breakdown: "
-            f"before_first_prefill={ttft_cpu_queue_breakdown_avg_ms.get('before_first_prefill', 0.0):.3f} ms, "
-            f"between_prefills={ttft_cpu_queue_breakdown_avg_ms.get('between_prefills', 0.0):.3f} ms"
-        )
-        if ttft_prefill_exec_breakdown_avg_ms:
-            detail = ", ".join(
-                f"{key}={ttft_prefill_exec_breakdown_avg_ms.get(key, 0.0):.3f} ms"
-                for key in [
-                    "worker_preprocess",
-                    "model_forward",
-                    "postprocess",
-                    "sampling",
-                    "bookkeeping_sync",
-                    "pp_gap",
-                    "other_prefill_exec",
-                ]
-                if key in ttft_prefill_exec_breakdown_avg_ms
-            )
-            print(f"  - prefill_exec_breakdown: {detail}")
     else:
         print("TTFT Avg (compute-side): 无可用请求")
 
@@ -4445,22 +4233,7 @@ def process_logs(input_file, output_file):
             f"{compute_breakdown['summary']['tpot_avg_ms_per_token']:.3f} ms/token "
             f"(denominator=decode_dispatch_count)"
         )
-        for key in [
-            "cpu_scheduling_wait",
-            "gpu_queue",
-            "worker_preprocess",
-            "model_forward",
-            "postprocess",
-            "sampling",
-            "bookkeeping_sync",
-            "draft",
-            "eplb",
-            "model_runner_output",
-            "pp_gap",
-            "other_exec",
-            "tail_transport",
-            "other_gap",
-        ]:
+        for key in ["cpu_queue", "gpu_queue", "decode_exec", "tail_transport", "other_gap"]:
             print(f"  - {key}: {tpot_avg_components_ms.get(key, 0.0):.3f} ms/token")
     else:
         print("TPOT Avg (compute-side): 无可用 decode 请求")
