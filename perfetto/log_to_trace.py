@@ -34,6 +34,19 @@ def create_perfetto_event(name, cat, ph, ts, dur, pid, tid, args=None, cname=Non
         event["cname"] = cname
     return event
 
+
+def count_prefill_decode_tokens(scheduled_tokens_by_req):
+    prefill_tokens = 0
+    decode_tokens = 0
+    if isinstance(scheduled_tokens_by_req, dict):
+        for rid, count in scheduled_tokens_by_req.items():
+            cnt = int(count) if count is not None else 0
+            if cnt == 1:
+                decode_tokens += 1
+            elif cnt > 1:
+                prefill_tokens += cnt
+    return prefill_tokens, decode_tokens
+
 def create_flow_event(ph, ts, pid, tid, corr_id):
     return {
         "name": "link", "cat": "flow", "ph": ph, "ts": (ts - TRACE_TS_ORIGIN_NS) / 1000.0, 
@@ -1919,6 +1932,9 @@ def process_logs(input_file, output_file):
     # }
     worker_states = {}
     generated_dispatch_slices = []  # 仍可用于 CUPTI 关联（用整个 execute_model 区间）
+    dispatch_scheduled_tokens_cache = {}  # dispatch_key -> scheduled_tokens_by_req
+    dispatch_prefill_tokens_cache = {}    # dispatch_key -> prefill_tokens
+    dispatch_decode_tokens_cache = {}     # dispatch_key -> decode_tokens
 
     for ev in worker_events:
         etype = ev['type']
@@ -1959,7 +1975,16 @@ def process_logs(input_file, output_file):
                         "ranks": ranks,
                         "batch_size": batch_size,
                         "input_type": input_type,
+                        "scheduled_tokens_by_req": payload.get("scheduled_tokens_by_req", {}),
+                        "num_computed_by_req": payload.get("num_computed_by_req", {}),
                     })
+                if dispatch_key:
+                    sched_tokens_map = payload.get("scheduled_tokens_by_req")
+                    if isinstance(sched_tokens_map, dict):
+                        dispatch_scheduled_tokens_cache[dispatch_key] = dict(sched_tokens_map)
+                        prefill_tokens, decode_tokens = count_prefill_decode_tokens(sched_tokens_map)
+                        dispatch_prefill_tokens_cache[dispatch_key] = prefill_tokens
+                        dispatch_decode_tokens_cache[dispatch_key] = decode_tokens
                 
                 # 画一个透明容器（浅灰色背景）
                 class_path = payload.get("class_path", "") or ""
@@ -1969,19 +1994,29 @@ def process_logs(input_file, output_file):
                     event_name = "GPUModelRunner (V1).execute_model"
                 else:
                     event_name = "Step Execution"
+                sched_tokens = payload.get("scheduled_tokens_by_req")
+                disp_args = {
+                    "req_ids": "\n".join(req_ids),
+                    "batch_size": batch_size,
+                    "class_path": class_path,
+                    "dispatch_key": dispatch_key,
+                    "dp_rank": ranks.get("dp"),
+                    "pp_rank": ranks.get("pp"),
+                    "tp_rank": ranks.get("tp"),
+                }
+                if isinstance(sched_tokens, dict):
+                    disp_args["scheduled_tokens_by_req"] = json.dumps(sched_tokens, separators=(",", ":"))
+                    prefill_tokens, decode_tokens = count_prefill_decode_tokens(sched_tokens)
+                    disp_args["prefill_tokens"] = prefill_tokens
+                    disp_args["decode_tokens"] = decode_tokens
+                num_computed = payload.get("num_computed_by_req")
+                if isinstance(num_computed, dict):
+                    disp_args["num_computed_by_req"] = json.dumps(num_computed, separators=(",", ":"))
                 trace_events.append(create_perfetto_event(
                     name=event_name, cat="worker", ph="X",
                     ts=t_start, dur=t_end - t_start,
                     pid=pid, tid=tid,
-                    args={
-                        "req_ids": "\n".join(req_ids),
-                        "batch_size": batch_size,
-                        "class_path": class_path,
-                        "dispatch_key": dispatch_key,
-                        "dp_rank": ranks.get("dp"),
-                        "pp_rank": ranks.get("pp"),
-                        "tp_rank": ranks.get("tp"),
-                    },
+                    args=disp_args,
                     cname="background"
                 ))
             continue  # 不进入状态机流转
@@ -2016,6 +2051,12 @@ def process_logs(input_file, output_file):
                     args["batch_size"] = batch_size
                 if input_type:
                     args["input_type"] = input_type
+                sched_tokens = payload.get("scheduled_tokens_by_req")
+                if isinstance(sched_tokens, dict):
+                    args["scheduled_tokens_by_req"] = json.dumps(sched_tokens, separators=(",", ":"))
+                    prefill_tokens, decode_tokens = count_prefill_decode_tokens(sched_tokens)
+                    args["prefill_tokens"] = prefill_tokens
+                    args["decode_tokens"] = decode_tokens
                 trace_events.append(create_perfetto_event(
                     name=display_name,
                     cat=cat, ph="X", ts=t_start, dur=t_end - t_start,
@@ -4484,6 +4525,12 @@ def process_logs(input_file, output_file):
                     "worker_span_count": d.get("worker_span_count"),
                     "worker_span_count_total": d.get("worker_span_count_total"),
                     "worker_boundary_policy": d.get("worker_boundary_policy"),
+                    "scheduled_tokens_by_req": json.dumps(
+                        dispatch_scheduled_tokens_cache.get(d.get("dispatch_key"), {}),
+                        separators=(",", ":")
+                    ) if d.get("dispatch_key") else None,
+                    "prefill_tokens": dispatch_prefill_tokens_cache.get(d.get("dispatch_key")),
+                    "decode_tokens": dispatch_decode_tokens_cache.get(d.get("dispatch_key")),
                 },
                 cname=d_color,
             ))

@@ -516,6 +516,9 @@ def _summarize_scheduler_output(scheduler_output):
     req_ids = _extract_req_ids_from_scheduler_output(scheduler_output)
     batch_size = 0
     input_type = "unknown"
+    num_computed_by_req, scheduled_tokens_by_req = _extract_scheduler_step_maps(
+        scheduler_output
+    )
 
     try:
         if hasattr(scheduler_output, "total_num_scheduled_tokens"):
@@ -538,6 +541,8 @@ def _summarize_scheduler_output(scheduler_output):
         "req_ids": req_ids,
         "batch_size": batch_size,
         "input_type": input_type,
+        "num_computed_by_req": num_computed_by_req,
+        "scheduled_tokens_by_req": scheduled_tokens_by_req,
     }
 
 
@@ -608,6 +613,8 @@ def _build_gpu_exec_context(runner, scheduler_output=None, method_name=None):
         "ranks": ranks,
         "dispatch_key": dispatch_key,
         "method_name": method_name,
+        "num_computed_by_req": dict(summary.get("num_computed_by_req", {})),
+        "scheduled_tokens_by_req": dict(summary.get("scheduled_tokens_by_req", {})),
     }
     return _refresh_gpu_exec_context(ctx)
 
@@ -1388,6 +1395,7 @@ def patch_gpu_model_runner(module):
                                 "start_ns": self._start_ns,
                                 "end_ns": end_ns,
                                 "timestamp_ns": end_ns,
+                                "scheduled_tokens_by_req": dict(ctx.get("scheduled_tokens_by_req", {})),
                             }
                             TraceSender.emit(
                                 event_type="gpu_phase_span",
@@ -1459,6 +1467,8 @@ def patch_gpu_model_runner(module):
                         "dispatch_key": ctx.get("dispatch_key"),
                         "start_ns": start_ns,
                         "end_ns": end_ns,
+                        "num_computed_by_req": dict(ctx.get("num_computed_by_req", {})),
+                        "scheduled_tokens_by_req": dict(ctx.get("scheduled_tokens_by_req", {})),
                     },
                 )
 
@@ -1518,6 +1528,7 @@ def patch_gpu_model_runner(module):
                                 "method_name": original_func.__name__,
                                 "start_ns": start_ns,
                                 "end_ns": end_ns,
+                                "scheduled_tokens_by_req": dict(ctx.get("scheduled_tokens_by_req", {})),
                             },
                         )
                         TraceSender.emit(
@@ -1535,6 +1546,7 @@ def patch_gpu_model_runner(module):
                                 "start_ns": start_mono,
                                 "end_ns": end_mono,
                                 "duration_us": (end_mono - start_mono) // 1000,
+                                "scheduled_tokens_by_req": dict(ctx.get("scheduled_tokens_by_req", {})),
                             },
                         )
             return wrapper
@@ -1582,6 +1594,7 @@ def patch_v2_gpu_model_runner(module):
             self._de_v2_req_ids = list(ctx.get("req_ids", []))
             self._de_v2_ranks = dict(ctx.get("ranks", {}))
             self._de_v2_batch_size = ctx.get("batch_size", 0)
+            self._de_v2_scheduled_tokens_by_req = dict(ctx.get("scheduled_tokens_by_req", {}))
 
             _push_gpu_exec_context(ctx)
             try:
@@ -1615,6 +1628,8 @@ def patch_v2_gpu_model_runner(module):
                         "dispatch_key": ctx.get("dispatch_key"),
                         "start_ns": start_ns,
                         "end_ns": end_ns,
+                        "num_computed_by_req": dict(ctx.get("num_computed_by_req", {})),
+                        "scheduled_tokens_by_req": dict(ctx.get("scheduled_tokens_by_req", {})),
                     },
                 )
 
@@ -1635,11 +1650,13 @@ def patch_v2_gpu_model_runner(module):
                 req_ids = getattr(self, "_de_v2_req_ids", [])
                 ranks = getattr(self, "_de_v2_ranks", {})
                 batch_size = getattr(self, "_de_v2_batch_size", 0)
+                scheduled_tokens_by_req = getattr(self, "_de_v2_scheduled_tokens_by_req", {})
                 ctx = {
                     "dispatch_key": dispatch_key,
                     "req_ids": req_ids,
                     "ranks": ranks,
                     "batch_size": batch_size,
+                    "scheduled_tokens_by_req": dict(scheduled_tokens_by_req),
                     "pid": os.getpid(),
                     "tid": _get_native_tid(),
                     "input_type": "unknown",
@@ -1679,6 +1696,7 @@ def patch_v2_gpu_model_runner(module):
                                 "method_name": original_func.__name__,
                                 "start_ns": start_ns,
                                 "end_ns": end_ns,
+                                "scheduled_tokens_by_req": dict(ctx.get("scheduled_tokens_by_req", {})),
                             },
                         )
                         TraceSender.emit(
@@ -1696,6 +1714,7 @@ def patch_v2_gpu_model_runner(module):
                                 "start_ns": start_mono,
                                 "end_ns": end_mono,
                                 "duration_us": (end_mono - start_mono) // 1000,
+                                "scheduled_tokens_by_req": dict(ctx.get("scheduled_tokens_by_req", {})),
                             },
                         )
             return wrapper
