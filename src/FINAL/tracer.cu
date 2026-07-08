@@ -92,7 +92,11 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
 
 #define CONTROL_SOCKET_PATH_MAX 108
 
-static std::map<uint32_t, pid_t> g_corr_to_ostid_map;
+struct CorrEntry {
+    pid_t os_tid;
+    int   pending; // 期望的 activity record 数量（RUNTIME+DRIVER）
+};
+static std::map<uint32_t, CorrEntry> g_corr_to_ostid_map;
 static std::mutex g_corr_mutex;
 static std::mutex g_zmq_send_mutex;
 static std::mutex g_cupti_state_mutex;
@@ -451,6 +455,13 @@ static bool cupti_enable_locked(const char *reason) {
         disable_activity_kinds_locked(kinds, "enable_rollback");
         return false;
     }
+
+    // 注意: 不启用 cuptiSubscribe API callback。
+    // 原因: cuptiSubscribe + cuptiEnableDomain 会在每次 CUDA API 调用时
+    // 触发 api_callback（百万次/秒频率），导致 g_corr_mutex 剧烈争用
+    // 和 CUPTI 内部潜在死锁，最终使推理 hang。
+    // 改为使用 api->threadId（pthread_t 值）作为 TID，在分析阶段通过
+    // /proc/<pid>/task/ 做离线映射。CorrEntry 结构和相关代码保留以备后用。
 
     unsigned long long generation = g_cupti_generation.fetch_add(1) + 1;
     g_cupti_enabled.store(true);
@@ -993,13 +1004,20 @@ void CUPTIAPI api_callback(
   if (cbdata->callbackSite == CUPTI_API_ENTER) {
       uint32_t correlationId = cbdata->correlationId;
       pid_t os_tid = syscall(SYS_gettid);
-      
-      // Log that we are capturing a correlation
-      // tracer_log("API_ENTER: cbid=%u, corrId=%u, tid=%d", cbid, correlationId, os_tid);
-      
+
       {
           std::lock_guard<std::mutex> lock(g_corr_mutex);
-          g_corr_to_ostid_map[correlationId] = os_tid;
+          auto& entry = g_corr_to_ostid_map[correlationId];
+          entry.os_tid = os_tid;
+          entry.pending++;  // 每多一次 ENTER（RUNTIME 或 DRIVER），期望+1
+      }
+
+      static std::atomic<unsigned long long> enter_count{0};
+      unsigned long long ec = enter_count.fetch_add(1) + 1;
+      if (ec <= 15 || ec % 500000 == 0) {
+          tracer_log("[API_CB] ENTER #%llu corrId=%u os_tid=%d domain=%u cbid=%u",
+                     ec, correlationId, (int)os_tid,
+                     (unsigned)domain, (unsigned)cbid);
       }
       return;
   }
@@ -1008,6 +1026,8 @@ void CUPTIAPI api_callback(
       // 在同步/查询 API 返回时，相关 GPU 工作通常已经完成，且 CUDA context 仍然有效。
       // 这里主动 flush，可避免等到进程退出时才拿到尾部 activity，进而减少 start/end=0 的记录。
       flush_cupti_after_sync_api(domain, cbid);
+      // 注意：不在此处 erase correlationId，因为 bufferCompleted 可能
+      // 异步处理该 record。改为在 bufferCompleted 消费后 erase。
   }
 }
 
@@ -1185,7 +1205,54 @@ void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t *buffer,
                 rec.end_ns = api->end;
                 rec.correlationId = api->correlationId;
                 rec.pid = api->processId;
-                rec.tid = api->threadId;
+                {
+                    // 将 CUPTI 的 pthread_t threadId 转换为真正的内核 TID
+                    // 同一个 correlationId 被 RUNTIME 和 DRIVER 两个 domain 共享，
+                    // pending 计数确保两个 activity record 都消费后才 erase。
+                    std::lock_guard<std::mutex> lock(g_corr_mutex);
+                    auto it = g_corr_to_ostid_map.find(api->correlationId);
+                    if (it != g_corr_to_ostid_map.end()) {
+                        rec.tid = (uint32_t)it->second.os_tid;
+                        if (--it->second.pending <= 0) {
+                            g_corr_to_ostid_map.erase(it);
+                        }
+                        static std::atomic<unsigned long long> hit_count{0};
+                        unsigned long long hc = hit_count.fetch_add(1) + 1;
+                        if (hc <= 20 || hc % 100000 == 0) {
+                            tracer_log("[TID_MAP] hit #%llu corrId=%u→os_tid=%u kind=%s",
+                                       hc, api->correlationId, rec.tid,
+                                       record->kind == CUPTI_ACTIVITY_KIND_DRIVER ? "DRIVER" : "RUNTIME");
+                        }
+                    } else {
+                        rec.tid = api->threadId;
+                        static std::atomic<unsigned long long> miss_count{0};
+                        unsigned long long mc = miss_count.fetch_add(1) + 1;
+                        if (mc <= 20 || mc % 100000 == 0) {
+                            size_t map_size = g_corr_to_ostid_map.size();
+                            tracer_log("[TID_MAP] MISS #%llu corrId=%u fallback_tid=%u map_size=%zu kind=%s",
+                                       mc, api->correlationId, rec.tid, map_size,
+                                       record->kind == CUPTI_ACTIVITY_KIND_DRIVER ? "DRIVER" : "RUNTIME");
+                        }
+                    }
+                    // 安全网：清理 pending=0 的最旧条目（corrId 低 = 最老）
+                    static constexpr size_t kMaxMapEntries = 262144;
+                    if (g_corr_to_ostid_map.size() > kMaxMapEntries) {
+                        size_t cleaned = 0;
+                        for (auto rit = g_corr_to_ostid_map.begin();
+                             rit != g_corr_to_ostid_map.end() && g_corr_to_ostid_map.size() > kMaxMapEntries / 2; ) {
+                            if (rit->second.pending <= 0) {
+                                rit = g_corr_to_ostid_map.erase(rit);
+                                cleaned++;
+                            } else {
+                                ++rit;
+                            }
+                        }
+                        if (cleaned > 0) {
+                            tracer_log("[TID_MAP] cleaned %zu consumed entries, map_size now %zu",
+                                       cleaned, g_corr_to_ostid_map.size());
+                        }
+                    }
+                }
                 rec.cbid = api->cbid;
                 const char* funcName = NULL;
                 CUpti_CallbackDomain domain = (record->kind == CUPTI_ACTIVITY_KIND_RUNTIME) 

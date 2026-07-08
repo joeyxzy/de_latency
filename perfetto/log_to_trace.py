@@ -1199,6 +1199,7 @@ def render_compute_breakdown_svg(svg_path, ttft_components_ms, tpot_components_m
         ("cpu_sched_wait", "#E15759", "CPU Sched Wait"),
         ("gpu_dispatch_wait", "#FF9D4D", "GPU Dispatch Wait"),
         ("prefill_exec", "#76B7B2", "Prefill Exec"),
+        ("os_sched_wait", "#B07AA1", "OS Sched (eBPF)"),
         ("postprocess_transport", "#59A14F", "Postprocess / Transport"),
         ("other_gap", "#BAB0AC", "Other Gap"),
     ]
@@ -1338,6 +1339,7 @@ def render_request_breakdown_svg(svg_path, rid, request_name, ttft_entry, tpot_e
             "cpu_sched_wait": "#E15759",
             "gpu_dispatch_wait": "#FF9D4D",
             "prefill_exec": "#76B7B2",
+            "os_sched_wait": "#B07AA1",
             "postprocess_transport": "#59A14F",
             "other_gap": "#BAB0AC",
         }
@@ -1347,10 +1349,11 @@ def render_request_breakdown_svg(svg_path, rid, request_name, ttft_entry, tpot_e
             "cpu_sched_wait": "CPU Sched Wait",
             "gpu_dispatch_wait": "GPU Dispatch Wait",
             "prefill_exec": "Prefill Exec",
+            "os_sched_wait": "OS Sched Delay (eBPF)",
             "postprocess_transport": "Postprocess / Transport",
             "other_gap": "Other Gap",
         }
-        for key in ["preprocess", "enginecore_queue", "cpu_sched_wait", "gpu_dispatch_wait", "prefill_exec", "postprocess_transport", "other_gap"]:
+        for key in ["preprocess", "enginecore_queue", "cpu_sched_wait", "gpu_dispatch_wait", "prefill_exec", "os_sched_wait", "postprocess_transport", "other_gap"]:
             ttft_rows.append({
                 "label": ttft_labels[key],
                 "value_ms": ttft_entry["components_ms"].get(key, 0.0),
@@ -3739,125 +3742,195 @@ def process_logs(input_file, output_file):
                 cname="terrible",
             ))
 
-    # 2. 结果容器：Key=req_id, Value=critical-path total_os_delay_ns
-    req_latency_map = defaultdict(int)
-    req_os_overlap_intervals = defaultdict(list)  # mono 时间轴，后续可转 wall 画图
-
-    # 多卡场景下，一个请求属于某个 DP group；该 DP 内所有 worker 的 OS delay
-    # 都可能阻塞该请求。先从 worker execute span 反推 dp->worker 与 req->window。
-    worker_tids_by_group = defaultdict(set)
-    req_windows_by_group = defaultdict(lambda: defaultdict(list))
-    req_groups = defaultdict(set)
-
-    def worker_group_key(payload, tid):
-        ranks = payload.get("ranks") if isinstance(payload.get("ranks"), dict) else {}
-        dp_rank = to_int(ranks.get("dp"))
-        if dp_rank is not None and dp_rank >= 0:
-            return ("dp", dp_rank), dp_rank
-        # 旧日志可能没有 dp 信息；此时保留原来的单 worker 语义。
-        return ("worker_tid", tid), None
-
-    for span in execute_model_span:
-        payload = span.get('payload', span)
-        tid = to_int(payload.get('tid'))
-        span_start = to_ns(payload.get('start_ns'))
-        span_end = to_ns(payload.get('end_ns'))
-        req_ids = normalize_request_ids(payload.get('req_ids', []))
-
-        if tid is None or span_start is None or span_end is None or span_end <= span_start or not req_ids:
+    # 2. 构建 per-worker-thread 执行窗口
+    #    窗口来源: gpu_execute_model (execute_model, wall clock)
+    #             + worker_model_execute_span from sample_tokens_wrapper (monotonic -> wall)
+    #    keyed by TID, sorted by time within each TID
+    print("  Building per-worker-thread windows for OS delay attribution...")
+    
+    # per_tid_windows[tid] = sorted list of {dk, pp, tp, wall_start, wall_end, req_ids}
+    per_tid_windows = defaultdict(list)
+    for span in generated_dispatch_slices:
+        dk = span.get('dispatch_key')
+        tid = span.get('tid')
+        if not dk or tid is None:
             continue
-
-        group_key, _dp_rank = worker_group_key(payload, tid)
-        worker_tids_by_group[group_key].add(tid)
-        for rid in req_ids:
-            lc = request_spans.get(rid)
-            if lc and global_mono_to_wall_offset is not None:
-                span_start_wall = span_start + global_mono_to_wall_offset
-                if span_start_wall > lc.get("end_ns", 0):
-                    continue
-            req_windows_by_group[group_key][rid].append((span_start, span_end))
-            req_groups[rid].add(group_key)
-
-    raw_req_os_intervals = defaultdict(list)
-    for group_key, req_windows in req_windows_by_group.items():
-        candidate_tids = sorted(tid for tid in worker_tids_by_group.get(group_key, set()) if tid in ebpf_map)
-        if not candidate_tids:
+        ranks = span.get('ranks') if isinstance(span.get('ranks'), dict) else {}
+        pp = to_int(ranks.get('pp'))
+        tp = to_int(ranks.get('tp'))
+        w_start = span.get('start')
+        w_end = span.get('end')
+        if w_start is None or w_end is None or w_end <= w_start:
             continue
-        dp_rank = group_key[1] if group_key[0] == "dp" else None
-        for rid, windows in req_windows.items():
-            for window_start, window_end in merge_intervals(windows):
-                for worker_tid in candidate_tids:
-                    for os_ev in ebpf_map[worker_tid]:
-                        if os_ev['start'] >= window_end:
-                            break
-                        if os_ev['end'] <= window_start:
-                            continue
+        per_tid_windows[tid].append({
+            'dk': dk,
+            'pp_rank': pp if pp is not None else 0,
+            'tp_rank': tp if tp is not None else 0,
+            'wall_start': w_start,
+            'wall_end': w_end,
+            'req_ids': normalize_request_ids(span.get('req_ids', [])),
+        })
 
-                        overlap_start = max(window_start, os_ev['start'])
-                        overlap_end = min(window_end, os_ev['end'])
-                        if overlap_end > overlap_start:
-                            raw_req_os_intervals[rid].append({
-                                "start_mono_ns": overlap_start,
-                                "end_mono_ns": overlap_end,
-                                "worker_tid": worker_tid,
-                                "dp_rank": dp_rank,
-                                "reason": os_ev.get("reason"),
-                            })
-
-    # 对每个请求按时间轴合并所有 worker 的 OS delay。这里算的是关键路径上的
-    # wall-clock 等效阻塞时间，而不是把多个 worker 同时发生的 delay 直接相加。
-    for rid, intervals in raw_req_os_intervals.items():
-        merged = []
-        for it in sorted(intervals, key=lambda x: (x["start_mono_ns"], x["end_mono_ns"])):
-            start = it["start_mono_ns"]
-            end = it["end_mono_ns"]
-            if end <= start:
+    # 用 worker_model_execute_span 延长尾 PP stage 的窗口
+    sample_span_extended = 0
+    if global_mono_to_wall_offset is not None:
+        for span in execute_model_span:
+            payload = span.get('payload', span)
+            dk = payload.get('dispatch_key')
+            if not dk:
                 continue
-            if not merged or start > merged[-1]["end_mono_ns"]:
-                merged.append({
-                    "start_mono_ns": start,
-                    "end_mono_ns": end,
-                    "worker_tids": {it["worker_tid"]},
-                    "dp_ranks": {it["dp_rank"]} if it.get("dp_rank") is not None else set(),
-                    "reasons": {it["reason"]} if it.get("reason") else set(),
+            tid = to_int(payload.get('tid'))
+            end_mono = to_ns(payload.get('end_ns'))
+            if tid is None or end_mono is None:
+                continue
+            end_wall = end_mono + global_mono_to_wall_offset
+            for w in per_tid_windows.get(tid, []):
+                if w['dk'] == dk and end_wall > w['wall_end']:
+                    w['wall_end'] = end_wall
+                    sample_span_extended += 1
+    if sample_span_extended:
+        print(f"  Extended {sample_span_extended} worker windows via sample_tokens")
+
+    # 对每个 TID 按时间排序窗口
+    for tid in per_tid_windows:
+        per_tid_windows[tid].sort(key=lambda w: (w['wall_start'], w['wall_end']))
+
+    # 3. 将 eBPF 延迟事件转为 wall clock
+    ebpf_wall_map = defaultdict(list)
+    if global_mono_to_wall_offset is not None:
+        for tid, events in ebpf_map.items():
+            for ev in events:
+                ws = ev['start'] + global_mono_to_wall_offset
+                we = ev['end'] + global_mono_to_wall_offset
+                if we > ws:
+                    ebpf_wall_map[tid].append({
+                        'wall_start': ws, 'wall_end': we,
+                        'start_mono_ns': ev['start'], 'end_mono_ns': ev['end'],
+                        'reason': ev.get('reason'),
+                    })
+    else:
+        ebpf_wall_map = ebpf_map
+
+    total_ebpf_events = sum(len(evs) for evs in ebpf_wall_map.values())
+    total_ebpf_dur_ns = sum(sum(ev['wall_end'] - ev['wall_start'] for ev in evs) for evs in ebpf_wall_map.values())
+    print(f"  eBPF events: {total_ebpf_events} total, sum_dur={total_ebpf_dur_ns/1e6:.1f}ms, tracked_tids={len(ebpf_wall_map)}")
+
+    # 4. 归因：对每个线程的每个 eBPF delay，找到它落在哪个 worker 窗口内
+    #    dispatch_os_fragments[dk][(pp_rank, tp_rank)] = list of wall-clock intervals
+    dispatch_os_fragments = defaultdict(lambda: defaultdict(list))
+    req_os_overlap_intervals = defaultdict(list)
+    
+    matched_events = 0
+    unmatched_events = 0
+    unmatched_dur_ns = 0
+
+    for tid, windows in per_tid_windows.items():
+        evs = ebpf_wall_map.get(tid, [])
+        if not evs:
+            continue
+        
+        wi = 0  # window index
+        for ev in evs:
+            # skip over windows that end before this eBPF event starts
+            while wi < len(windows) and windows[wi]['wall_end'] <= ev['wall_start']:
+                wi += 1
+            if wi >= len(windows):
+                # no more windows to match
+                unmatched_events += 1
+                unmatched_dur_ns += (ev['wall_end'] - ev['wall_start'])
+                continue
+            if ev['wall_end'] <= windows[wi]['wall_start']:
+                # eBPF event ends before current window starts
+                unmatched_events += 1
+                unmatched_dur_ns += (ev['wall_end'] - ev['wall_start'])
+                continue
+            
+            # overlap: this eBPF event falls within window[wi]
+            w = windows[wi]
+            overlap_start = max(w['wall_start'], ev['wall_start'])
+            overlap_end = min(w['wall_end'], ev['wall_end'])
+            if overlap_end > overlap_start:
+                matched_events += 1
+                delay_ns = overlap_end - overlap_start
+                key = (w['pp_rank'], w['tp_rank'])
+                dispatch_os_fragments[w['dk']][key].append({
+                    'delay_ns': delay_ns,
+                    'wall_start': overlap_start,
+                    'req_ids': w['req_ids'],
                 })
-            else:
-                merged[-1]["end_mono_ns"] = max(merged[-1]["end_mono_ns"], end)
-                merged[-1]["worker_tids"].add(it["worker_tid"])
-                if it.get("dp_rank") is not None:
-                    merged[-1]["dp_ranks"].add(it["dp_rank"])
-                if it.get("reason"):
-                    merged[-1]["reasons"].add(it["reason"])
+                if global_mono_to_wall_offset is not None:
+                    mono_start = int(overlap_start - global_mono_to_wall_offset)
+                    mono_end = int(overlap_end - global_mono_to_wall_offset)
+                else:
+                    mono_start = int(overlap_start)
+                    mono_end = int(overlap_end)
+                req_os_overlap_intervals[w['dk']].append({
+                    "start_mono_ns": mono_start,
+                    "end_mono_ns": mono_end,
+                    "worker_tid": tid,
+                    "pp_rank": w['pp_rank'],
+                    "tp_rank": w['tp_rank'],
+                    "reason": ev.get('reason'),
+                    "req_ids": w['req_ids'],
+                })
 
-        total_ns = 0
-        for it in merged:
-            total_ns += it["end_mono_ns"] - it["start_mono_ns"]
-            req_os_overlap_intervals[rid].append({
-                "start_mono_ns": it["start_mono_ns"],
-                "end_mono_ns": it["end_mono_ns"],
-                "worker_tids": sorted(it["worker_tids"]),
-                "dp_ranks": sorted(it["dp_ranks"]),
-                "reasons": sorted(it["reasons"]),
-            })
-        if total_ns > 0:
-            req_latency_map[rid] = total_ns
+    print(f"  eBPF event matching: {matched_events} matched, {unmatched_events} unmatched ({unmatched_dur_ns/1e6:.1f}ms unmatched)")
 
-    multi_group_reqs = [rid for rid, groups in req_groups.items() if len(groups) > 1]
-    if multi_group_reqs:
-        print(
-            f"  [warn] {len(multi_group_reqs)} 个请求出现在多个 worker/dp group 中；"
-            "OS delay 已按所有相关 group 的合并关键路径统计"
-        )
-    print(
-        f"  Worker OS attribution groups: {len(worker_tids_by_group)} groups, "
-        f"{sum(len(tids) for tids in worker_tids_by_group.values())} worker tids"
-    )
+    # 5. 对每个 dispatch: TP 取 max (per PP stage), PP 累加
+    # PP stages 在单个 dispatch 内是串联执行的，每个 stage 的延迟直接追加到总延迟
+    dispatch_os_delay_ns = {}
+    dispatch_os_count = 0
+    dispatch_os_total_ns = 0
+
+    for dk, pp_tp_fragments in dispatch_os_fragments.items():
+        pp_max_delay = {}
+        for (pp_rank, tp_rank), fragments in pp_tp_fragments.items():
+            tp_total = sum(f['delay_ns'] for f in fragments)
+            pp_max_delay[pp_rank] = max(pp_max_delay.get(pp_rank, 0), tp_total)
+        
+        total_os_delay = int(sum(pp_max_delay.values()))
+        
+        if total_os_delay > 0:
+            dispatch_os_count += 1
+            dispatch_os_total_ns += total_os_delay
+            dispatch_os_delay_ns[dk] = total_os_delay
+    
+    if dispatch_os_count:
+        print(f"  Attributed OS delay: {dispatch_os_count} dispatches (avg {dispatch_os_total_ns / dispatch_os_count / 1e6:.3f} ms/dispatch)")
+
+    # 6. 展开 req_os_overlap_intervals: dk→rid, 然后 per-request 聚合:
+    #    对每个请求参与的每个 dispatch，取 PP stages 中最大的 OS delay
+    #    （因为 PP 是并行执行的，最慢的 stage 决定延迟），
+    #    然后跨 dispatch 求和（不同 dispatch 时间上不重叠）
+    _req_os_per_dispatch = defaultdict(lambda: defaultdict(float))
+    for dk, intervals in req_os_overlap_intervals.items():
+        req_ids = set()
+        for iv in intervals:
+            req_ids.update(normalize_request_ids(iv.get('req_ids', [])))
+        # 每个 dispatch 的 OS delay: PP stages 取 max
+        pp_max_delay = defaultdict(float)
+        for iv in intervals:
+            pp = iv.get('pp_rank', 0)
+            dur = (iv.get('end_mono_ns', 0) or 0) - (iv.get('start_mono_ns', 0) or 0)
+            if dur > 0:
+                pp_max_delay[pp] = max(pp_max_delay[pp], dur)
+        dispatch_os_delay = sum(pp_max_delay.values())
+        if dispatch_os_delay > 0:
+            for rid in req_ids:
+                _req_os_per_dispatch[rid][dk] = max(
+                    _req_os_per_dispatch[rid].get(dk, 0),
+                    dispatch_os_delay
+                )
+
+    req_total_os_delay_ns = defaultdict(int)
+    for rid, dk_delays in _req_os_per_dispatch.items():
+        req_total_os_delay_ns[rid] = int(sum(dk_delays.values()))
 
     # 5. 打印结果
-    print(f"共统计到 {len(req_latency_map)} 个请求受到 OS 调度影响：")
+    print(f"共统计到 {len(req_total_os_delay_ns)} 个请求受到 OS 调度影响：")
     
     # 按延迟从高到低排序
-    sorted_reqs = sorted(req_latency_map.items(), key=lambda x: x[1], reverse=True)
+    sorted_reqs = sorted(req_total_os_delay_ns.items(), key=lambda x: x[1], reverse=True)
     
     for rid, lat_ns in sorted_reqs:
         lat_ms = lat_ns / 1e6
@@ -3871,6 +3944,14 @@ def process_logs(input_file, output_file):
     REQUEST_PID = 11000
     trace_events.append({"name": "process_name", "ph": "M", "pid": REQUEST_PID, "args": {"name": "Request Interference"}})
 
+    # tid -> pid lookup (for OS delay rendering on worker lanes)
+    tid_to_pid = {}
+    for span in generated_dispatch_slices:
+        tid = span.get('tid')
+        pid = span.get('pid')
+        if tid is not None and pid is not None:
+            tid_to_pid[tid] = pid
+
     all_req_ids = (
         set(request_spans.keys())
         | set(req_coro_sched_ns.keys())
@@ -3882,7 +3963,7 @@ def process_logs(input_file, output_file):
         | set(req_output_handler_exec_ns.keys())
         | set(req_vllm_queue_ns.keys())
         | set(req_gpu_queue_ns.keys())
-        | set(req_latency_map.keys())
+        | set(req_total_os_delay_ns.keys())
         | set(req_stage_ns.keys())
         | set(req_dispatch_intervals_map.keys())
         | set(req_step_execution_intervals.keys())
@@ -3890,17 +3971,34 @@ def process_logs(input_file, output_file):
     req_os_intervals_wall = defaultdict(list)
     if global_mono_to_wall_offset is not None:
         for rid, intervals in req_os_overlap_intervals.items():
+            req_span = request_spans.get(rid)
             for it in intervals:
-                s_wall = it["start_mono_ns"] + global_mono_to_wall_offset
-                e_wall = it["end_mono_ns"] + global_mono_to_wall_offset
-                if e_wall > s_wall:
-                    req_os_intervals_wall[rid].append({
-                        "start_ns": s_wall,
-                        "end_ns": e_wall,
-                        "worker_tids": list(it.get("worker_tids") or []),
-                        "dp_ranks": list(it.get("dp_ranks") or []),
-                        "reasons": list(it.get("reasons") or []),
-                    })
+                s_wall = (it.get("start_mono_ns", 0) or 0) + global_mono_to_wall_offset
+                e_wall = (it.get("end_mono_ns", 0) or 0) + global_mono_to_wall_offset
+                if e_wall <= s_wall:
+                    continue
+                # clip to request lifecycle
+                if req_span:
+                    lc_start = req_span.get("start_ns")
+                    lc_end = req_span.get("end_ns")
+                    if lc_start is not None:
+                        s_wall = max(s_wall, lc_start)
+                    if lc_end is not None:
+                        e_wall = min(e_wall, lc_end)
+                if e_wall <= s_wall:
+                    continue
+                wtid = it.get("worker_tid")
+                req_os_intervals_wall[rid].append({
+                    "start_ns": s_wall,
+                    "end_ns": e_wall,
+                    "worker_tid": wtid,
+                    "worker_tids": [wtid] if wtid is not None else [],
+                    "dp_ranks": list(it.get("dp_ranks") or []),
+                    "reasons": [it.get("reason")] if it.get("reason") else [],
+                    "worker_pid": tid_to_pid.get(wtid),
+                    "pp_rank": it.get("pp_rank"),
+                    "tp_rank": it.get("tp_rank"),
+                })
     if global_mono_to_wall_offset is None and req_os_overlap_intervals:
         print("  [warn] 无法估计 mono->wall 偏移，OS overlap 仅做统计，不绘制到请求生命周期轨道")
 
@@ -4058,9 +4156,14 @@ def process_logs(input_file, output_file):
 
                     ttft_total_ns = ttft_end_ns - ttft_start_ns
                     postprocess_transport_ns = max(0, ttft_end_ns - last_initial_prefill_end_ns)
+                    os_sched_wait_ns = 0
+                    for d in initial_prefill_dispatches_sorted:
+                        dk = d.get("dispatch_key")
+                        if dk:
+                            os_sched_wait_ns += dispatch_os_delay_ns.get(dk, 0)
                     ttft_other_gap_ns = max(
                         0,
-                        ttft_total_ns - preprocess_ns - enginecore_queue_ns - cpu_sched_wait_ns - gpu_dispatch_wait_ns - prefill_exec_ns - postprocess_transport_ns,
+                        ttft_total_ns - preprocess_ns - enginecore_queue_ns - cpu_sched_wait_ns - gpu_dispatch_wait_ns - prefill_exec_ns - os_sched_wait_ns - postprocess_transport_ns,
                     )
 
                     ttft_components_ns = {
@@ -4069,6 +4172,7 @@ def process_logs(input_file, output_file):
                         "cpu_sched_wait": cpu_sched_wait_ns,
                         "gpu_dispatch_wait": gpu_dispatch_wait_ns,
                         "prefill_exec": prefill_exec_ns,
+                        "os_sched_wait": os_sched_wait_ns,
                         "postprocess_transport": postprocess_transport_ns,
                         "other_gap": ttft_other_gap_ns,
                     }
@@ -4232,7 +4336,7 @@ def process_logs(input_file, output_file):
     if ttft_req_count > 0:
         ttft_avg_components_ms = {
             key: round(ttft_component_totals_ns.get(key, 0) / ttft_req_count / 1e6, 6)
-            for key in ["preprocess", "enginecore_queue", "cpu_sched_wait", "gpu_dispatch_wait", "prefill_exec", "postprocess_transport", "other_gap"]
+            for key in ["preprocess", "enginecore_queue", "cpu_sched_wait", "gpu_dispatch_wait", "prefill_exec", "os_sched_wait", "postprocess_transport", "other_gap"]
         }
     tpot_avg_components_ms = {}
     if tpot_total_decode_steps > 0:
@@ -4263,7 +4367,7 @@ def process_logs(input_file, output_file):
             f"TTFT Avg ({ttft_req_count} reqs, compute-side): "
             f"{compute_breakdown['summary']['ttft_avg_ms']:.3f} ms"
         )
-        for key in ["preprocess", "enginecore_queue", "cpu_sched_wait", "gpu_dispatch_wait", "prefill_exec", "postprocess_transport", "other_gap"]:
+        for key in ["preprocess", "enginecore_queue", "cpu_sched_wait", "gpu_dispatch_wait", "prefill_exec", "os_sched_wait", "postprocess_transport", "other_gap"]:
             print(f"  - {key}: {ttft_avg_components_ms.get(key, 0.0):.3f} ms")
     else:
         print("TTFT Avg (compute-side): 无可用请求")
@@ -4425,7 +4529,7 @@ def process_logs(input_file, output_file):
         vllm_queue_from_enqueue_ms = req_vllm_queue_from_enqueue_ns.get(rid, 0) / 1e6
         vllm_queue_from_step_ready_ms = req_vllm_queue_from_step_ready_ns.get(rid, 0) / 1e6
         gpu_queue_ms = req_gpu_queue_ns.get(rid, 0) / 1e6
-        os_delay_ms = req_latency_map.get(rid, 0) / 1e6
+        os_delay_ms = req_total_os_delay_ns.get(rid, 0) / 1e6
         engine_input_queue_wait_ms = req_stage_ns.get(rid, {}).get(
             "engine_core.input_queue_wait_after_preprocess", 0) / 1e6
         prefill_exec_ms = req_dispatch_phase_ns.get(rid, {}).get("prefill", 0) / 1e6
@@ -4745,23 +4849,24 @@ def process_logs(input_file, output_file):
                 ))
 
         for o in req_os_intervals_wall.get(rid, []):
-            if o["end_ns"] > o["start_ns"]:
-                trace_events.append(create_perfetto_event(
-                    name="OS Sched Delay (Attributed)",
-                    cat="request_os",
-                    ph="X",
-                    ts=o["start_ns"],
-                    dur=o["end_ns"] - o["start_ns"],
-                    pid=REQUEST_PID,
-                    tid=lane_tids["os"],
-                    args={
-                        "request_id": rid,
-                        "worker_tids": ",".join(str(tid) for tid in o.get("worker_tids", [])),
-                        "dp_ranks": ",".join(str(dp) for dp in o.get("dp_ranks", [])),
-                        "reasons": ",".join(str(reason) for reason in o.get("reasons", [])),
-                    },
-                    cname="terrible",
-                ))
+            if o["end_ns"] <= o["start_ns"]:
+                continue
+            trace_events.append(create_perfetto_event(
+                name="OS Sched Delay",
+                cat="request_os",
+                ph="X",
+                ts=o["start_ns"],
+                dur=o["end_ns"] - o["start_ns"],
+                pid=REQUEST_PID,
+                tid=lane_tids["os"],
+                args={
+                    "request_id": rid,
+                    "worker_tid": o.get("worker_tid"),
+                    "pp_rank": o.get("pp_rank"),
+                    "tp_rank": o.get("tp_rank"),
+                },
+                cname="terrible",
+            ))
 
         for s in req_stage_intervals.get(rid, []):
             if s["stage"] != "engine_core.input_queue_wait_after_preprocess":
@@ -4782,6 +4887,44 @@ def process_logs(input_file, output_file):
                 cname="yellow",
             ))
 
+    _worker_os_events = defaultdict(lambda: {"pp_rank": None, "tp_rank": None, "req_ids": set()})
+    _worker_os_event_key = {}
+
+    for rid in sorted(all_req_ids, key=req_sort_key):
+        for o in req_os_intervals_wall.get(rid, []):
+            if o["end_ns"] <= o["start_ns"]:
+                continue
+            worker_pid = o.get("worker_pid")
+            worker_tid = o.get("worker_tid")
+            if worker_pid is not None and worker_tid is not None:
+                dedup_key = (o["start_ns"], o["end_ns"], worker_pid, worker_tid)
+                _worker_os_events[dedup_key]["pp_rank"] = o.get("pp_rank")
+                _worker_os_events[dedup_key]["tp_rank"] = o.get("tp_rank")
+                _worker_os_events[dedup_key]["req_ids"].add(rid)
+
+    # 画出去重后的 worker-lane OS delay
+    for (start_ns, end_ns, wpid, wtid), meta in _worker_os_events.items():
+        pp = meta["pp_rank"]
+        tp = meta["tp_rank"]
+        req_list = sorted(meta["req_ids"])[:10]
+        label = f"OS Sched (pp{pp} tp{tp})"
+        trace_events.append(create_perfetto_event(
+            name=label,
+            cat="worker_os_sched",
+            ph="X",
+            ts=start_ns,
+            dur=end_ns - start_ns,
+            pid=wpid,
+            tid=wtid,
+            args={
+                "request_ids": ",".join(req_list),
+                "request_count": len(meta["req_ids"]),
+                "pp_rank": pp,
+                "tp_rank": tp,
+            },
+            cname="terrible",
+        ))
+
     print("=== Request Interference Summary ===")
     for rid in sorted(
         all_req_ids,
@@ -4796,7 +4939,7 @@ def process_logs(input_file, output_file):
             + req_vllm_queue_ns.get(x, 0)
             + req_gpu_queue_ns.get(x, 0)
             + _request_pp_gap_wall_ns(x)
-            + req_latency_map.get(x, 0)
+            + req_total_os_delay_ns.get(x, 0)
         ),
         reverse=True,
     ):
@@ -4819,7 +4962,7 @@ def process_logs(input_file, output_file):
             f"scheduled-step_ready={req_vllm_queue_from_step_ready_ns.get(rid, 0) / 1e6:.3f} ms), "
             f"gpu_queue={req_gpu_queue_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"pp_gap={pp_gap_ms:.3f} ms, "
-            f"os_delay={req_latency_map.get(rid, 0) / 1e6:.3f} ms, "
+            f"os_delay={req_total_os_delay_ns.get(rid, 0) / 1e6:.3f} ms, "
             f"prefill_exec={req_dispatch_phase_ns.get(rid, {}).get('prefill', 0) / 1e6:.3f} ms, "
             f"decode_exec={req_dispatch_phase_ns.get(rid, {}).get('decode', 0) / 1e6:.3f} ms"
         )

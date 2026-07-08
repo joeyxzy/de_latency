@@ -1,4 +1,6 @@
 /build/
+/results/
+/plots/
 /tmp/
 /src/*/*.o
 /src/*/*_user
