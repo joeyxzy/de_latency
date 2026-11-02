@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "de-latency"
+version = "0.3.0"
+description = "Joint Python/CUPTI/eBPF latency attribution for vLLM 0.20"
+requires-python = ">=3.10"
+dependencies = ["pyzmq>=25", "ijson>=3.2"]
+
+[project.scripts]
+de-latency = "de_latency.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["de_latency*"]

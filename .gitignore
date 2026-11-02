@@ -1,9 +1,10 @@
 /build/
 /results/
 /plots/
+/bench_results/
 /tmp/
-/src/*/*.o
-/src/*/*_user
+/dist/
+.pytest_cache/
 *.swp
 *.log
 *.dSYM
@@ -15,3 +16,7 @@ __pycache__/
 *.html
 .codex
 *.pt.trace.json.gz
+*.egg-info/
+!tests/fixtures/*.json
+!docs/*.json
+!docs/history/*.json

@@ -1,0 +1,1440 @@
+{
+  "date": "2026-10-30",
+  "scope": "successful intermediate sessions only; raw logs and traces removed",
+  "retained_successful_sessions": [
+    "complete-tp",
+    "refactor-eager2",
+    "refactor-graph2",
+    "refactor-three"
+  ],
+  "removed_sessions": [
+    {
+      "session": "complete-graph",
+      "removed_disk_bytes": 414134272,
+      "validation": {
+        "passed": true,
+        "errors": [],
+        "sources": {
+          "monkey_patch": 7564,
+          "cupti": 193224
+        },
+        "event_types": {
+          "monkey_patch:coroutine_sched_patch_status": 2,
+          "monkey_patch:thread_role": 1,
+          "monkey_patch:worker_process_ready": 1,
+          "monkey_patch:req_generate_stage": 193,
+          "monkey_patch:coroutine_start": 16,
+          "monkey_patch:req_enqueue_scheduler": 16,
+          "monkey_patch:enginecore_mainloop_span": 570,
+          "monkey_patch:scheduler_schedule": 280,
+          "monkey_patch:req_scheduler_out_rpc": 272,
+          "monkey_patch:worker_preprocess_start": 272,
+          "cupti:driver": 15449,
+          "monkey_patch:gpu_phase_span": 1912,
+          "monkey_patch:gpu_execute_model": 280,
+          "monkey_patch:worker_model_execute_span": 544,
+          "monkey_patch:scheduler_sample_tokens": 272,
+          "monkey_patch:req_step_ready": 272,
+          "monkey_patch:req_metrics_events": 15,
+          "monkey_patch:output_socket_sched_latency": 275,
+          "monkey_patch:output_socket_exec_slice": 272,
+          "monkey_patch:output_handler_sched_latency": 275,
+          "monkey_patch:output_handler_exec_slice": 272,
+          "monkey_patch:coroutine_sched_latency": 1024,
+          "monkey_patch:coroutine_exec_slice": 512,
+          "cupti:runtime": 25636,
+          "cupti:memcpy": 3336,
+          "cupti:kernel": 131108,
+          "cupti:memset": 16592,
+          "cupti:marker": 1103,
+          "monkey_patch:coroutine_end": 16
+        },
+        "request_count": 16,
+        "required_sources": [
+          "cupti",
+          "monkey_patch"
+        ],
+        "producer_dropped": {},
+        "cupti_stop_status": {
+          "de_latency_cupti_476150.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=476150 socket=/home/joeyxzy/de_latency/de_latency/bench_results/complete-graph/de_latency_cupti_476150.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=246480"
+        },
+        "ebpf_status": null,
+        "graph_launches": 257,
+        "kernel_worker_pids": [
+          476150
+        ],
+        "phase_ranks": [
+          [
+            0,
+            0
+          ]
+        ],
+        "perfetto_complete_events": 201226
+      },
+      "manifest.json": {
+        "python": "/home/joeyxzy/miniconda3/envs/vllm-0200/bin/python",
+        "model": "/home/joeyxzy/models/Qwen1.5-4B-Chat",
+        "gpu": "3",
+        "cuda_visible_devices": "3",
+        "gpu_uuids": "GPU-e8006ad3-9aa5-40d7-f8e1-05b2e72ff894",
+        "gpu_memory_utilization": "0.65",
+        "graph": true,
+        "tp": 1,
+        "pp": 1,
+        "port": 58603,
+        "measurement_start_ns": 1793324694233498510,
+        "measurement_end_ns": 1793324706775007594
+      },
+      "events.log.stats.json": {
+        "schema_version": 2,
+        "sources": {
+          "monkey_patch": 7564,
+          "cupti": 193224
+        },
+        "invalid_events": 0,
+        "producer_dropped": {
+          "monkey_patch:475504:None": 0,
+          "monkey_patch:475504:475504": 0,
+          "monkey_patch:476150:None": 0,
+          "monkey_patch:476150:476150": 0,
+          "monkey_patch:476150:477448": 0,
+          "cupti:476150:476150": 0,
+          "cupti:476150:0": 0,
+          "cupti:476150:477930": 0
+        }
+      },
+      "final.validation.json": {
+        "passed": true,
+        "errors": [],
+        "trace_stem": "final",
+        "sources": {
+          "monkey_patch": 7564,
+          "cupti": 193224
+        },
+        "event_types": {
+          "monkey_patch:coroutine_sched_patch_status": 2,
+          "monkey_patch:thread_role": 1,
+          "monkey_patch:worker_process_ready": 1,
+          "monkey_patch:req_generate_stage": 193,
+          "monkey_patch:coroutine_start": 16,
+          "monkey_patch:req_enqueue_scheduler": 16,
+          "monkey_patch:enginecore_mainloop_span": 570,
+          "monkey_patch:scheduler_schedule": 280,
+          "monkey_patch:req_scheduler_out_rpc": 272,
+          "monkey_patch:worker_preprocess_start": 272,
+          "cupti:driver": 15449,
+          "monkey_patch:gpu_phase_span": 1912,
+          "monkey_patch:gpu_execute_model": 280,
+          "monkey_patch:worker_model_execute_span": 544,
+          "monkey_patch:scheduler_sample_tokens": 272,
+          "monkey_patch:req_step_ready": 272,
+          "monkey_patch:req_metrics_events": 15,
+          "monkey_patch:output_socket_sched_latency": 275,
+          "monkey_patch:output_socket_exec_slice": 272,
+          "monkey_patch:output_handler_sched_latency": 275,
+          "monkey_patch:output_handler_exec_slice": 272,
+          "monkey_patch:coroutine_sched_latency": 1024,
+          "monkey_patch:coroutine_exec_slice": 512,
+          "cupti:runtime": 25636,
+          "cupti:memcpy": 3336,
+          "cupti:kernel": 131108,
+          "cupti:memset": 16592,
+          "cupti:marker": 1103,
+          "monkey_patch:coroutine_end": 16
+        },
+        "request_count": 16,
+        "required_sources": [
+          "cupti",
+          "monkey_patch"
+        ],
+        "producer_dropped": {},
+        "cupti_stop_status": {
+          "de_latency_cupti_476150.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=476150 socket=/home/joeyxzy/de_latency/de_latency/bench_results/complete-graph/de_latency_cupti_476150.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=246480"
+        },
+        "ebpf_status": null,
+        "graph_launches": 257,
+        "kernel_worker_pids": [
+          476150
+        ],
+        "phase_ranks": [
+          [
+            0,
+            0
+          ]
+        ],
+        "perfetto_complete_events": 201226
+      },
+      "benchmark_counts": {
+        "completed": 16,
+        "failed": 0
+      }
+    },
+    {
+      "session": "drain-v7",
+      "removed_disk_bytes": 281423872,
+      "validation": {
+        "passed": true,
+        "errors": [],
+        "sources": {
+          "monkey_patch": 5795,
+          "cupti": 235809
+        },
+        "event_types": {
+          "monkey_patch:coroutine_sched_patch_status": 2,
+          "monkey_patch:thread_role": 1,
+          "monkey_patch:worker_process_ready": 1,
+          "monkey_patch:req_generate_stage": 193,
+          "monkey_patch:coroutine_start": 16,
+          "monkey_patch:req_enqueue_scheduler": 16,
+          "monkey_patch:enginecore_mainloop_span": 392,
+          "monkey_patch:scheduler_schedule": 193,
+          "monkey_patch:req_scheduler_out_rpc": 189,
+          "monkey_patch:worker_preprocess_start": 189,
+          "monkey_patch:gpu_phase_span": 1327,
+          "monkey_patch:gpu_execute_model": 193,
+          "monkey_patch:worker_model_execute_span": 378,
+          "monkey_patch:scheduler_sample_tokens": 189,
+          "monkey_patch:req_step_ready": 189,
+          "monkey_patch:req_metrics_events": 15,
+          "monkey_patch:output_socket_sched_latency": 192,
+          "monkey_patch:output_socket_exec_slice": 189,
+          "monkey_patch:output_handler_sched_latency": 190,
+          "monkey_patch:output_handler_exec_slice": 189,
+          "monkey_patch:coroutine_sched_latency": 1024,
+          "monkey_patch:coroutine_exec_slice": 512,
+          "cupti:driver": 4937,
+          "cupti:runtime": 118509,
+          "cupti:memcpy": 2346,
+          "cupti:kernel": 99180,
+          "cupti:memset": 10074,
+          "cupti:marker": 763,
+          "monkey_patch:coroutine_end": 16
+        },
+        "request_count": 16,
+        "required_sources": [
+          "cupti",
+          "monkey_patch"
+        ],
+        "producer_dropped": {},
+        "cupti_stop_status": {
+          "de_latency_cupti_1209520.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=1209520 socket=/home/joeyxzy/de_latency/de_latency/bench_results/drain-v7/de_latency_cupti_1209520.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=1293343"
+        },
+        "ebpf_status": null,
+        "graph_launches": 0,
+        "kernel_worker_pids": [
+          1209520
+        ],
+        "phase_ranks": [
+          [
+            0,
+            0
+          ]
+        ],
+        "perfetto_complete_events": 243249
+      },
+      "manifest.json": {
+        "python": "/home/joeyxzy/miniconda3/envs/vllm-0200/bin/python",
+        "model": "/home/joeyxzy/models/Qwen1.5-4B-Chat",
+        "gpu": "7",
+        "cuda_visible_devices": "7",
+        "gpu_uuids": "GPU-2e539a7a-bcdb-651c-17c7-2dea33d65f78",
+        "gpu_memory_utilization": "0.45",
+        "graph": false,
+        "tp": 1,
+        "pp": 1,
+        "port": 57569,
+        "measurement_start_ns": 1793152513918234544,
+        "measurement_end_ns": 1793152526665708161
+      },
+      "events.log.stats.json": {
+        "schema_version": 2,
+        "sources": {
+          "monkey_patch": 5795,
+          "cupti": 235809
+        },
+        "invalid_events": 0,
+        "producer_dropped": {
+          "monkey_patch:1209121:None": 0,
+          "monkey_patch:1209121:1209121": 0,
+          "monkey_patch:1209520:None": 0,
+          "monkey_patch:1209520:1209520": 0,
+          "monkey_patch:1209520:1210160": 0,
+          "cupti:1209520:1209520": 0,
+          "cupti:1209520:0": 0,
+          "cupti:1209520:1210613": 0
+        }
+      },
+      "benchmark_counts": {
+        "completed": 16,
+        "failed": 0
+      }
+    },
+    {
+      "session": "eager-final",
+      "removed_disk_bytes": 1065533440,
+      "validation": {
+        "passed": true,
+        "sources": {
+          "monkey_patch": 6434,
+          "cupti": 1462776
+        },
+        "event_types": {
+          "monkey_patch:coroutine_sched_patch_status": 2,
+          "monkey_patch:thread_role": 1,
+          "monkey_patch:worker_process_ready": 1,
+          "monkey_patch:req_generate_stage": 193,
+          "monkey_patch:coroutine_start": 16,
+          "monkey_patch:req_enqueue_scheduler": 16,
+          "monkey_patch:enginecore_mainloop_span": 398,
+          "monkey_patch:scheduler_schedule": 196,
+          "monkey_patch:req_scheduler_out_rpc": 192,
+          "monkey_patch:worker_preprocess_start": 192,
+          "monkey_patch:gpu_phase_span": 1348,
+          "monkey_patch:gpu_forward_start": 192,
+          "monkey_patch:gpu_forward_end": 192,
+          "monkey_patch:gpu_execute_model": 196,
+          "monkey_patch:worker_model_execute_span": 384,
+          "monkey_patch:scheduler_sample_tokens": 192,
+          "monkey_patch:gpu_bookkeeping": 192,
+          "monkey_patch:req_step_ready": 192,
+          "monkey_patch:req_metrics_events": 15,
+          "monkey_patch:output_socket_sched_latency": 195,
+          "monkey_patch:output_socket_exec_slice": 192,
+          "monkey_patch:output_handler_sched_latency": 193,
+          "monkey_patch:output_handler_exec_slice": 192,
+          "monkey_patch:coroutine_sched_latency": 1024,
+          "monkey_patch:coroutine_exec_slice": 512,
+          "cupti:runtime": 1051772,
+          "cupti:driver": 303436,
+          "cupti:memcpy": 2234,
+          "cupti:kernel": 94782,
+          "cupti:memset": 9824,
+          "cupti:marker": 728,
+          "monkey_patch:coroutine_end": 16
+        },
+        "request_count": 16,
+        "required_sources": [
+          "cupti",
+          "monkey_patch"
+        ]
+      },
+      "manifest.json": {
+        "python": "/home/joeyxzy/miniconda3/envs/vllm-0200/bin/python",
+        "model": "/home/joeyxzy/models/Qwen1.5-4B-Chat",
+        "gpu": "7",
+        "graph": false,
+        "tp": 1,
+        "pp": 1,
+        "port": 57545,
+        "measurement_start_ns": 1793089182938581393,
+        "measurement_end_ns": 1793089195533635853
+      },
+      "events.log.stats.json": {
+        "schema_version": 2,
+        "sources": {
+          "monkey_patch": 6434,
+          "cupti": 1462776
+        },
+        "invalid_events": 0,
+        "producer_dropped": {
+          "monkey_patch:4069652:None": 0,
+          "monkey_patch:4069652:4069652": 0,
+          "monkey_patch:4070000:None": 0,
+          "monkey_patch:4070000:4070000": 0,
+          "monkey_patch:4070000:4070543": 0,
+          "cupti:4070000:4070000": 91554,
+          "cupti:4070000:0": 91554,
+          "cupti:4070000:4070979": 91554,
+          "cupti:4070000:4070008": 91554
+        }
+      },
+      "benchmark_counts": {
+        "completed": 16,
+        "failed": 0
+      }
+    },
+    {
+      "session": "eager-v5",
+      "removed_disk_bytes": 283189248,
+      "validation": {
+        "passed": true,
+        "errors": [],
+        "sources": {
+          "monkey_patch": 5829,
+          "cupti": 238543
+        },
+        "event_types": {
+          "monkey_patch:coroutine_sched_patch_status": 2,
+          "monkey_patch:thread_role": 1,
+          "monkey_patch:worker_process_ready": 1,
+          "monkey_patch:req_generate_stage": 193,
+          "monkey_patch:coroutine_start": 16,
+          "monkey_patch:req_enqueue_scheduler": 16,
+          "monkey_patch:enginecore_mainloop_span": 396,
+          "monkey_patch:scheduler_schedule": 195,
+          "monkey_patch:req_scheduler_out_rpc": 191,
+          "monkey_patch:worker_preprocess_start": 191,
+          "monkey_patch:gpu_phase_span": 1341,
+          "monkey_patch:gpu_execute_model": 195,
+          "monkey_patch:worker_model_execute_span": 382,
+          "monkey_patch:scheduler_sample_tokens": 191,
+          "monkey_patch:req_step_ready": 191,
+          "monkey_patch:req_metrics_events": 15,
+          "monkey_patch:output_socket_sched_latency": 193,
+          "monkey_patch:output_socket_exec_slice": 191,
+          "monkey_patch:output_handler_sched_latency": 191,
+          "monkey_patch:output_handler_exec_slice": 191,
+          "monkey_patch:coroutine_sched_latency": 1020,
+          "monkey_patch:coroutine_exec_slice": 510,
+          "cupti:driver": 5267,
+          "cupti:runtime": 119599,
+          "cupti:memcpy": 2370,
+          "cupti:kernel": 100214,
+          "cupti:memset": 10322,
+          "cupti:marker": 771,
+          "monkey_patch:coroutine_end": 16
+        },
+        "request_count": 16,
+        "required_sources": [
+          "cupti",
+          "monkey_patch"
+        ],
+        "producer_dropped": {},
+        "cupti_stop_status": {
+          "de_latency_cupti_336079.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=336079 socket=/home/joeyxzy/de_latency/de_latency/bench_results/eager-v5/de_latency_cupti_336079.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=1307545"
+        },
+        "ebpf_status": null,
+        "graph_launches": 0,
+        "kernel_worker_pids": [
+          336079
+        ],
+        "phase_ranks": [
+          [
+            0,
+            0
+          ]
+        ],
+        "perfetto_complete_events": 246000
+      },
+      "manifest.json": {
+        "python": "/home/joeyxzy/miniconda3/envs/vllm-0200/bin/python",
+        "model": "/home/joeyxzy/models/Qwen1.5-4B-Chat",
+        "gpu": "7",
+        "cuda_visible_devices": "7",
+        "gpu_uuids": "GPU-2e539a7a-bcdb-651c-17c7-2dea33d65f78",
+        "gpu_memory_utilization": "0.45",
+        "graph": false,
+        "tp": 1,
+        "pp": 1,
+        "port": 33513,
+        "measurement_start_ns": 1793107892742628447,
+        "measurement_end_ns": 1793107905740510205
+      },
+      "events.log.stats.json": {
+        "schema_version": 2,
+        "sources": {
+          "monkey_patch": 5829,
+          "cupti": 238543
+        },
+        "invalid_events": 0,
+        "producer_dropped": {
+          "monkey_patch:335747:None": 0,
+          "monkey_patch:335747:335747": 0,
+          "monkey_patch:336079:None": 0,
+          "monkey_patch:336079:336079": 0,
+          "monkey_patch:336079:336759": 0,
+          "cupti:336079:336079": 0,
+          "cupti:336079:0": 0,
+          "cupti:336079:337484": 0
+        }
+      },
+      "benchmark_counts": {
+        "completed": 16,
+        "failed": 0
+      }
+    },
+    {
+      "session": "final-live",
+      "removed_disk_bytes": 450596864,
+      "validation": {
+        "passed": true,
+        "errors": [],
+        "trace_stem": "trace",
+        "sources": {
+          "monkey_patch": 5979,
+          "ebpf": 365,
+          "cupti": 247570
+        },
+        "event_types": {
+          "monkey_patch:coroutine_sched_patch_status": 2,
+          "monkey_patch:thread_role": 1,
+          "ebpf:sched_latency": 365,
+          "monkey_patch:worker_process_ready": 1,
+          "monkey_patch:req_generate_stage": 193,
+          "monkey_patch:coroutine_start": 16,
+          "monkey_patch:req_enqueue_scheduler": 16,
+          "monkey_patch:enginecore_mainloop_span": 410,
+          "monkey_patch:scheduler_schedule": 202,
+          "monkey_patch:req_scheduler_out_rpc": 198,
+          "monkey_patch:worker_preprocess_start": 198,
+          "monkey_patch:gpu_phase_span": 1390,
+          "monkey_patch:gpu_execute_model": 202,
+          "monkey_patch:worker_model_execute_span": 396,
+          "monkey_patch:scheduler_sample_tokens": 198,
+          "cupti:driver": 5702,
+          "cupti:kernel": 103899,
+          "cupti:marker": 800,
+          "cupti:runtime": 123861,
+          "cupti:memcpy": 2451,
+          "cupti:memset": 10857,
+          "monkey_patch:req_step_ready": 198,
+          "monkey_patch:req_metrics_events": 15,
+          "monkey_patch:output_socket_sched_latency": 200,
+          "monkey_patch:output_socket_exec_slice": 198,
+          "monkey_patch:output_handler_sched_latency": 198,
+          "monkey_patch:output_handler_exec_slice": 198,
+          "monkey_patch:coroutine_sched_latency": 1022,
+          "monkey_patch:coroutine_exec_slice": 511,
+          "monkey_patch:coroutine_end": 16
+        },
+        "request_count": 16,
+        "required_sources": [
+          "cupti",
+          "ebpf",
+          "monkey_patch"
+        ],
+        "producer_dropped": {},
+        "cupti_stop_status": {
+          "de_latency_cupti_486983.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=486983 socket=/home/joeyxzy/de_latency/de_latency/bench_results/final-live/de_latency_cupti_486983.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=1355864"
+        },
+        "ebpf_status": {
+          "ring_dropped": 0,
+          "map_dropped": 0,
+          "send_dropped": 0,
+          "exit_code": 0
+        },
+        "graph_launches": 0,
+        "kernel_worker_pids": [
+          486983
+        ],
+        "phase_ranks": [
+          [
+            0,
+            0
+          ]
+        ],
+        "perfetto_complete_events": 255423
+      },
+      "manifest.json": {
+        "python": "/home/joeyxzy/miniconda3/envs/vllm-0200/bin/python",
+        "model": "/home/joeyxzy/models/Qwen1.5-4B-Chat",
+        "gpu": "7",
+        "cuda_visible_devices": "7",
+        "gpu_uuids": "GPU-2e539a7a-bcdb-651c-17c7-2dea33d65f78",
+        "gpu_memory_utilization": "0.45",
+        "graph": false,
+        "tp": 1,
+        "pp": 1,
+        "port": 51265,
+        "measurement_start_ns": 1793325095090119041,
+        "measurement_end_ns": 1793325107429767329
+      },
+      "events.log.stats.json": {
+        "schema_version": 2,
+        "sources": {
+          "monkey_patch": 5979,
+          "ebpf": 365,
+          "cupti": 247570
+        },
+        "invalid_events": 0,
+        "producer_dropped": {
+          "monkey_patch:486588:None": 0,
+          "monkey_patch:486588:486588": 0,
+          "monkey_patch:486983:None": 0,
+          "ebpf:None:486588": 0,
+          "monkey_patch:486983:486983": 0,
+          "ebpf:None:486983": 0,
+          "monkey_patch:486983:487634": 0,
+          "cupti:486983:486983": 0,
+          "cupti:486983:0": 0,
+          "cupti:486983:488082": 0
+        }
+      },
+      "final.validation.json": {
+        "passed": true,
+        "errors": [],
+        "trace_stem": "final",
+        "sources": {
+          "monkey_patch": 5979,
+          "ebpf": 365,
+          "cupti": 247570
+        },
+        "event_types": {
+          "monkey_patch:coroutine_sched_patch_status": 2,
+          "monkey_patch:thread_role": 1,
+          "ebpf:sched_latency": 365,
+          "monkey_patch:worker_process_ready": 1,
+          "monkey_patch:req_generate_stage": 193,
+          "monkey_patch:coroutine_start": 16,
+          "monkey_patch:req_enqueue_scheduler": 16,
+          "monkey_patch:enginecore_mainloop_span": 410,
+          "monkey_patch:scheduler_schedule": 202,
+          "monkey_patch:req_scheduler_out_rpc": 198,
+          "monkey_patch:worker_preprocess_start": 198,
+          "monkey_patch:gpu_phase_span": 1390,
+          "monkey_patch:gpu_execute_model": 202,
+          "monkey_patch:worker_model_execute_span": 396,
+          "monkey_patch:scheduler_sample_tokens": 198,
+          "cupti:driver": 5702,
+          "cupti:kernel": 103899,
+          "cupti:marker": 800,
+          "cupti:runtime": 123861,
+          "cupti:memcpy": 2451,
+          "cupti:memset": 10857,
+          "monkey_patch:req_step_ready": 198,
+          "monkey_patch:req_metrics_events": 15,
+          "monkey_patch:output_socket_sched_latency": 200,
+          "monkey_patch:output_socket_exec_slice": 198,
+          "monkey_patch:output_handler_sched_latency": 198,
+          "monkey_patch:output_handler_exec_slice": 198,
+          "monkey_patch:coroutine_sched_latency": 1022,
+          "monkey_patch:coroutine_exec_slice": 511,
+          "monkey_patch:coroutine_end": 16
+        },
+        "request_count": 16,
+        "required_sources": [
+          "cupti",
+          "ebpf",
+          "monkey_patch"
+        ],
+        "producer_dropped": {},
+        "cupti_stop_status": {
+          "de_latency_cupti_486983.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=486983 socket=/home/joeyxzy/de_latency/de_latency/bench_results/final-live/de_latency_cupti_486983.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=1355864"
+        },
+        "ebpf_status": {
+          "ring_dropped": 0,
+          "map_dropped": 0,
+          "send_dropped": 0,
+          "exit_code": 0
+        },
+        "graph_launches": 0,
+        "kernel_worker_pids": [
+          486983
+        ],
+        "phase_ranks": [
+          [
+            0,
+            0
+          ]
+        ],
+        "perfetto_complete_events": 255423
+      },
+      "benchmark_counts": {
+        "completed": 16,
+        "failed": 0
+      }
+    },
+    {
+      "session": "graph-v3",
+      "removed_disk_bytes": 249913344,
+      "validation": {
+        "passed": true,
+        "errors": [],
+        "sources": {
+          "monkey_patch": 7153,
+          "cupti": 181037
+        },
+        "event_types": {
+          "monkey_patch:coroutine_sched_patch_status": 2,
+          "monkey_patch:thread_role": 1,
+          "monkey_patch:worker_process_ready": 1,
+          "monkey_patch:req_generate_stage": 193,
+          "monkey_patch:coroutine_start": 16,
+          "monkey_patch:req_enqueue_scheduler": 16,
+          "monkey_patch:enginecore_mainloop_span": 526,
+          "monkey_patch:scheduler_schedule": 259,
+          "monkey_patch:req_scheduler_out_rpc": 253,
+          "monkey_patch:worker_preprocess_start": 253,
+          "monkey_patch:gpu_phase_span": 1777,
+          "monkey_patch:gpu_execute_model": 259,
+          "monkey_patch:worker_model_execute_span": 506,
+          "monkey_patch:scheduler_sample_tokens": 253,
+          "monkey_patch:req_step_ready": 253,
+          "monkey_patch:req_metrics_events": 15,
+          "monkey_patch:output_socket_sched_latency": 256,
+          "monkey_patch:output_socket_exec_slice": 253,
+          "monkey_patch:output_handler_sched_latency": 256,
+          "monkey_patch:output_handler_exec_slice": 253,
+          "monkey_patch:coroutine_sched_latency": 1024,
+          "monkey_patch:coroutine_exec_slice": 512,
+          "cupti:driver": 15354,
+          "cupti:runtime": 24355,
+          "cupti:memcpy": 3108,
+          "cupti:kernel": 122073,
+          "cupti:memset": 15124,
+          "cupti:marker": 1023,
+          "monkey_patch:coroutine_end": 16
+        },
+        "request_count": 16,
+        "required_sources": [
+          "cupti",
+          "monkey_patch"
+        ],
+        "producer_dropped": {},
+        "cupti_stop_status": {
+          "de_latency_cupti_329474.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=329474 socket=/home/joeyxzy/de_latency/de_latency/bench_results/graph-v3/de_latency_cupti_329474.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=235549"
+        },
+        "ebpf_status": null,
+        "graph_launches": 238,
+        "kernel_worker_pids": [
+          329474
+        ],
+        "phase_ranks": [
+          [
+            0,
+            0
+          ]
+        ],
+        "perfetto_complete_events": 188800
+      },
+      "manifest.json": {
+        "python": "/home/joeyxzy/miniconda3/envs/vllm-0200/bin/python",
+        "model": "/home/joeyxzy/models/Qwen1.5-4B-Chat",
+        "gpu": "6",
+        "graph": true,
+        "tp": 1,
+        "pp": 1,
+        "port": 49287,
+        "measurement_start_ns": 1793107733605182308,
+        "measurement_end_ns": 1793107746401499393
+      },
+      "events.log.stats.json": {
+        "schema_version": 2,
+        "sources": {
+          "monkey_patch": 7153,
+          "cupti": 181037
+        },
+        "invalid_events": 0,
+        "producer_dropped": {
+          "monkey_patch:328794:None": 0,
+          "monkey_patch:328794:328794": 0,
+          "monkey_patch:329474:None": 0,
+          "monkey_patch:329474:329474": 0,
+          "monkey_patch:329474:330378": 0,
+          "cupti:329474:329474": 0,
+          "cupti:329474:0": 0,
+          "cupti:329474:330957": 0
+        }
+      },
+      "benchmark_counts": {
+        "completed": 16,
+        "failed": 0
+      }
+    },
+    {
+      "session": "graph-v6",
+      "removed_disk_bytes": 267452416,
+      "validation": {
+        "passed": true,
+        "errors": [],
+        "sources": {
+          "monkey_patch": 7565,
+          "cupti": 193156
+        },
+        "event_types": {
+          "monkey_patch:coroutine_sched_patch_status": 2,
+          "monkey_patch:thread_role": 1,
+          "monkey_patch:worker_process_ready": 1,
+          "monkey_patch:req_generate_stage": 193,
+          "monkey_patch:coroutine_start": 16,
+          "monkey_patch:req_enqueue_scheduler": 16,
+          "monkey_patch:enginecore_mainloop_span": 570,
+          "monkey_patch:scheduler_schedule": 280,
+          "monkey_patch:req_scheduler_out_rpc": 272,
+          "monkey_patch:worker_preprocess_start": 272,
+          "monkey_patch:gpu_phase_span": 1912,
+          "monkey_patch:gpu_execute_model": 280,
+          "monkey_patch:worker_model_execute_span": 544,
+          "monkey_patch:scheduler_sample_tokens": 272,
+          "monkey_patch:req_step_ready": 272,
+          "monkey_patch:req_metrics_events": 15,
+          "monkey_patch:output_socket_sched_latency": 275,
+          "monkey_patch:output_socket_exec_slice": 272,
+          "monkey_patch:output_handler_sched_latency": 276,
+          "monkey_patch:output_handler_exec_slice": 272,
+          "monkey_patch:coroutine_sched_latency": 1024,
+          "monkey_patch:coroutine_exec_slice": 512,
+          "cupti:driver": 15449,
+          "cupti:runtime": 25642,
+          "cupti:memcpy": 3336,
+          "cupti:kernel": 131108,
+          "cupti:memset": 16518,
+          "cupti:marker": 1103,
+          "monkey_patch:coroutine_end": 16
+        },
+        "request_count": 16,
+        "required_sources": [
+          "cupti",
+          "monkey_patch"
+        ],
+        "producer_dropped": {},
+        "cupti_stop_status": {
+          "de_latency_cupti_343978.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=343978 socket=/home/joeyxzy/de_latency/de_latency/bench_results/graph-v6/de_latency_cupti_343978.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=246452"
+        },
+        "ebpf_status": null,
+        "graph_launches": 257,
+        "kernel_worker_pids": [
+          343978
+        ],
+        "phase_ranks": [
+          [
+            0,
+            0
+          ]
+        ],
+        "perfetto_complete_events": 201153
+      },
+      "manifest.json": {
+        "python": "/home/joeyxzy/miniconda3/envs/vllm-0200/bin/python",
+        "model": "/home/joeyxzy/models/Qwen1.5-4B-Chat",
+        "gpu": "7",
+        "cuda_visible_devices": "7",
+        "gpu_uuids": "GPU-2e539a7a-bcdb-651c-17c7-2dea33d65f78",
+        "gpu_memory_utilization": "0.65",
+        "graph": true,
+        "tp": 1,
+        "pp": 1,
+        "port": 52367,
+        "measurement_start_ns": 1793108090046069961,
+        "measurement_end_ns": 1793108102738130207
+      },
+      "events.log.stats.json": {
+        "schema_version": 2,
+        "sources": {
+          "monkey_patch": 7565,
+          "cupti": 193156
+        },
+        "invalid_events": 0,
+        "producer_dropped": {
+          "monkey_patch:343633:None": 0,
+          "monkey_patch:343633:343633": 0,
+          "monkey_patch:343978:None": 0,
+          "monkey_patch:343978:343978": 0,
+          "monkey_patch:343978:345145": 0,
+          "cupti:343978:343978": 0,
+          "cupti:343978:0": 0,
+          "cupti:343978:345856": 0
+        }
+      },
+      "benchmark_counts": {
+        "completed": 16,
+        "failed": 0
+      }
+    },
+    {
+      "session": "smoke-eager-2",
+      "removed_disk_bytes": 359362560,
+      "validation": {
+        "passed": true,
+        "sources": {
+          "monkey_patch": 6326,
+          "cupti": 484154
+        },
+        "event_types": {
+          "monkey_patch:coroutine_sched_patch_status": 2,
+          "monkey_patch:thread_role": 1,
+          "monkey_patch:worker_process_ready": 1,
+          "monkey_patch:req_generate_stage": 193,
+          "monkey_patch:coroutine_start": 16,
+          "monkey_patch:req_enqueue_scheduler": 16,
+          "monkey_patch:enginecore_mainloop_span": 384,
+          "monkey_patch:scheduler_schedule": 190,
+          "monkey_patch:req_scheduler_out_rpc": 188,
+          "monkey_patch:worker_preprocess_start": 188,
+          "monkey_patch:gpu_phase_span": 1318,
+          "monkey_patch:gpu_forward_start": 188,
+          "monkey_patch:gpu_forward_end": 188,
+          "monkey_patch:gpu_execute_model": 190,
+          "monkey_patch:worker_model_execute_span": 376,
+          "monkey_patch:scheduler_sample_tokens": 188,
+          "monkey_patch:gpu_bookkeeping": 188,
+          "monkey_patch:req_step_ready": 188,
+          "monkey_patch:req_metrics_events": 15,
+          "monkey_patch:output_socket_sched_latency": 191,
+          "monkey_patch:output_socket_exec_slice": 188,
+          "monkey_patch:output_handler_sched_latency": 189,
+          "monkey_patch:output_handler_exec_slice": 188,
+          "monkey_patch:coroutine_sched_latency": 1024,
+          "monkey_patch:coroutine_exec_slice": 512,
+          "cupti:runtime": 347786,
+          "cupti:driver": 101864,
+          "cupti:memcpy": 694,
+          "cupti:kernel": 30502,
+          "cupti:memset": 3073,
+          "cupti:marker": 235,
+          "monkey_patch:coroutine_end": 16
+        },
+        "request_count": 16,
+        "required_sources": [
+          "cupti",
+          "monkey_patch"
+        ]
+      },
+      "manifest.json": {
+        "python": "/home/joeyxzy/miniconda3/envs/vllm-0200/bin/python",
+        "model": "/home/joeyxzy/models/Qwen1.5-4B-Chat",
+        "gpu": "7",
+        "graph": false,
+        "tp": 1,
+        "pp": 1,
+        "port": 51711,
+        "measurement_start_ns": 1793088126590542843,
+        "measurement_end_ns": 1793088139541677592
+      },
+      "events.log.stats.json": {
+        "schema_version": 2,
+        "sources": {
+          "monkey_patch": 6326,
+          "cupti": 484154
+        },
+        "invalid_events": 0,
+        "producer_dropped": {
+          "monkey_patch:4039809:None": 0,
+          "monkey_patch:4039809:4039809": 0,
+          "monkey_patch:4040143:None": 0,
+          "monkey_patch:4040143:4040143": 0,
+          "monkey_patch:4040143:4040741": 0,
+          "cupti:4040143:671014912": 1003165,
+          "cupti:4040143:0": 1003165,
+          "cupti:4040143:2751459328": 1003165
+        }
+      },
+      "benchmark_counts": {
+        "completed": 16,
+        "failed": 0
+      }
+    },
+    {
+      "session": "split-workers",
+      "removed_disk_bytes": 911265792,
+      "validation": {
+        "passed": true,
+        "errors": [],
+        "trace_stem": "trace",
+        "sources": {
+          "monkey_patch": 13318,
+          "cupti": 986599
+        },
+        "event_types": {
+          "monkey_patch:coroutine_sched_patch_status": 6,
+          "monkey_patch:thread_role": 1,
+          "monkey_patch:worker_process_ready": 4,
+          "monkey_patch:req_generate_stage": 193,
+          "monkey_patch:coroutine_start": 16,
+          "monkey_patch:req_enqueue_scheduler": 16,
+          "monkey_patch:enginecore_mainloop_span": 396,
+          "monkey_patch:scheduler_schedule": 195,
+          "monkey_patch:req_scheduler_out_rpc": 191,
+          "monkey_patch:scheduler_sample_tokens": 191,
+          "monkey_patch:worker_preprocess_start": 764,
+          "monkey_patch:gpu_phase_span": 4218,
+          "cupti:driver": 58554,
+          "cupti:kernel": 240242,
+          "cupti:marker": 3088,
+          "cupti:runtime": 670585,
+          "cupti:memcpy": 9556,
+          "monkey_patch:gpu_execute_model": 780,
+          "cupti:memset": 4574,
+          "monkey_patch:pp_comm_span": 2292,
+          "monkey_patch:worker_model_execute_span": 1528,
+          "monkey_patch:req_step_ready": 191,
+          "monkey_patch:req_metrics_events": 15,
+          "monkey_patch:output_socket_sched_latency": 194,
+          "monkey_patch:output_socket_exec_slice": 191,
+          "monkey_patch:output_handler_sched_latency": 193,
+          "monkey_patch:output_handler_exec_slice": 191,
+          "monkey_patch:coroutine_sched_latency": 1024,
+          "monkey_patch:coroutine_exec_slice": 512,
+          "monkey_patch:coroutine_end": 16
+        },
+        "request_count": 16,
+        "required_sources": [
+          "cupti",
+          "monkey_patch"
+        ],
+        "producer_dropped": {},
+        "cupti_stop_status": {
+          "de_latency_cupti_518083.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=518083 socket=/home/joeyxzy/de_latency/de_latency/bench_results/split-workers/de_latency_cupti_518083.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=756614",
+          "de_latency_cupti_518084.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=518084 socket=/home/joeyxzy/de_latency/de_latency/bench_results/split-workers/de_latency_cupti_518084.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=757659",
+          "de_latency_cupti_518085.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=518085 socket=/home/joeyxzy/de_latency/de_latency/bench_results/split-workers/de_latency_cupti_518085.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=822736",
+          "de_latency_cupti_518086.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=518086 socket=/home/joeyxzy/de_latency/de_latency/bench_results/split-workers/de_latency_cupti_518086.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=822911"
+        },
+        "ebpf_status": null,
+        "graph_launches": 0,
+        "kernel_worker_pids": [
+          518083,
+          518084,
+          518085,
+          518086
+        ],
+        "phase_ranks": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            1,
+            1
+          ]
+        ],
+        "perfetto_complete_events": 998835
+      },
+      "manifest.json": {
+        "python": "/home/joeyxzy/miniconda3/envs/vllm-0200/bin/python",
+        "model": "/home/joeyxzy/models/Qwen1.5-4B-Chat",
+        "gpu": "4,5,6,7",
+        "cuda_visible_devices": "4,5,6,7",
+        "gpu_uuids": "GPU-68f442c0-b95c-febb-25fe-58c15697f4ac,GPU-93c833e4-daad-fd92-78cd-d76fba685ca5,GPU-9ac5bb2f-a917-160a-e0fc-30dcb172c054,GPU-2e539a7a-bcdb-651c-17c7-2dea33d65f78",
+        "gpu_memory_utilization": "0.35",
+        "graph": false,
+        "tp": 2,
+        "pp": 2,
+        "port": 38753,
+        "measurement_start_ns": 1793326394286168539,
+        "measurement_end_ns": 1793326406780270711
+      },
+      "events.log.stats.json": {
+        "schema_version": 2,
+        "sources": {
+          "monkey_patch": 13318,
+          "cupti": 986599
+        },
+        "invalid_events": 0,
+        "producer_dropped": {
+          "monkey_patch:516878:None": 0,
+          "monkey_patch:516878:516878": 0,
+          "monkey_patch:517791:None": 0,
+          "monkey_patch:518083:None": 0,
+          "monkey_patch:518085:None": 0,
+          "monkey_patch:518084:None": 0,
+          "monkey_patch:518086:None": 0,
+          "monkey_patch:518083:518083": 0,
+          "monkey_patch:518085:518085": 0,
+          "monkey_patch:518086:518086": 0,
+          "monkey_patch:518084:518084": 0,
+          "monkey_patch:517791:519099": 0,
+          "monkey_patch:517791:517791": 0,
+          "cupti:518083:518083": 0,
+          "cupti:518083:0": 0,
+          "cupti:518084:518084": 0,
+          "cupti:518084:0": 0,
+          "cupti:518085:518085": 0,
+          "cupti:518085:519780": 0,
+          "cupti:518085:519783": 0,
+          "cupti:518085:0": 0,
+          "cupti:518086:518086": 0,
+          "cupti:518086:519779": 0,
+          "cupti:518086:519776": 0,
+          "cupti:518086:0": 0,
+          "cupti:518086:518788": 0,
+          "cupti:518085:518787": 0,
+          "cupti:518084:519777": 0,
+          "cupti:518084:519781": 0,
+          "cupti:518086:518686": 0,
+          "cupti:518085:518685": 0,
+          "cupti:518083:519778": 0,
+          "cupti:518083:519782": 0,
+          "cupti:518084:518817": 0,
+          "cupti:518084:519793": 0,
+          "cupti:518084:519790": 0,
+          "cupti:518086:519792": 0,
+          "cupti:518086:519791": 0,
+          "cupti:518085:519787": 0,
+          "cupti:518085:519789": 0,
+          "cupti:518083:518819": 0,
+          "cupti:518083:519786": 0,
+          "cupti:518083:519788": 0,
+          "cupti:518085:518939": 0
+        }
+      },
+      "benchmark_counts": {
+        "completed": 16,
+        "failed": 0
+      }
+    },
+    {
+      "session": "task-events",
+      "removed_disk_bytes": 293220352,
+      "validation": {
+        "passed": true,
+        "errors": [],
+        "sources": {
+          "monkey_patch": 5937,
+          "cupti": 244986
+        },
+        "event_types": {
+          "monkey_patch:coroutine_sched_patch_status": 2,
+          "monkey_patch:thread_role": 1,
+          "monkey_patch:worker_process_ready": 1,
+          "monkey_patch:req_generate_stage": 193,
+          "monkey_patch:coroutine_start": 16,
+          "monkey_patch:req_enqueue_scheduler": 16,
+          "monkey_patch:enginecore_mainloop_span": 406,
+          "monkey_patch:scheduler_schedule": 200,
+          "monkey_patch:req_scheduler_out_rpc": 196,
+          "monkey_patch:worker_preprocess_start": 196,
+          "monkey_patch:gpu_phase_span": 1376,
+          "monkey_patch:gpu_execute_model": 200,
+          "monkey_patch:worker_model_execute_span": 392,
+          "monkey_patch:scheduler_sample_tokens": 196,
+          "cupti:driver": 5532,
+          "cupti:runtime": 122688,
+          "cupti:memcpy": 2432,
+          "cupti:kernel": 102860,
+          "cupti:memset": 10683,
+          "monkey_patch:req_step_ready": 196,
+          "monkey_patch:req_metrics_events": 15,
+          "monkey_patch:output_socket_sched_latency": 198,
+          "monkey_patch:output_socket_exec_slice": 196,
+          "monkey_patch:output_handler_sched_latency": 196,
+          "monkey_patch:output_handler_exec_slice": 196,
+          "monkey_patch:coroutine_sched_latency": 1022,
+          "monkey_patch:coroutine_exec_slice": 511,
+          "cupti:marker": 791,
+          "monkey_patch:coroutine_end": 16
+        },
+        "request_count": 16,
+        "required_sources": [
+          "cupti",
+          "monkey_patch"
+        ],
+        "producer_dropped": {},
+        "cupti_stop_status": {
+          "de_latency_cupti_4015804.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=4015804 socket=/home/joeyxzy/de_latency/de_latency/bench_results/task-events/de_latency_cupti_4015804.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=1342104"
+        },
+        "ebpf_status": null,
+        "graph_launches": 0,
+        "kernel_worker_pids": [
+          4015804
+        ],
+        "phase_ranks": [
+          [
+            0,
+            0
+          ]
+        ],
+        "perfetto_complete_events": 252509
+      },
+      "manifest.json": {
+        "python": "/home/joeyxzy/miniconda3/envs/vllm-0200/bin/python",
+        "model": "/home/joeyxzy/models/Qwen1.5-4B-Chat",
+        "gpu": "7",
+        "cuda_visible_devices": "7",
+        "gpu_uuids": "GPU-2e539a7a-bcdb-651c-17c7-2dea33d65f78",
+        "gpu_memory_utilization": "0.45",
+        "graph": false,
+        "tp": 1,
+        "pp": 1,
+        "port": 38899,
+        "measurement_start_ns": 1793282965517542357,
+        "measurement_end_ns": 1793282978415315105
+      },
+      "events.log.stats.json": {
+        "schema_version": 2,
+        "sources": {
+          "monkey_patch": 5937,
+          "cupti": 244986
+        },
+        "invalid_events": 0,
+        "producer_dropped": {
+          "monkey_patch:4015431:None": 0,
+          "monkey_patch:4015431:4015431": 0,
+          "monkey_patch:4015804:None": 0,
+          "monkey_patch:4015804:4015804": 0,
+          "monkey_patch:4015804:4016399": 0,
+          "cupti:4015804:4015804": 0,
+          "cupti:4015804:0": 0,
+          "cupti:4015804:4016870": 0
+        }
+      },
+      "benchmark_counts": {
+        "completed": 16,
+        "failed": 0
+      }
+    },
+    {
+      "session": "three-v2",
+      "removed_disk_bytes": 272707584,
+      "validation": {
+        "passed": true,
+        "errors": [],
+        "sources": {
+          "monkey_patch": 5657,
+          "ebpf": 353,
+          "cupti": 227973
+        },
+        "event_types": {
+          "monkey_patch:coroutine_sched_patch_status": 2,
+          "monkey_patch:thread_role": 1,
+          "ebpf:sched_latency": 353,
+          "monkey_patch:worker_process_ready": 1,
+          "monkey_patch:req_generate_stage": 193,
+          "monkey_patch:coroutine_start": 16,
+          "monkey_patch:req_enqueue_scheduler": 16,
+          "monkey_patch:enginecore_mainloop_span": 374,
+          "monkey_patch:scheduler_schedule": 185,
+          "monkey_patch:req_scheduler_out_rpc": 183,
+          "monkey_patch:worker_preprocess_start": 183,
+          "monkey_patch:gpu_phase_span": 1283,
+          "monkey_patch:gpu_execute_model": 185,
+          "monkey_patch:worker_model_execute_span": 366,
+          "monkey_patch:scheduler_sample_tokens": 183,
+          "monkey_patch:req_step_ready": 183,
+          "monkey_patch:req_metrics_events": 15,
+          "monkey_patch:output_socket_sched_latency": 186,
+          "monkey_patch:output_socket_exec_slice": 183,
+          "monkey_patch:output_handler_sched_latency": 184,
+          "monkey_patch:output_handler_exec_slice": 183,
+          "monkey_patch:coroutine_sched_latency": 1024,
+          "monkey_patch:coroutine_exec_slice": 512,
+          "cupti:driver": 4587,
+          "cupti:runtime": 114803,
+          "cupti:memcpy": 2278,
+          "cupti:kernel": 96018,
+          "cupti:memset": 9552,
+          "cupti:marker": 735,
+          "monkey_patch:coroutine_end": 16
+        },
+        "request_count": 16,
+        "required_sources": [
+          "cupti",
+          "ebpf",
+          "monkey_patch"
+        ],
+        "producer_dropped": {},
+        "cupti_stop_status": {
+          "de_latency_cupti_1235897.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=1235897 socket=/home/joeyxzy/de_latency/de_latency/bench_results/three-v2/de_latency_cupti_1235897.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=1252115"
+        },
+        "ebpf_status": {
+          "ring_dropped": 0,
+          "map_dropped": 0,
+          "send_dropped": 0,
+          "exit_code": 0
+        },
+        "graph_launches": 0,
+        "kernel_worker_pids": [
+          1235897
+        ],
+        "phase_ranks": [
+          [
+            0,
+            0
+          ]
+        ],
+        "perfetto_complete_events": 235606
+      },
+      "manifest.json": {
+        "python": "/home/joeyxzy/miniconda3/envs/vllm-0200/bin/python",
+        "model": "/home/joeyxzy/models/Qwen1.5-4B-Chat",
+        "gpu": "7",
+        "cuda_visible_devices": "7",
+        "gpu_uuids": "GPU-2e539a7a-bcdb-651c-17c7-2dea33d65f78",
+        "gpu_memory_utilization": "0.45",
+        "graph": false,
+        "tp": 1,
+        "pp": 1,
+        "port": 35207,
+        "measurement_start_ns": 1793153329183693710,
+        "measurement_end_ns": 1793153342080055011
+      },
+      "events.log.stats.json": {
+        "schema_version": 2,
+        "sources": {
+          "monkey_patch": 5657,
+          "ebpf": 353,
+          "cupti": 227973
+        },
+        "invalid_events": 0,
+        "producer_dropped": {
+          "monkey_patch:1235516:None": 0,
+          "monkey_patch:1235516:1235516": 0,
+          "ebpf:None:1235516": 0,
+          "monkey_patch:1235897:None": 0,
+          "monkey_patch:1235897:1235897": 0,
+          "ebpf:None:1235897": 0,
+          "monkey_patch:1235897:1236466": 0,
+          "cupti:1235897:1235897": 0,
+          "cupti:1235897:0": 0,
+          "cupti:1235897:1236950": 0
+        }
+      },
+      "benchmark_counts": {
+        "completed": 16,
+        "failed": 0
+      }
+    },
+    {
+      "session": "tp2pp2-v1",
+      "removed_disk_bytes": 169623552,
+      "validation": {
+        "passed": true,
+        "errors": [],
+        "sources": {
+          "monkey_patch": 3860,
+          "cupti": 177051
+        },
+        "event_types": {
+          "monkey_patch:coroutine_sched_patch_status": 6,
+          "monkey_patch:thread_role": 1,
+          "monkey_patch:worker_process_ready": 4,
+          "monkey_patch:req_generate_stage": 193,
+          "monkey_patch:coroutine_start": 16,
+          "monkey_patch:req_enqueue_scheduler": 16,
+          "monkey_patch:enginecore_mainloop_span": 76,
+          "monkey_patch:scheduler_schedule": 36,
+          "monkey_patch:req_scheduler_out_rpc": 34,
+          "monkey_patch:scheduler_sample_tokens": 34,
+          "monkey_patch:worker_preprocess_start": 136,
+          "cupti:driver": 17226,
+          "cupti:runtime": 116147,
+          "cupti:memcpy": 1688,
+          "cupti:kernel": 41278,
+          "monkey_patch:gpu_phase_span": 756,
+          "monkey_patch:gpu_execute_model": 144,
+          "monkey_patch:pp_comm_span": 408,
+          "monkey_patch:worker_model_execute_span": 272,
+          "cupti:marker": 556,
+          "cupti:memset": 156,
+          "monkey_patch:req_step_ready": 34,
+          "monkey_patch:output_socket_sched_latency": 37,
+          "monkey_patch:req_metrics_events": 2,
+          "monkey_patch:output_socket_exec_slice": 34,
+          "monkey_patch:output_handler_sched_latency": 35,
+          "monkey_patch:output_handler_exec_slice": 34,
+          "monkey_patch:coroutine_sched_latency": 1024,
+          "monkey_patch:coroutine_exec_slice": 512,
+          "monkey_patch:coroutine_end": 16
+        },
+        "request_count": 16,
+        "required_sources": [
+          "cupti",
+          "monkey_patch"
+        ],
+        "producer_dropped": {},
+        "cupti_stop_status": {
+          "de_latency_cupti_339854.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=339854 socket=/home/joeyxzy/de_latency/de_latency/bench_results/tp2pp2-v1/de_latency_cupti_339854.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=142090",
+          "de_latency_cupti_339855.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=339855 socket=/home/joeyxzy/de_latency/de_latency/bench_results/tp2pp2-v1/de_latency_cupti_339855.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=142077",
+          "de_latency_cupti_339856.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=339856 socket=/home/joeyxzy/de_latency/de_latency/bench_results/tp2pp2-v1/de_latency_cupti_339856.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=144631",
+          "de_latency_cupti_339857.sock": "ok state=off markers_only=no generation=1 subscriber=no activity_callbacks=yes pid=339857 socket=/home/joeyxzy/de_latency/de_latency/bench_results/tp2pp2-v1/de_latency_cupti_339857.sock ring_dropped=0 zmq_dropped=0 cupti_dropped=0 filtered_queries=144810"
+        },
+        "ebpf_status": null,
+        "graph_launches": 0,
+        "kernel_worker_pids": [
+          339854,
+          339855,
+          339856,
+          339857
+        ],
+        "phase_ranks": [
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            1,
+            1
+          ]
+        ],
+        "perfetto_complete_events": 182668
+      },
+      "manifest.json": {
+        "python": "/home/joeyxzy/miniconda3/envs/vllm-0200/bin/python",
+        "model": "/home/joeyxzy/models/Qwen1.5-4B-Chat",
+        "gpu": "3,4,5,6",
+        "cuda_visible_devices": "3,4,5,6",
+        "gpu_uuids": "GPU-e8006ad3-9aa5-40d7-f8e1-05b2e72ff894,GPU-68f442c0-b95c-febb-25fe-58c15697f4ac,GPU-93c833e4-daad-fd92-78cd-d76fba685ca5,GPU-9ac5bb2f-a917-160a-e0fc-30dcb172c054",
+        "gpu_memory_utilization": "0.35",
+        "graph": false,
+        "tp": 2,
+        "pp": 2,
+        "port": 57703,
+        "measurement_start_ns": 1793107979066579470,
+        "measurement_end_ns": 1793107997876112192
+      },
+      "events.log.stats.json": {
+        "schema_version": 2,
+        "sources": {
+          "monkey_patch": 3860,
+          "cupti": 177051
+        },
+        "invalid_events": 0,
+        "producer_dropped": {
+          "monkey_patch:339194:None": 0,
+          "monkey_patch:339194:339194": 0,
+          "monkey_patch:339542:None": 0,
+          "monkey_patch:339854:None": 0,
+          "monkey_patch:339855:None": 0,
+          "monkey_patch:339856:None": 0,
+          "monkey_patch:339857:None": 0,
+          "monkey_patch:339856:339856": 0,
+          "monkey_patch:339857:339857": 0,
+          "monkey_patch:339855:339855": 0,
+          "monkey_patch:339854:339854": 0,
+          "monkey_patch:339542:340918": 0,
+          "monkey_patch:339542:339542": 0,
+          "cupti:339854:339854": 0,
+          "cupti:339854:0": 0,
+          "cupti:339855:339855": 0,
+          "cupti:339855:0": 0,
+          "cupti:339856:339856": 0,
+          "cupti:339856:341747": 0,
+          "cupti:339856:341745": 0,
+          "cupti:339856:0": 0,
+          "cupti:339855:341741": 0,
+          "cupti:339855:341743": 0,
+          "cupti:339855:340214": 0,
+          "cupti:339856:340190": 0,
+          "cupti:339856:340080": 0,
+          "cupti:339857:339857": 0,
+          "cupti:339857:341742": 0,
+          "cupti:339857:341744": 0,
+          "cupti:339857:0": 0,
+          "cupti:339856:341760": 0,
+          "cupti:339856:341758": 0,
+          "cupti:339857:340191": 0,
+          "cupti:339857:340078": 0,
+          "cupti:339857:341754": 0,
+          "cupti:339857:341756": 0,
+          "cupti:339854:341746": 0,
+          "cupti:339854:341748": 0,
+          "cupti:339854:340212": 0,
+          "cupti:339854:341757": 0,
+          "cupti:339854:341759": 0,
+          "cupti:339855:341753": 0,
+          "cupti:339855:341755": 0,
+          "cupti:339856:340393": 0
+        }
+      },
+      "benchmark_counts": {
+        "completed": 16,
+        "failed": 0
+      }
+    }
+  ]
+}
